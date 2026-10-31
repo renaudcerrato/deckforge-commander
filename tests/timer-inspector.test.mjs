@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import ts from 'typescript';
+import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
+import { createInspectorFixture } from './helpers/inspector-harness.mjs';
 import { createInspectorBridge, RUN_ACTION_UUID, TIMER_ACTION_UUID, ONCE_ACTION_UUID } from '../src/inspector/bridge.mjs';
 import { createInspectorController } from '../src/inspector/run.mjs';
 import { getTimerInspectorConfiguration, validateTimerSettings, classifyTimerSettings } from '../src/core/timer-settings.mjs';
@@ -14,39 +15,6 @@ const pressError = 'Choose start / refresh or start / stop.';
 const presets = [['1', '1s'], ['10', '10s'], ['30', '30s'], ['60', '1mn'], ['600', '10mn'], ['1800', '30mn'], ['3600', '1h']];
 const asset = name => readFileSync(new URL(`../git.renaudcerrato.deckforge.sdPlugin/ui/${name}`, import.meta.url), 'utf8');
 
-// SDPI's value setter synchronously dispatches a direct, non-bubbling valuechange
-// with no detail. Only DOM, transport, clocks and SDK/storage/process boundaries are doubled.
-function control(value = '') {
-  const listeners = new Map();
-  return {
-    get value() { return value; },
-    set value(next) { value = typeof next === 'string' ? next.replace(/[\r\n]/g, '') : next; this.dispatch('valuechange'); },
-    addEventListener(name, listener) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(listener); },
-    removeEventListener(name, listener) { listeners.get(name)?.delete(listener); },
-    dispatch(name) { for (const listener of listeners.get(name) ?? []) listener({ type: name, bubbles: false }); },
-  };
-}
-// Attribute text and visible hint are separate public component boundaries.
-// Do not emulate LocalizedMessage or Lit's private change-detection machinery.
-function cwdControl() {
-  const field = control(), attributes = new Map([['placeholder', '/absolute/path/to/working-directory']]);
-  let renderedHint = attributes.get('placeholder');
-  Object.assign(field, {
-    getAttribute(name) { return attributes.get(name) ?? null; },
-    setAttribute(name, value) { attributes.set(name, String(value)); },
-    requestUpdate() { renderedHint = attributes.get('placeholder'); },
-  });
-  Object.defineProperties(field, {
-    placeholder: { set(value) { if (typeof value === 'string') throw new TypeError('SDPI placeholder property does not accept text.'); } },
-    renderedHint: { get() { return renderedHint; } },
-  });
-  return field;
-}
-function fields() {
-  return { executable: control(), argsText: control(), cwd: cwdControl(), title: cwdControl(), themeColor: control('#606060'),
-    intervalPreset: control(), intervalSeconds: control(), actionOnPress: control(), timerControls: { hidden: true }, customInterval: { hidden: true },
-    status: { textContent: '', set innerHTML(_) { throw new Error('Status must be plaintext'); } } };
-}
 function clock() {
   let time = 0, id = 0;
   const timers = new Map();
@@ -61,7 +29,8 @@ function clock() {
 const edits = socket => socket.sent.filter(message => message.payload?.type === 'canvas:edit');
 const normal = socket => socket.sent;
 function harness({ built = false, loading = false } = {}) {
-  const f = fields(), time = clock(), sockets = [], errors = [], states = [], events = new Map();
+  const fixture = createInspectorFixture(), f = fixture.fields;
+  const time = clock(), sockets = [], errors = [], states = [], events = new Map();
   let controller, bridge, chained = 0;
   class Socket {
     constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); }
@@ -71,8 +40,7 @@ function harness({ built = false, loading = false } = {}) {
   let connect, dispose;
   if (built) {
     const window = { connectElgatoStreamDeckSocket() { chained++; }, addEventListener(name, fn) { events.set(name, fn); } };
-    const ids = { ...f, 'timer-controls': f.timerControls, 'custom-interval': f.customInterval, 'settings-status': f.status };
-    const document = { readyState: loading ? 'loading' : 'complete', getElementById: id => ids[id],
+    const document = { readyState: loading ? 'loading' : 'complete', getElementById: fixture.getElementById,
       addEventListener(name, fn) { events.set(name, fn); } };
     runInNewContext(asset('run.js'), { window, document, WebSocket: Socket, TextEncoder,
       Date: class extends Date { static now() { return 123; } }, Math: Object.assign(Object.create(Math), { random: () => 0.25 }),
@@ -668,21 +636,11 @@ test('built Timer entry routes custom edits, suppresses synchronous hydration an
   assert.equal(h.edits().length, 1); assert.equal(h.sockets.length, 1);
 });
 
-// Compile actual adapters in memory as the existing Timer adapter suite does;
-// never load plugin.ts, connect an SDK, start a process, or create another helper file.
-const adapterCodes = new Map(['timer', 'program-runtime'].map(name => [
-  `./${name}`, ts.transpileModule(readFileSync(new URL(`../src/actions/${name}.ts`, import.meta.url), 'utf8'), {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, experimentalDecorators: true },
-  }).outputText,
-]));
-const helperNames = ['availability', 'error-artwork', 'execution-paths', 'launch-environment', 'settings', 'settings-authority', 'theme',
-  'timer-artwork', 'timer-session', 'timer-settings'];
-const helpers = new Map(await Promise.all(helperNames.map(async name => [
-  `../core/${name}.mjs`, await import(`../src/core/${name}.mjs`),
-])));
+// Shared loader evaluates real adapters/core, never plugin startup or real I/O.
+const adapterCodes = await loadAdapterCode(['timer']);
 
 function backend(t, client, settings = initial) {
-  const time = clock(), launches = [], logs = [], sessions = [], states = [], managers = [], modules = new Map();
+  const time = clock(), launches = [], logs = [], sessions = [], states = [], managers = [];
   let stored = structuredClone(settings), resolveRun;
   const writes = [], replies = [];
   const runtime = {
@@ -698,32 +656,25 @@ function backend(t, client, settings = initial) {
   const registry = Object.fromEntries(['onDeviceDidConnect', 'onDeviceDidDisconnect', 'onSystemDidWakeUp']
     .map(name => [name, () => ({ dispose() {} })]));
   // Captures return the real instances unchanged, for their public idle/state APIs.
-  function capture(name, factory, collection) {
-    return { ...helpers.get(name), [factory](dependencies) {
-      const actual = helpers.get(name)[factory](dependencies); collection.push(actual); return actual;
+  function capture(module, factory, collection) {
+    return { ...module, [factory](dependencies) {
+      const actual = module[factory](dependencies); collection.push(actual); return actual;
     } };
   }
-  function requireIsolated(name) {
-    if (adapterCodes.has(name)) {
-      if (!modules.has(name)) {
-        const exports = {}; modules.set(name, exports);
-        new Function('require', 'exports', 'process', adapterCodes.get(name))(requireIsolated, exports,
-          { env: {}, cwd: () => '/synthetic/cwd' });
-      }
-      return modules.get(name);
-    }
+  const requireIsolated = createAdapterLoader(adapterCodes, {
+    process: { env: {}, cwd: () => '/synthetic/cwd', platform: 'darwin' }, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return { startProcessRun(execution) {
       launches.push(structuredClone(execution));
       const done = new Promise(resolve => { resolveRun = resolve; });
       return { done, async stop() { resolveRun({ status: 'stopped' }); return true; } };
     } };
-    if (name === '../core/timer-session.mjs') return capture(name, 'createTimerSession', sessions);
-    if (name === '../core/timer-settings.mjs') return capture(name, 'createTimerStateCoordinator', states);
-    if (name === '../core/availability.mjs') return capture(name, 'createAvailabilityManager', managers);
-    if (helpers.has(name)) return helpers.get(name);
-    throw new Error(`Unexpected isolated dependency: ${name}`);
-  }
+  }, observe(name, actual) {
+    if (name === '../core/timer-session.mjs') return capture(actual, 'createTimerSession', sessions);
+    if (name === '../core/timer-settings.mjs') return capture(actual, 'createTimerStateCoordinator', states);
+    if (name === '../core/availability.mjs') return capture(actual, 'createAvailabilityManager', managers);
+    return actual;
+  } });
   const { TimerAction } = requireIsolated('./timer'), action = new TimerAction(registry, time);
   const idle = async () => {
     await Promise.all(managers.map(manager => manager.whenIdle()));

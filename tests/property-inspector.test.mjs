@@ -2,54 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { createInspectorFixture } from './helpers/inspector-harness.mjs';
 import { createInspectorBridge } from '../src/inspector/bridge.mjs';
 import { createInspectorController } from '../src/inspector/run.mjs';
 import { parseArguments } from '../src/core/arguments.mjs';
 import { getInspectorConfiguration, validateSettings } from '../src/core/settings.mjs';
 
 const initial = { executable: '/program', argsText: 'old', cwd: '', runRequested: false };
-function control() {
-  let value;
-  const listeners = new Set();
-  return {
-    get value() { return value; },
-    // A component may emit synchronously when hydrated; this must not become an edit.
-    set value(next) { value = typeof next === 'string' ? next.replace(/[\r\n]/g, '') : next; for (const listener of listeners) listener(); },
-    userEdit(next) { this.value = next; },
-    addEventListener(type, listener) { if (type === 'valuechange') listeners.add(listener); },
-    removeEventListener(type, listener) { if (type === 'valuechange') listeners.delete(listener); },
-  };
-}
 function controls() {
-  return { executable: control(), argsText: control(), cwd: cwdControl(), title: cwdControl(), themeColor: colorControl(), status: { textContent: '' } };
-}
-// Public SDPI4 boundary only: placeholder text belongs to the attribute API;
-// changing that attribute alone need not repaint an already rendered input.
-function cwdControl() {
-  const field = control(), attributes = new Map([['placeholder', '/absolute/path/to/working-directory']]);
-  let renderedHint = attributes.get('placeholder');
-  Object.assign(field, {
-    getAttribute(name) { return attributes.get(name) ?? null; },
-    setAttribute(name, value) { attributes.set(name, String(value)); },
-    requestUpdate() { renderedHint = attributes.get('placeholder'); },
-  });
-  Object.defineProperties(field, {
-    placeholder: { set(value) { if (typeof value === 'string') throw new TypeError('SDPI placeholder property does not accept text.'); } },
-    renderedHint: { get() { return renderedHint; } },
-  });
-  return field;
-}
-function colorControl() {
-  let value = '#969696';
-  const listeners = new Map();
-  return {
-    get value() { return value; },
-    set value(next) { value = next; this.dispatch('input'); this.dispatch('change'); },
-    addEventListener(event, callback) { if (!listeners.has(event)) listeners.set(event, new Set()); listeners.get(event).add(callback); },
-    removeEventListener(event, callback) { listeners.get(event)?.delete(callback); },
-    dispatch(event) { for (const callback of listeners.get(event) ?? []) callback(); },
-    userEdit(next) { this.value = next; },
-  };
+  return createInspectorFixture().fields;
 }
 const normalMessages = socket => socket.sent;
 const traceMessages = socket => socket.sent.filter(message => message.payload?.type === 'canvas:trace');
@@ -232,7 +193,7 @@ for (const [platform, executable, cwd, hint] of [
 }
 test('cwd boundary rejects plain placeholder property text and paints attribute text only after an explicit update', () => {
   // Arrange
-  const field = cwdControl(), original = field.renderedHint, hint = String.raw`C:\absolute\path\to\working-directory`;
+  const field = controls().cwd, original = field.renderedHint, hint = String.raw`C:\absolute\path\to\working-directory`;
   // Act
   let rejected; try { field.placeholder = hint; } catch (error) { rejected = error; }
   field.setAttribute('placeholder', hint); const beforeRender = field.renderedHint; field.requestUpdate();
@@ -470,10 +431,10 @@ test('inspector markup has local scripts, executable picker and optional cwd tex
 test('built browser entry replaces vendor connection wrapper and opens only one mocked socket', () => {
   // Arrange
   const script = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8');
-  const fields = controls(), sockets = [], timers = new Map(), events = new Map();
+  const fixture = createInspectorFixture(), fields = fixture.fields, sockets = [], timers = new Map(), events = new Map();
   let chained = 0, timerId = 0;
   const window = { connectElgatoStreamDeckSocket() { chained++; }, addEventListener(type, callback) { events.set(type, callback); } };
-  const document = { readyState: 'complete', addEventListener() {}, getElementById(id) { return id === 'settings-status' ? fields.status : fields[id]; } };
+  const document = { readyState: 'complete', addEventListener() {}, getElementById: fixture.getElementById };
   class Socket {
     constructor(url) { this.url = url; this.readyState = 0; this.sent = []; sockets.push(this); }
     send(text) { this.sent.push(JSON.parse(text)); }
@@ -531,7 +492,7 @@ for (const [label, argumentSettings] of [
 
 test('native input strips actual CR/LF on render and edit, making raw projection unsafe', () => {
   // Arrange
-  const native = control();
+  const native = controls().argsText;
   // Act
   native.value = 'a\r\nb\rc\nd';
   const rendered = native.value;

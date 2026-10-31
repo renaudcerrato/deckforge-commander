@@ -235,14 +235,12 @@ for (const loss of ['hide', 'disconnect', 'execution-edit']) {
 
 // Authorized in-memory adapter seam: SDK/process/storage are doubles; project
 // coordinators, availability and lifecycle modules remain real. No plugin startup.
-const adapterCodes = await loadAdapterCode(['run', 'program-runtime']);
-const helperNames = ['action-session', 'availability', 'error-artwork', 'execution-paths', 'launch-artwork', 'launch-environment', 'run-state', 'settings', 'settings-authority', 'theme'];
-const helpers = new Map(await Promise.all(helperNames.map(async name => [`../core/${name}.mjs`, await import(`../src/core/${name}.mjs`)])));
+const adapterCodes = await loadAdapterCode(['run']);
 function adapter({ firstStopGate } = {}) {
   const launches = [], replies = [], listeners = new Map();
   const sdk = { info: { plugin: { uuid: 'synthetic', version: '0.1' }, application: { version: '7.6', language: 'en', platform: 'mac', platformVersion: '26' } }, logger: { info() {}, warn() {} }, ui: { async sendToPropertyInspector(value) { replies.push(value); } } };
   const sdkModule = { default: sdk, SingletonAction: class {}, action: () => value => value };
-  const syntheticProcess = { env: {}, cwd: () => '/synthetic/cwd' };
+  const syntheticProcess = { env: {}, cwd: () => '/synthetic/cwd', platform: 'darwin' };
   const isolatedRequire = createAdapterLoader(adapterCodes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return { startProcessRun(input) {
@@ -256,8 +254,6 @@ function adapter({ firstStopGate } = {}) {
         done.resolve({ status: 'stopped' }); return true;
       } };
     } };
-    if (helpers.has(name)) return helpers.get(name);
-    throw new Error('Unexpected synthetic dependency');
   } });
   const exports = isolatedRequire('./run');
   const register = name => listener => { listeners.set(name, listener); return { dispose() {} }; };

@@ -33,13 +33,7 @@ function clock() {
 }
 // Objective: exercise actual adapters/authority/policy/render queue; isolate only external boundaries.
 // Never evaluate plugin.ts, connect the SDK, inherit user environment or create a child.
-const codes = await loadAdapterCode(['once', 'run', 'timer', 'program-runtime']);
-const names = ['action-session', 'availability', 'error-artwork', 'execution-paths', 'launch-artwork', 'launch-environment',
-  'run-state', 'settings', 'settings-authority', 'theme', 'timer-artwork', 'timer-session', 'timer-settings',
-  'once-artwork', 'once-session', 'once-settings'];
-const helpers = new Map(await Promise.all(names.map(async name =>
-  [`../core/${name}.mjs`, await import(`../src/core/${name}.mjs`)])));
-const platformSource = (await readFile(new URL('../src/core/execution-paths.mjs', import.meta.url), 'utf8')).replaceAll('export function ', 'function ');
+const codes = await loadAdapterCode(['once', 'run', 'timer']);
 function runtime(id = 'synthetic-once-key', initial = base, manifestId = ONCE_UUID, slot) {
   // SDK wrappers are ephemeral; old and new wrappers address the same host context.
   slot ??= { value: structuredClone(initial), display: [], writes: [] };
@@ -71,8 +65,6 @@ function harness(t, platform = 'posix') {
   const syntheticProcess = { env: { PATH: '/synthetic/path', PRIVATE_ENV: 'SYNTHETIC_PRIVATE_ENV',
     ELGATO_KEY_COLUMN: 'STALE_SYNTHETIC', ELGATO_DEVICE_NAME: 'STALE_SYNTHETIC', ELGATO_ACTION_THEME_COLOR: 'STALE_SYNTHETIC' },
     cwd: () => '/synthetic/cwd', platform: platform === 'win32' ? 'win32' : 'darwin' };
-  // Evaluate real platform detection against this harness's isolated Node boundary.
-  const platformHelpers = new Function('process', `${platformSource}\nreturn { executionPlatform, isAbsoluteExecutionPath, executionBasename };`)(syntheticProcess);
   const runner = { startProcessRun(settings, callbacks, dependencies, { env }) {
     const done = deferred(), stopEntered = deferred();
     const launch = { settings: structuredClone(settings), env: { ...env }, callbacks, done, stopEntered, stops: 0, certain: true };
@@ -83,8 +75,8 @@ function harness(t, platform = 'posix') {
       done.resolve({ status: 'stopped' }); return certain;
     } };
   } };
-  const capture = (name, factory, collection) => ({ ...helpers.get(name), [factory](dependencies) {
-    const actual = helpers.get(name)[factory](dependencies); collection.push(actual); return actual;
+  const capture = (module, factory, collection) => ({ ...module, [factory](dependencies) {
+    const actual = module[factory](dependencies); collection.push(actual); return actual;
   } });
   const factories = new Map([
     ['once-session', ['createOnceSession', sessions]], ['timer-session', ['createTimerSession', sessions]],
@@ -92,25 +84,11 @@ function harness(t, platform = 'posix') {
     ['timer-settings', ['createTimerStateCoordinator', states]], ['run-state', ['createRunStateCoordinator', states]],
     ['availability', ['createAvailabilityManager', managers]],
   ].map(([name, value]) => [`../core/${name}.mjs`, value]));
-  // Imported ESM helpers share the host OS; align their omitted-platform default
-  // with the isolated Node boundary without replacing real validation behavior.
-  const validators = new Map([
-    ['../core/settings.mjs', 'validateSettings'],
-    ['../core/timer-settings.mjs', 'validateTimerSettings'],
-    ['../core/once-settings.mjs', 'validateOnceSettings'],
-  ]);
   const isolatedRequire = createAdapterLoader(codes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-    if (name === '../core/execution-paths.mjs') return platformHelpers;
-    if (helpers.has(name)) {
-      const actual = helpers.get(name), module = factories.has(name) ? capture(name, ...factories.get(name)) : actual;
-      const validator = validators.get(name);
-      return validator ? { ...module, [validator](settings, executionPlatform = platform) {
-        return actual[validator](settings, executionPlatform);
-      } } : module;
-    }
-    throw Error('Unexpected isolated adapter dependency');
+  }, observe(name, actual) {
+    return factories.has(name) ? capture(actual, ...factories.get(name)) : actual;
   } });
   const { OnceAction } = isolatedRequire('./once'), { RunAction } = isolatedRequire('./run'), { TimerAction } = isolatedRequire('./timer');
   const action = new OnceAction(registry, time);

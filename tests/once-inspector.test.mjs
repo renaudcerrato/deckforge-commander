@@ -2,36 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { createInspectorFixture } from './helpers/inspector-harness.mjs';
 import { createInspectorBridge, ONCE_ACTION_UUID, RUN_ACTION_UUID, TIMER_ACTION_UUID } from '../src/inspector/bridge.mjs';
 import { createInspectorController } from '../src/inspector/run.mjs';
 import { parseArguments } from '../src/core/arguments.mjs';
 
 const initial = { executable: '/synthetic/report.py', argsText: '', cwd: '', themeColor: '#123456' };
 const asset = name => readFileSync(new URL(`../git.renaudcerrato.deckforge.sdPlugin/ui/${name}`, import.meta.url), 'utf8');
-function control(value = '') {
-  const listeners = new Map();
-  return { get value() { return value; },
-    set value(next) { value = typeof next === 'string' ? next.replace(/[\r\n]/g, '') : next; this.dispatch('valuechange'); },
-    addEventListener(name, fn) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(fn); },
-    removeEventListener(name, fn) { listeners.get(name)?.delete(fn); },
-    dispatch(name) { for (const fn of listeners.get(name) ?? []) fn({ type: name, bubbles: false }); },
-  };
-}
-// Fail the real unsupported SDPI property assignment without simulating its internals.
-function cwdControl() {
-  const field = control(), attributes = new Map([['placeholder', '/absolute/path/to/working-directory']]);
-  let renderedHint = attributes.get('placeholder');
-  Object.assign(field, {
-    getAttribute(name) { return attributes.get(name) ?? null; },
-    setAttribute(name, value) { attributes.set(name, String(value)); },
-    requestUpdate() { renderedHint = attributes.get('placeholder'); },
-  });
-  Object.defineProperties(field, {
-    placeholder: { set(value) { if (typeof value === 'string') throw new TypeError('SDPI placeholder property does not accept text.'); } },
-    renderedHint: { get() { return renderedHint; } },
-  });
-  return field;
-}
 function clock() {
   let time = 0, id = 0;
   const timers = new Map();
@@ -43,10 +20,7 @@ function clock() {
 }
 // Objective: real bridge/controller and generated entry, with only DOM, transport and time faked.
 function harness({ built = false, loading = false } = {}) {
-  const f = { executable: control(), argsText: control(), cwd: cwdControl(), title: cwdControl(), themeColor: control(),
-    intervalPreset: control(), intervalSeconds: control(), actionOnPress: control(),
-    timerControls: { hidden: true }, customInterval: { hidden: true },
-    status: { textContent: '', set innerHTML(_) { throw Error('Status must remain plaintext'); } } };
+  const fixture = createInspectorFixture(), f = fixture.fields;
   const time = clock(), sockets = [], errors = [], events = new Map();
   let bridge, controller, connect, dispose, chained = 0;
   class Socket {
@@ -56,8 +30,7 @@ function harness({ built = false, loading = false } = {}) {
   }
   if (built) {
     const window = { connectElgatoStreamDeckSocket() { chained++; }, addEventListener(name, fn) { events.set(name, fn); } };
-    const ids = { ...f, 'timer-controls': f.timerControls, 'custom-interval': f.customInterval, 'settings-status': f.status };
-    const document = { readyState: loading ? 'loading' : 'complete', getElementById: id => ids[id], addEventListener(name, fn) { events.set(name, fn); } };
+    const document = { readyState: loading ? 'loading' : 'complete', getElementById: fixture.getElementById, addEventListener(name, fn) { events.set(name, fn); } };
     runInNewContext(asset('run.js'), { window, document, WebSocket: Socket, TextEncoder,
       Date: class extends Date { static now() { return 123; } }, Math: Object.assign(Object.create(Math), { random: () => 0.25 }),
       setTimeout: time.setTimer, clearTimeout: time.clearTimer }, { timeout: 1000 });

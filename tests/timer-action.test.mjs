@@ -44,11 +44,7 @@ function clock() {
 
 // Reuse the existing launch-environment harness technique, not its fixture model.
 // Transpile only actual adapter modules in memory, never execute plugin.ts or SDK startup.
-const adapterCodes = await loadAdapterCode(['timer', 'run', 'program-runtime']);
-const helperNames = ['action-session', 'availability', 'error-artwork', 'execution-paths', 'launch-artwork', 'launch-environment',
-  'run-state', 'settings', 'settings-authority', 'theme', 'timer-artwork', 'timer-session', 'timer-settings'];
-const helpers = new Map(await Promise.all(helperNames.map(async name =>
-  [`../core/${name}.mjs`, await import(`../src/core/${name}.mjs`)])));
+const adapterCodes = await loadAdapterCode(['timer', 'run']);
 
 function runtime(id = 'synthetic-timer-key', initial = base, manifestId = TIMER_UUID) {
   let stored = structuredClone(initial);
@@ -105,20 +101,20 @@ function harness(t) {
   } };
   // Never inherit, log or print the user's process environment.
   const syntheticProcess = { env: { PATH: '/synthetic/path', ELGATO_KEY_COLUMN: 'STALE_SYNTHETIC',
-    ELGATO_DEVICE_NAME: 'STALE_SYNTHETIC', ELGATO_ACTION_THEME_COLOR: 'STALE_SYNTHETIC', PRIVATE_ENV: 'SYNTHETIC_PRIVATE_ENV' }, cwd: () => '/synthetic/cwd' };
-  const capture = (name, factory, collection) => ({ ...helpers.get(name), [factory](dependencies) {
-    const actual = helpers.get(name)[factory](dependencies); collection.push(actual); return actual;
+    ELGATO_DEVICE_NAME: 'STALE_SYNTHETIC', ELGATO_ACTION_THEME_COLOR: 'STALE_SYNTHETIC', PRIVATE_ENV: 'SYNTHETIC_PRIVATE_ENV' }, cwd: () => '/synthetic/cwd', platform: 'darwin' };
+  const capture = (module, factory, collection) => ({ ...module, [factory](dependencies) {
+    const actual = module[factory](dependencies); collection.push(actual); return actual;
   } });
   const isolatedRequire = createAdapterLoader(adapterCodes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-    if (name === '../core/timer-session.mjs') return capture(name, 'createTimerSession', sessions);
-    if (name === '../core/action-session.mjs') return capture(name, 'createActionSession', sessions);
-    if (name === '../core/timer-settings.mjs') return capture(name, 'createTimerStateCoordinator', states);
-    if (name === '../core/run-state.mjs') return capture(name, 'createRunStateCoordinator', states);
-    if (name === '../core/availability.mjs') return capture(name, 'createAvailabilityManager', managers);
-    if (helpers.has(name)) return helpers.get(name);
-    throw new Error('Unexpected isolated adapter dependency');
+  }, observe(name, actual) {
+    if (name === '../core/timer-session.mjs') return capture(actual, 'createTimerSession', sessions);
+    if (name === '../core/action-session.mjs') return capture(actual, 'createActionSession', sessions);
+    if (name === '../core/timer-settings.mjs') return capture(actual, 'createTimerStateCoordinator', states);
+    if (name === '../core/run-state.mjs') return capture(actual, 'createRunStateCoordinator', states);
+    if (name === '../core/availability.mjs') return capture(actual, 'createAvailabilityManager', managers);
+    return actual;
   } });
   const { TimerAction } = isolatedRequire('./timer'), { RunAction } = isolatedRequire('./run');
   const action = new TimerAction(registry, time);

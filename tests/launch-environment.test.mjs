@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
 import { createLaunchEnvironment, validateLaunchOptions } from '../src/core/launch-environment.mjs';
+import { createErrorArtwork } from '../src/core/error-artwork.mjs';
 
 // Independent contract table: these names belong to DeckForge Commander, not the SDK.
 const fields = [
@@ -241,9 +242,7 @@ for (const [label, make] of [
 // Authorized adapter harness: transpile the real action and shared runtime, never the plugin entry.
 // SDK, process launch, logger and event registration are boundaries. All lifecycle
 // coordinators and metadata transformations below are the real project helpers.
-const adapterCodes = await loadAdapterCode(['run', 'program-runtime']);
-const helperNames = ['action-session', 'availability', 'error-artwork', 'execution-paths', 'launch-artwork', 'launch-environment', 'run-state', 'settings', 'settings-authority', 'theme'];
-const helpers = new Map(await Promise.all(helperNames.map(async name => [`../core/${name}.mjs`, await import(`../src/core/${name}.mjs`)])));
+const adapterCodes = await loadAdapterCode(['run']);
 const registration = () => ({ plugin: { uuid: 'synthetic-plugin', version: '0.1.0.0' }, application: { version: '7.6', language: 'fr', platform: 'mac', platformVersion: '26' } });
 
 function adapterHarness() {
@@ -261,20 +260,20 @@ function adapterHarness() {
     callbacks.onDiagnostic('PROCESS_SPAWN_SUCCEEDED');
     return { done, async stop() { launch.stops++; resolve({ status: 'stopped' }); return true; } };
   } };
-  const syntheticProcess = { env: { ...stale(), PATH: '/synthetic/path' }, cwd: () => '/synthetic/cwd' };
+  const syntheticProcess = { env: { ...stale(), PATH: '/synthetic/path' }, cwd: () => '/synthetic/cwd', platform: 'darwin' };
   const isolatedRequire = createAdapterLoader(adapterCodes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-    if (name === '../core/action-session.mjs') return { ...helpers.get(name), createActionSession(dependencies) {
-      const session = helpers.get(name).createActionSession({ ...dependencies, confirmLaunchSettings(expected) {
+  }, observe(name, actual) {
+    if (name === '../core/action-session.mjs') return { ...actual, createActionSession(dependencies) {
+      const session = actual.createActionSession({ ...dependencies, confirmLaunchSettings(expected) {
         launchCheckEntered.resolve(expected); return dependencies.confirmLaunchSettings(expected);
       } }); sessions.push(session); return session;
     } };
-    if (name === '../core/run-state.mjs') return { ...helpers.get(name), createRunStateCoordinator(dependencies) {
-      const state = helpers.get(name).createRunStateCoordinator(dependencies); states.push(state); return state;
+    if (name === '../core/run-state.mjs') return { ...actual, createRunStateCoordinator(dependencies) {
+      const state = actual.createRunStateCoordinator(dependencies); states.push(state); return state;
     } };
-    if (helpers.has(name)) return helpers.get(name);
-    throw Error('Unexpected harness dependency');
+    return actual;
   } });
   const exports = isolatedRequire('./run');
   const register = name => listener => { registrations.push(name); listeners.set(name, listener); return { dispose() {} }; };
@@ -373,7 +372,7 @@ for (const failed of [false, true]) {
     assert.equal(started.runRequested, false); assert.equal(expected.themeColor, '#abcdef'); assert.equal(expected.runRequested, false);
     assert.deepEqual(r.writes.map(value => value.runRequested), [false]);
     assert.equal(h.launches.length, failed ? 0 : 1);
-    if (failed) { assert.equal(session.getState().persistenceBlocked, true); assert.equal(r.display.at(-1)[1], helpers.get('../core/error-artwork.mjs').createErrorArtwork('STATE_SAVE_FAILED', '#abcdef')); }
+    if (failed) { assert.equal(session.getState().persistenceBlocked, true); assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED', '#abcdef')); }
     else { assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, '#abcdef'); assert.equal(session.getState().persistenceBlocked, false); }
   });
 }
@@ -636,7 +635,7 @@ for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNA
     h.launches[0].callbacks.onDiagnostic(diagnostic);
     h.launches[0].resolve({ status: 'error', error: 'Program exited unsuccessfully.' }); await h.sessions[0].whenIdle();
     // Assert
-    assert.equal(r.display.at(-1)[1], helpers.get('../core/error-artwork.mjs').createErrorArtwork(diagnostic));
+    assert.equal(r.display.at(-1)[1], createErrorArtwork(diagnostic));
     assert.deepEqual(r.display.at(-2), ['title', '']);
     assert.equal(r.display.filter(item => item[0] === 'image').some(item => />exited<\/text>/.test(artworkSvg(item[1]))), false);
     assert.equal(h.launches.length, 1);
@@ -807,7 +806,7 @@ test('extracted Stream refuses launch when complete configuration readback does 
   assert.deepEqual(r.writes, [{ ...initial, argsText: 'changed' }]);
   assert.equal(h.launches.length, 0);
   assert.equal(h.sessions[0].getState().persistenceBlocked, true);
-  assert.equal(r.display.at(-1)[1], helpers.get('../core/error-artwork.mjs').createErrorArtwork('STATE_SAVE_FAILED'));
+  assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED'));
 });
 
 for (const execution of [false, true]) test(`shared PI claimed ${execution ? 'execution' : 'theme'} edit preserves Run policy and complete settings`, adapterOptions, async t => {
