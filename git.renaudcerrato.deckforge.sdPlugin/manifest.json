@@ -1,0 +1,78 @@
+{
+	"Name": "DeckForge Commander",
+	"Version": "0.1.1.0",
+	"Author": "Renaud Cerrato",
+	"Actions": [
+		{
+			"Name": "Stream",
+			"UUID": "git.renaudcerrato.deckforge.stream",
+			"Icon": "imgs/actions/run/icon",
+			"Tooltip": "Display image updates from a configured program.",
+			"PropertyInspectorPath": "ui/run.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/run/key",
+					"TitleAlignment": "bottom"
+				}
+			]
+		},
+		{
+			"Name": "Loop",
+			"UUID": "git.renaudcerrato.deckforge.loop",
+			"Icon": "imgs/actions/timer/icon",
+			"Tooltip": "Display image updates from a program on a timer.",
+			"PropertyInspectorPath": "ui/run.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/timer/key",
+					"TitleAlignment": "bottom"
+				}
+			]
+		},
+		{
+			"Name": "Run",
+			"UUID": "git.renaudcerrato.deckforge.run",
+			"Icon": "imgs/actions/once/icon",
+			"Tooltip": "Run a program once and keep its final output.",
+			"PropertyInspectorPath": "ui/run.html",
+			"Controllers": [
+				"Keypad"
+			],
+			"States": [
+				{
+					"Image": "imgs/actions/once/key",
+					"TitleAlignment": "bottom"
+				}
+			]
+		}
+	],
+	"Category": "DeckForge Commander",
+	"CategoryIcon": "imgs/plugin/category-icon",
+	"CodePath": "bin/plugin.js",
+	"Description": "Script to canvas",
+	"Icon": "imgs/plugin/marketplace",
+	"SDKVersion": 3,
+	"Software": {
+		"MinimumVersion": "7.1"
+	},
+	"OS": [
+		{
+			"Platform": "mac",
+			"MinimumVersion": "13"
+		},
+		{
+			"Platform": "windows",
+			"MinimumVersion": "10"
+		}
+	],
+	"Nodejs": {
+		"Version": "24"
+	},
+	"UUID": "git.renaudcerrato.deckforge"
+}

@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeckForge Commander Settings</title>
+    <style>
+        p { margin: 24px 0; }
+        #settings-status { color: #969696; }
+        #themeColor { width: 100%; height: 30px; }
+        #timer-controls[hidden], #custom-interval[hidden] { display: none !important; }
+    </style>
+    <script src="sdpi-components.js"></script>
+    <script src="run.js"></script>
+</head>
+<body>
+    <sdpi-item label="Executable">
+        <sdpi-file id="executable"></sdpi-file>
+    </sdpi-item>
+    <sdpi-item label="Title (optional)">
+        <sdpi-textfield id="title" placeholder="DeckForge Commander"></sdpi-textfield>
+    </sdpi-item>
+    <sdpi-item label="Arguments">
+        <sdpi-textfield id="argsText"></sdpi-textfield>
+        <small>Quote arguments containing spaces, for example --mode "daily report".</small>
+    </sdpi-item>
+    <sdpi-item label="Working directory (optional)">
+        <sdpi-textfield id="cwd" placeholder="/absolute/path/to/working-directory"></sdpi-textfield>
+    </sdpi-item>
+    <div id="timer-controls" hidden>
+        <sdpi-item label="Action on press">
+            <sdpi-select id="actionOnPress">
+                <option value="refresh">start / refresh (long press to stop)</option>
+                <option value="stop">start / stop</option>
+            </sdpi-select>
+        </sdpi-item>
+        <sdpi-item label="Interval">
+            <sdpi-select id="intervalPreset">
+                <option value="1">1s</option>
+                <option value="10">10s</option>
+                <option value="30">30s</option>
+                <option value="60">1mn</option>
+                <option value="600">10mn</option>
+                <option value="1800">30mn</option>
+                <option value="3600">1h</option>
+                <option value="custom">Custom</option>
+            </sdpi-select>
+        </sdpi-item>
+        <sdpi-item id="custom-interval" label="Interval (seconds)" hidden>
+            <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
+            <small>Enter whole seconds from 1 to 86400.</small>
+        </sdpi-item>
+    </div>
+    <sdpi-item label="Theme color">
+        <input id="themeColor" type="color" value="#606060" aria-label="Artwork theme color" />
+    </sdpi-item>
+    <p id="settings-status" role="status" aria-live="polite"></p>
+</body>
+</html>

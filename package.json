@@ -1,0 +1,35 @@
+{
+    "scripts": {
+        "build": "task build",
+        "pack": "task pack",
+        "link": "streamdeck link git.renaudcerrato.deckforge.sdPlugin",
+        "unlink": "streamdeck unlink git.renaudcerrato.deckforge",
+        "stop": "streamdeck stop git.renaudcerrato.deckforge",
+        "restart": "streamdeck restart git.renaudcerrato.deckforge",
+        "watch": "task --watch dev",
+        "assets": "TASK_TEMP_DIR=.task ./node_modules/.bin/task --taskfile Taskfile.yml assets",
+        "assets:images": "TASK_TEMP_DIR=.task ./node_modules/.bin/task --taskfile Taskfile.yml images",
+        "assets:gifs": "TASK_TEMP_DIR=.task ./node_modules/.bin/task --taskfile Taskfile.yml gifs",
+        "assets:check": "TASK_TEMP_DIR=.task ./node_modules/.bin/task --taskfile Taskfile.yml check",
+        "assets:hero": "TASK_TEMP_DIR=.task task --taskfile Taskfile.yml hero"
+    },
+    "type": "module",
+    "devDependencies": {
+        "@elgato/cli": "^1.10.1",
+        "@go-task/cli": "3.54.0",
+        "@rollup/plugin-commonjs": "^29.0.2",
+        "@rollup/plugin-node-resolve": "^15.2.2",
+        "@rollup/plugin-terser": "^1.0.0",
+        "@rollup/plugin-typescript": "^12.1.0",
+        "@tsconfig/node20": "^20.1.2",
+        "@types/node": "~24.1.0",
+        "rollup": "^4.0.2",
+        "sharp": "0.35.5",
+        "tslib": "^2.6.2",
+        "typescript": "^5.2.2"
+    },
+    "dependencies": {
+        "@elgato/streamdeck": "^3.0.0",
+        "shlex": "3.0.0"
+    }
+}

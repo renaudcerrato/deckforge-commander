@@ -1,0 +1,12 @@
+.opencode/
+.DS_Store
+node_modules/
+*.sdPlugin/bin/
+*.sdPlugin/logs/
+*.sdPlugin/bin
+*.sdPlugin/logs
+.env
+.env.*
+.task/
+dist/
+/assets/.slide-preview-*/

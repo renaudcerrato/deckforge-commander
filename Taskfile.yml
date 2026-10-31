@@ -1,0 +1,355 @@
+version: '3'
+method: checksum
+silent: true
+
+tasks:
+  dev:
+    desc: Rebuild native and JavaScript sources, then restart the plugin on success
+    dir: '{{.ROOT_DIR}}'
+    method: none
+    platforms: [darwin/arm64, darwin/amd64, windows/amd64]
+    sources:
+      - 'src/**/*'
+      - rollup.config.mjs
+      - tsconfig.json
+      - Taskfile.yml
+      - scripts/bootstrap-toolchain.mjs
+      - git.renaudcerrato.deckforge.sdPlugin/manifest.json
+      - git.renaudcerrato.deckforge.sdPlugin/ui/run.html
+    cmds:
+      - task: build
+      - cmd: npm run restart
+
+  build:
+    desc: Compile the Windows transport and minified plugin/inspector bundles
+    dir: '{{.ROOT_DIR}}'
+    method: none
+    platforms: [darwin/arm64, darwin/amd64, linux/amd64, windows/amd64]
+    vars: &build-vars
+      TOOLCHAIN:
+        sh: node {{printf "%s/scripts/bootstrap-toolchain.mjs" .ROOT_DIR | shellQuote}} paths
+      NODE: '{{(fromJson .TOOLCHAIN).input.node}}'
+      ZIG: '{{(fromJson .TOOLCHAIN).input.zig}}'
+      HEADERS: '{{(fromJson .TOOLCHAIN).input.headers}}'
+      NODE_LIB: '{{(fromJson .TOOLCHAIN).input.nodeLibrary}}'
+      SOURCE: '{{(fromJson .TOOLCHAIN).input.source}}'
+      OUTPUT: '{{(fromJson .TOOLCHAIN).input.output}}'
+    cmds:
+      - task: windows:native
+      - cmd: |
+          {{.NODE | shellQuote}} node_modules/rollup/dist/bin/rollup -c
+        timeout: 120s
+
+  pack:
+    desc: Build and package the installer
+    dir: '{{.ROOT_DIR}}'
+    method: none
+    platforms: [darwin/arm64, darwin/amd64, linux/amd64, windows/amd64]
+    vars: *build-vars
+    cmds:
+      - task: build
+      - cmd: |
+          {{.NODE | shellQuote}} --input-type=module <<'NODE'
+          import { readFile, readdir, rm, writeFile } from 'node:fs/promises';
+          import path from 'node:path';
+          import { assertSafeBuildPath, requireBuildFile } from './scripts/bootstrap-toolchain.mjs';
+          const root = process.cwd(), plugin = 'git.renaudcerrato.deckforge.sdPlugin';
+          const stage = path.join(root, '.task/package', plugin);
+          async function images(relative = 'imgs') {
+            const files = [];
+            for (const entry of await readdir(path.join(root, plugin, relative), { withFileTypes: true })) {
+              const name = relative + '/' + entry.name;
+              if (entry.isDirectory()) files.push(...await images(name));
+              else if (entry.isFile() && /\.(png|svg)$/.test(entry.name)) files.push(name);
+              else throw new Error('Unexpected plugin image file.');
+            }
+            return files;
+          }
+          const names = ['manifest.json', 'bin/plugin.js', 'bin/package.json', 'bin/native/win32-x64/transport.node',
+            'ui/run.html', 'ui/run.js', 'ui/sdpi-components.js', 'THIRD_PARTY_NOTICES.txt', ...await images()];
+          const files = [...names.map(name => [path.join(root, plugin, name), path.join(stage, name)]),
+            [path.join(root, 'LICENSE'), path.join(stage, 'LICENSE')]];
+          for (const [source, destination] of files) {
+            await requireBuildFile(source);
+            await assertSafeBuildPath(destination);
+          }
+          await assertSafeBuildPath(stage, { directory: true });
+          await rm(stage, { recursive: true, force: true });
+          for (const [source, destination] of files) {
+            await assertSafeBuildPath(destination, { createParents: true });
+            await writeFile(destination, await readFile(source));
+          }
+          await assertSafeBuildPath(path.join(root, 'dist/git.renaudcerrato.deckforge.streamDeckPlugin'), { createParents: true });
+          NODE
+        timeout: 120s
+      - cmd: |
+          npm exec --no -- streamdeck pack .task/package/git.renaudcerrato.deckforge.sdPlugin --output dist --no-update-check --force
+        timeout: 120s
+      - cmd: |
+          {{.NODE | shellQuote}} --input-type=module -e "import { requireBuildFile } from './scripts/bootstrap-toolchain.mjs'; import path from 'node:path'; await requireBuildFile(path.resolve('dist/git.renaudcerrato.deckforge.streamDeckPlugin'));"
+        timeout: 120s
+
+  windows:native:
+    desc: Compile the Windows x64 Node-API transport
+    dir: '{{.ROOT_DIR}}'
+    platforms: [darwin/arm64, darwin/amd64, linux/amd64, windows/amd64]
+    method: none
+    vars: *build-vars
+    cmds:
+      - cmd: |
+          {{.NODE | shellQuote}} scripts/bootstrap-toolchain.mjs bootstrap
+      - cmd: |
+          unset ZIG_LIB_DIR ZIG_IS_DETECTING_LIBC_PATHS
+          test "$({{.ZIG | shellQuote}} version)" = "0.17.0"
+        timeout: 10s
+      - cmd: |
+          unset ZIG_LIB_DIR ZIG_IS_DETECTING_LIBC_PATHS
+          export NATIVE_BUILD_ZIG={{.ZIG | shellQuote}}
+          export NATIVE_BUILD_HEADERS={{.HEADERS | shellQuote}}
+          export NATIVE_BUILD_NODE_LIB={{.NODE_LIB | shellQuote}}
+          export NATIVE_BUILD_OUTPUT={{.OUTPUT | shellQuote}}
+          TEMP="$NATIVE_BUILD_OUTPUT.build-cache/temp" \
+          TMP="$NATIVE_BUILD_OUTPUT.build-cache/temp" \
+          TMPDIR="$NATIVE_BUILD_OUTPUT.build-cache/temp" \
+          ZIG_LOCAL_CACHE_DIR="$NATIVE_BUILD_OUTPUT.build-cache/local" \
+          ZIG_GLOBAL_CACHE_DIR="$NATIVE_BUILD_OUTPUT.build-cache/global" \
+          "$NATIVE_BUILD_ZIG" cc -shared -target x86_64-windows-gnu \
+          -std=c11 -Wall -Wextra -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 \
+          -DNAPI_VERSION=8 -I "$NATIVE_BUILD_HEADERS" "src/native/windows-process-transport.c" \
+          "$NATIVE_BUILD_NODE_LIB" -lkernel32 -o "$NATIVE_BUILD_OUTPUT"
+        timeout: 600s
+
+  assets:
+    cmds:
+      - task: images
+      - task: gifs
+      - task: check
+
+  images:
+    cmds:
+      - task: protocol
+      - task: keys
+
+  gifs:
+    cmds:
+      - task: demo-gif
+      - task: video-gif
+      - task: fluxcapacitor-gif
+
+  check:
+    cmds:
+      - node assets/generate-protocol-examples.mjs --check
+      - node assets/generate-key-previews.mjs --check
+
+  hero:
+    desc: Capture four demos and compose the animated Mini hero
+    dir: '{{.ROOT_DIR}}'
+    sources:
+      - Taskfile.yml
+      - assets/build-hero.sh
+      - package.json
+      - package-lock.json
+      - assets/generate-preview.mjs
+      - assets/preview-rendering.mjs
+      - assets/generate-hero.mjs
+      - assets/hero-rendering.mjs
+      - assets/compose-device.mjs
+      - 'src/core/*.mjs'
+      - demos/showcase.py
+      - demos/video.sh
+      - demos/fluxcapacitor.py
+      - demos/sample.mp4
+      - demos/sample.gif
+      - assets/Stream Deck Mini.png
+    generates:
+      - assets/hero.gif
+    cmds:
+      - /usr/bin/env -u BASH_ENV -u ENV /bin/bash --noprofile --norc assets/build-hero.sh
+
+  protocol:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - assets/generate-protocol-examples.mjs
+      - src/core/output-update.mjs
+      - src/core/image-update.mjs
+      - src/core/output-options.mjs
+      - src/core/primitive-artwork.mjs
+      - src/core/output-data.mjs
+      - src/core/colors.mjs
+      - src/core/theme.mjs
+    generates:
+      - assets/protocol-text-plain.svg
+      - assets/protocol-text-styled.svg
+      - assets/protocol-text-wrap.svg
+      - assets/protocol-text-multiline.svg
+      - assets/protocol-text-ellipsis.svg
+      - assets/protocol-progress-ring.svg
+      - assets/protocol-progress-bar.svg
+      - assets/protocol-text-mono.svg
+      - assets/protocol-text-aligned.svg
+      - assets/protocol-progress-ring-thin.svg
+      - assets/protocol-progress-ring-bordered.svg
+      - assets/protocol-progress-bar-square.svg
+      - assets/protocol-progress-bar-track.svg
+      - assets/protocol-image.svg
+      - assets/protocol-text-layout.svg
+      - assets/protocol-progress-ring-labels.svg
+      - assets/protocol-progress-bar-labels.svg
+      - assets/protocol-card-basic.svg
+      - assets/protocol-card-styled.svg
+      - assets/protocol-card-aligned.svg
+      - assets/protocol-card-wrap.svg
+    cmds:
+      - node assets/generate-protocol-examples.mjs --write
+
+  keys:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - assets/generate-key-previews.mjs
+      - assets/preview-rendering.mjs
+      - src/core/launch-artwork.mjs
+      - src/core/timer-artwork.mjs
+      - src/core/once-artwork.mjs
+      - src/core/key-layout.mjs
+      - src/core/theme.mjs
+      - src/core/output-update.mjs
+      - src/core/image-update.mjs
+      - src/core/output-options.mjs
+      - src/core/primitive-artwork.mjs
+      - src/core/output-data.mjs
+      - src/core/colors.mjs
+    generates:
+      - assets/key-stream.png
+      - assets/key-loop.png
+      - assets/key-run.png
+    cmds:
+      - node assets/generate-key-previews.mjs --write
+
+  demo-gif:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - demos/showcase.py
+      - assets/generate-preview.mjs
+      - assets/preview-rendering.mjs
+      - src/core/image-lines.mjs
+      - src/core/output-update.mjs
+      - src/core/image-update.mjs
+      - src/core/output-options.mjs
+      - src/core/primitive-artwork.mjs
+      - src/core/output-data.mjs
+      - src/core/colors.mjs
+      - src/core/theme.mjs
+    generates:
+      - assets/demo-preview.gif
+    cmds:
+      - |
+        /usr/bin/env -u BASH_ENV -u ENV /bin/bash --noprofile --norc -c '
+          set -e -o pipefail
+          umask 077
+          out="assets/demo-preview.gif"
+          tmp=""
+          cleanup() { if [[ -n "$tmp" ]]; then /bin/rm -f "$tmp"; fi; }
+          trap cleanup EXIT
+          [[ -d assets && ! -L assets && -d demos && ! -L demos ]]
+          [[ -f demos/showcase.py && ! -L demos/showcase.py ]]
+          [[ -f assets/generate-preview.mjs && ! -L assets/generate-preview.mjs ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          tmp="$(/usr/bin/mktemp assets/.asset-demo-XXXXXXXX)"
+          python3 -B demos/showcase.py | node assets/generate-preview.mjs --duration 120 > "$tmp"
+          [[ -d assets && ! -L assets ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          /bin/mv -f "$tmp" "$out"
+          tmp=""
+        '
+
+  fluxcapacitor-gif:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - demos/fluxcapacitor.py
+      - assets/generate-preview.mjs
+      - assets/preview-rendering.mjs
+      - src/core/image-lines.mjs
+      - src/core/output-update.mjs
+      - src/core/image-update.mjs
+      - src/core/output-options.mjs
+      - src/core/primitive-artwork.mjs
+      - src/core/output-data.mjs
+      - src/core/colors.mjs
+      - src/core/theme.mjs
+    generates:
+      - assets/fluxcapacitor-preview.gif
+    cmds:
+      - |
+        /usr/bin/env -u BASH_ENV -u ENV /bin/bash --noprofile --norc -c '
+          set -e -o pipefail
+          umask 077
+          out="assets/fluxcapacitor-preview.gif"
+          tmp=""
+          cleanup() { if [[ -n "$tmp" ]]; then /bin/rm -f "$tmp"; fi; }
+          trap cleanup EXIT
+          [[ -d assets && ! -L assets && -d demos && ! -L demos ]]
+          [[ -f demos/fluxcapacitor.py && ! -L demos/fluxcapacitor.py ]]
+          [[ -f assets/generate-preview.mjs && ! -L assets/generate-preview.mjs ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          tmp="$(/usr/bin/mktemp assets/.asset-flux-XXXXXXXX)"
+          python3 -B demos/fluxcapacitor.py --once | node assets/generate-preview.mjs --fps 12 --duration 10 > "$tmp"
+          [[ -d assets && ! -L assets ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          /bin/mv -f "$tmp" "$out"
+          tmp=""
+        '
+
+  video-gif:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - demos/video.sh
+      - demos/sample.mp4
+      - assets/generate-preview.mjs
+      - assets/preview-rendering.mjs
+      - src/core/image-lines.mjs
+      - src/core/output-update.mjs
+      - src/core/image-update.mjs
+      - src/core/output-options.mjs
+      - src/core/primitive-artwork.mjs
+      - src/core/output-data.mjs
+      - src/core/colors.mjs
+      - src/core/theme.mjs
+    generates:
+      - assets/video-preview.gif
+    cmds:
+      - |
+        /usr/bin/env -u BASH_ENV -u ENV /bin/bash --noprofile --norc -c '
+          set -e -o pipefail
+          umask 077
+          out="assets/video-preview.gif"
+          tmp=""
+          cleanup() { if [[ -n "$tmp" ]]; then /bin/rm -f "$tmp"; fi; }
+          trap cleanup EXIT
+          [[ -d assets && ! -L assets && -d demos && ! -L demos ]]
+          [[ -f demos/video.sh && ! -L demos/video.sh ]]
+          [[ -f demos/sample.mp4 && ! -L demos/sample.mp4 ]]
+          [[ -f assets/generate-preview.mjs && ! -L assets/generate-preview.mjs ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          tmp="$(/usr/bin/mktemp assets/.asset-video-XXXXXXXX)"
+          /bin/bash demos/video.sh --duration 5 | node assets/generate-preview.mjs --fps 10 --duration 120 > "$tmp"
+          [[ -d assets && ! -L assets ]]
+          [[ ! -L "$out" ]]
+          [[ ! -e "$out" || -f "$out" ]]
+          /bin/mv -f "$tmp" "$out"
+          tmp=""
+        '
