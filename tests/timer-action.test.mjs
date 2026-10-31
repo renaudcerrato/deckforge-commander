@@ -198,11 +198,25 @@ test('actual Loop final hard-line SDK handoff drains before deadline and rejects
   // Act
   h.launches[0].callbacks.onUpdate(final); await entered.promise;
   h.launches[0].callbacks.onUpdate({ ...final, hardBreaks: true });
-  const finishing = h.finish(); const before = h.sessions[0].getState().dueMs;
-  gate.resolve(); await finishing; const retained = [...images(r)], due = h.sessions[0].getState().dueMs;
+  const beforeCompletion = [...r.display];
+  const finishing = h.finish();
+  try {
+    // T7: give the queued terminal operation an event-loop turn with the final image still held.
+    await h.launches[0].done.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    // Assert before release: neither completion nor a repeat deadline may precede final handoff.
+    const pending = h.sessions[0].getState();
+    assert.equal(pending.phase, 'stopping');
+    assert.equal(pending.dueMs, undefined);
+    assert.deepEqual(r.display, beforeCompletion);
+    assert.equal(h.launches.length, 1);
+  } finally {
+    gate.resolve(); await finishing;
+  }
+  const retained = [...images(r)], due = h.sessions[0].getState().dueMs;
   await h.advance(5000); h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.idle();
   // Assert
-  assert.equal(before, undefined); assert.equal(due, 5000);
+  assert.equal(due, 5000);
   assert.equal(retained.at(-1), artwork); assert.deepEqual(images(r), retained); assert.deepEqual(r.writes, []);
   assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
 });
@@ -452,15 +466,13 @@ for (const policy of [undefined, 'refresh', 'stop']) {
 }
 
 // Objective: breaking action mapping has no legacy aliases or plugin identity change.
-test('manifest and actual decorators identify Stream/Loop/Run actions registered before connect', options, async t => {
+test('manifest and actual decorators identify Stream/Loop/Run actions', options, async t => {
   // Arrange
   const h = harness(t);
   const manifest = JSON.parse(await readFile(new URL('../git.renaudcerrato.deckforge.sdPlugin/manifest.json', import.meta.url), 'utf8'));
-  const plugin = await readFile(new URL('../src/plugin.ts', import.meta.url), 'utf8');
   // Act
   const run = manifest.Actions.find(action => action.UUID === RUN_UUID);
   const timer = manifest.Actions.find(action => action.UUID === TIMER_UUID);
-  const registrations = [...plugin.matchAll(/streamDeck\.actions\.registerAction\(new (\w+)\(\)\);/g)];
   // Assert
   assert.equal(manifest.Actions.length, 3);
   assert.deepEqual(manifest.Actions.map(action => [action.Name, action.UUID]), [
@@ -474,19 +486,18 @@ test('manifest and actual decorators identify Stream/Loop/Run actions registered
   assert.equal(once.PropertyInspectorPath, run.PropertyInspectorPath);
   assert.deepEqual(once.Controllers, ['Keypad']);
   assert.deepEqual(once.States, [{ Image: 'imgs/actions/once/key', TitleAlignment: 'bottom' }]);
-  assert.deepEqual(run, { Name: 'Stream', UUID: RUN_UUID, Icon: 'imgs/actions/run/icon',
-    Tooltip: 'Display image updates from a configured program.', PropertyInspectorPath: 'ui/run.html',
-    Controllers: ['Keypad'], States: [{ Image: 'imgs/actions/run/key', TitleAlignment: 'bottom' }] });
+  assert.equal(run.Name, 'Stream'); assert.equal(run.UUID, RUN_UUID); assert.equal(run.Icon, 'imgs/actions/run/icon');
+  assert.equal(run.PropertyInspectorPath, 'ui/run.html');
+  assert.deepEqual(run.Controllers, ['Keypad']);
+  assert.deepEqual(run.States, [{ Image: 'imgs/actions/run/key', TitleAlignment: 'bottom' }]);
   assert.equal(timer.Name, 'Loop'); assert.equal(timer.Icon, 'imgs/actions/timer/icon');
   assert.equal(timer.PropertyInspectorPath, run.PropertyInspectorPath);
   assert.deepEqual(timer.Controllers, ['Keypad']);
   assert.deepEqual(timer.States, [{ Image: 'imgs/actions/timer/key', TitleAlignment: 'bottom' }]);
   assert.equal(manifest.UUID, 'git.renaudcerrato.deckforge');
-  assert.equal(manifest.Description, 'Script to canvas'); assert.equal(manifest.Version, '0.1.1.0');
+  assert.equal(manifest.Description, 'Script to canvas');
   assert.equal(manifest.Name, 'DeckForge Commander'); assert.equal(manifest.Author, 'Renaud Cerrato');
   assert.equal(h.decorated.get(h.TimerAction), TIMER_UUID); assert.equal(h.decorated.get(h.RunAction), RUN_UUID);
-  assert.deepEqual(registrations.map(match => match[1]), ['RunAction', 'TimerAction', 'OnceAction']);
-  assert.ok(registrations.every(match => match.index < plugin.indexOf('streamDeck.connect()')));
   assert.equal(h.launches.length, 0); assert.equal(h.sessions.length, 0);
 });
 

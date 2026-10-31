@@ -32,7 +32,7 @@ export function createLatestFrameQueue({ send, onError }) {
     throw new TypeError('send and onError must be functions.');
   }
 
-  let sending = false;
+  let activeUpdate;
   let pendingUpdate;
   let producerFallback;
   let disposed = false;
@@ -41,7 +41,7 @@ export function createLatestFrameQueue({ send, onError }) {
   const idleWaiters = new Set();
 
   function settleWhenIdle() {
-    if (sending || pendingUpdate !== undefined) return;
+    if (activeUpdate !== undefined || pendingUpdate !== undefined) return;
     for (const resolve of idleWaiters) resolve();
     idleWaiters.clear();
   }
@@ -61,12 +61,12 @@ export function createLatestFrameQueue({ send, onError }) {
   }
 
   function sendUpdate(update) {
-    sending = true;
+    activeUpdate = update;
     let result;
     try {
       result = send(update);
     } catch {
-      sending = false;
+      activeUpdate = undefined;
       reportFailure();
       settleWhenIdle();
       return;
@@ -74,7 +74,9 @@ export function createLatestFrameQueue({ send, onError }) {
 
     Promise.resolve(result).then(
       (handedOff) => {
-        sending = false;
+        activeUpdate = undefined;
+        // An attempted active producer must not survive as a cosmetic's alternate.
+        if (handedOff !== false && producerFallback === update) producerFallback = undefined;
         // A cosmetic handoff already delivered this record; never replay its producer copy.
         if (handedOff !== false && update.origin === 'cosmetic'
           && producerFallback?.outputVersion === update.outputVersion) producerFallback = undefined;
@@ -95,7 +97,7 @@ export function createLatestFrameQueue({ send, onError }) {
         sendUpdate(nextUpdate);
       },
       () => {
-        sending = false;
+        activeUpdate = undefined;
         reportFailure();
         settleWhenIdle();
       },
@@ -111,8 +113,10 @@ export function createLatestFrameQueue({ send, onError }) {
       if (producerFallback?.outputVersion !== copy.outputVersion) producerFallback = undefined;
       if (pendingUpdate !== undefined && pendingUpdate.origin !== 'cosmetic'
         && pendingUpdate.outputVersion === copy.outputVersion) producerFallback = pendingUpdate;
+      else if (activeUpdate !== undefined && activeUpdate.origin !== 'cosmetic'
+        && activeUpdate.outputVersion === copy.outputVersion) producerFallback = activeUpdate;
     }
-    if (!sending) {
+    if (activeUpdate === undefined) {
       sendUpdate(copy);
       return true;
     }
@@ -121,7 +125,7 @@ export function createLatestFrameQueue({ send, onError }) {
   }
 
   function whenIdle() {
-    if (!sending && pendingUpdate === undefined) return Promise.resolve();
+    if (activeUpdate === undefined && pendingUpdate === undefined) return Promise.resolve();
     return new Promise(resolve => idleWaiters.add(resolve));
   }
 

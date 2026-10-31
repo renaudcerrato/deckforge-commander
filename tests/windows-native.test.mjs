@@ -2,9 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startWindowsProcessTransport } from '../src/core/windows-process-transport.mjs';
 import { startProcessRun } from '../src/core/process-runner.mjs';
+import { executionPlatform } from '../src/core/execution-paths.mjs';
+import { validateSettings } from '../src/core/settings.mjs';
 
 const execution = () => ({ executable: 'C:/synthetic/node.exe', args: ['', 'é🙂', 'a"b', 'trailing\\'], cwd: 'C:/synthetic' });
+const runnerExecution = (platform = executionPlatform()) => ({
+  executable: platform === 'win32' ? 'C:/synthetic/known-fixture' : '/synthetic/known-fixture', args: [],
+});
 const result = overrides => ({ rootExit: true, rootCode: 0, launchError: false, launchCode: 0, callbackError: false, nativeError: false, stdoutError: false, cleanupCertain: true, ...overrides });
+
+// W3 rev2: only the shared facade input follows the host; native inputs stay Windows-specific.
+for (const platform of ['posix', 'win32']) {
+  test(`${platform} shared-runner fixture passes real validation and rejects mismatched paths`, () => {
+    // Arrange
+    const input = runnerExecution(platform), otherPlatform = platform === 'win32' ? 'posix' : 'win32';
+    // Act
+    const validated = validateSettings(input, platform);
+    // Assert
+    assert.deepEqual(validated, input);
+    assert.throws(() => validateSettings(input, otherPlatform), { diagnosticCode: 'INVALID_EXECUTABLE' });
+  });
+}
 function boundary() {
   let deliver, resolve, reject, bytes, stops = 0;
   const done = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -200,7 +218,7 @@ for (const scenario of publicScenarios) test(`${scenario.label} preserves the pu
   // Windows execution without invoking POSIX spawn or a real executable.
   const fake = boundary(), updates = [], errors = [], diagnostics = [];
   let submissions = 0;
-  const run = startProcessRun({ executable: '/synthetic/known-fixture', args: [] }, {
+  const run = startProcessRun(runnerExecution(), {
     onUpdate: update => updates.push(update),
     onError: message => errors.push(message),
     onDiagnostic: event => diagnostics.push(event),

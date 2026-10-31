@@ -5,7 +5,6 @@ import { validateSettings } from '../src/core/settings.mjs';
 import { equalJson } from '../src/core/settings-authority.mjs';
 import { createActionSession } from '../src/core/action-session.mjs';
 import { startProcessRun } from '../src/core/process-runner.mjs';
-import { createLaunchArtwork } from '../src/core/launch-artwork.mjs';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { createTimerStateCoordinator } from '../src/core/timer-settings.mjs';
@@ -572,7 +571,7 @@ for (const loss of ['hide', 'disconnect']) {
       if (++reads === 1) { entered.resolve(snapshot); return read.promise; }
       return snapshot;
     }, (kind, caption, current, color, footer, extension) => {
-      if (current()) handoffs.push(['title', ''], ['image', createLaunchArtwork(kind, caption, color, footer, extension)]);
+      if (current()) handoffs.push(['presentation', { kind, caption, color, footer, extension, current }]);
     });
     await h.session.appear(stopped);
     const starting = h.session.press(), started = await entered.promise;
@@ -588,8 +587,11 @@ for (const loss of ['hide', 'disconnect']) {
     assert.equal(h.runs.length, 1);
     assert.equal(h.runs[0].stops, 0);
     assert.deepEqual(handoffs, before);
-    assert.equal(before.length, 4); // Legitimate idle Ready followed by first-attempt Loading.
-    assert.match(decodeURIComponent(before.at(-1)[1]), />loading\.\.\.<\/text>/);
+    assert.deepEqual(before.map(([, value]) => [value.kind, value.caption, value.color, value.footer, value.extension]), [
+      ['ready', 'program', '#969696', 'ready', undefined],
+      ['waiting', 'program', '#969696', 'ready', undefined],
+    ]);
+    assert.ok(before.every(([, value]) => value.current() === false), 'old presentation guards are no longer current');
     assert.deepEqual(h.host.writes, []);
     assert.deepEqual(h.host.value, stopped);
     assert.equal(h.session.getState().runRequested, true);
@@ -670,7 +672,7 @@ function nativeIntegrated(input, readback) {
   const session = createActionSession({
     initialConnected: true,
     async onPresentation(kind, caption, current, color, footer, extension) {
-      if (current()) handoffs.push(['title', ''], ['image', createLaunchArtwork(kind, caption, color, footer, extension)]);
+      if (current()) handoffs.push(['presentation', { kind, caption, color, footer, extension, current }]);
     },
     async confirmLaunchSettings(expected) {
       await h.state.whenIdle();
@@ -829,9 +831,12 @@ for (const loss of ['hide', 'disconnect']) {
     assert.equal(resumedIntent, true);
     assert.equal(resumedCount, 2);
     assert.deepEqual(writesBeforeManualCleanup, []);
-    assert.equal(beforeResumeDisplay.length, 4);
+    assert.deepEqual(beforeResumeDisplay.map(([, value]) => [value.kind, value.caption, value.color, value.footer, value.extension]), [
+      ['ready', 'program', '#969696', 'ready', undefined],
+      ['waiting', 'program', '#969696', 'ready', undefined],
+    ]);
     assert.deepEqual(resumedDisplay, beforeResumeDisplay);
-    assert.match(decodeURIComponent(resumedDisplay[3][1]), />loading\.\.\.<\/text>/);
+    assert.ok(resumedDisplay.every(([, value]) => value.current() === false), 'retired presentation guards stay stale after cleanup');
     assert.equal(old.diagnostics.includes('PROCESS_LAUNCH_FAILED'), false);
     assert.deepEqual(h.errors, []);
     disposeNative(h);

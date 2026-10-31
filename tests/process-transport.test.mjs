@@ -1,11 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { startProcessRun } from '../src/core/process-runner.mjs';
+import { executionPlatform } from '../src/core/execution-paths.mjs';
+import { validateSettings } from '../src/core/settings.mjs';
 
 const options = { timeout: 2_000 };
-const execution = () => ({ executable: '/synthetic/program', args: ['', 'literal $(arg)', 'é😀'], cwd: '/synthetic/cwd' });
+const execution = (platform = executionPlatform()) => ({
+  executable: platform === 'win32' ? 'C:/synthetic/program' : '/synthetic/program',
+  args: ['', 'literal $(arg)', 'é😀'],
+  cwd: platform === 'win32' ? 'C:/synthetic/cwd' : '/synthetic/cwd',
+});
 const success = { code: 0, terminated: false };
 const terminated = { code: null, terminated: true };
+
+// W3 rev2: shared-runner validation precedes the injected transport on every host.
+for (const platform of ['posix', 'win32']) {
+  test(`${platform} alternate-transport fixture passes real validation only with matching paths`, options, () => {
+    // Arrange
+    const input = execution(platform), otherPlatform = platform === 'win32' ? 'posix' : 'win32';
+    // Act
+    const validated = validateSettings(input, platform);
+    // Assert
+    assert.deepEqual(validated, input);
+    assert.throws(() => validateSettings(input, otherPlatform), { diagnosticCode: 'INVALID_EXECUTABLE' });
+    assert.throws(() => validateSettings({ ...input, cwd: execution(otherPlatform).cwd }, platform),
+      { diagnosticCode: 'INVALID_CWD' });
+  });
+}
 
 function deferred() {
   let resolve;

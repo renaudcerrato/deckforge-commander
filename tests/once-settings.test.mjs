@@ -14,12 +14,12 @@ for (const title of ['a/b\\c.txt', '', null, 42, 'bad\0title', 'x'.repeat(8193)]
     // Arrange
     const input = { ...base, title }, original = structuredClone(input);
     // Act
-    const result = classifyOnceSettings(input);
-    const same = sameOnceExecutionSettings(input, { ...input, title: 'other' });
+    const result = classifyOnceSettings(input, 'posix');
+    const same = sameOnceExecutionSettings(input, { ...input, title: 'other' }, 'posix');
     // Assert
     assert.deepEqual(result, { kind: 'configured', execution: { executable: base.executable, args: [] } });
     assert.equal(same, true); assert.deepEqual(input, original);
-    assert.equal(sameOnceExecutionSettings(input, { ...input, argsText: 'changed' }), false);
+    assert.equal(sameOnceExecutionSettings(input, { ...input, argsText: 'changed' }, 'posix'), false);
   });
 }
 function capture(operation) { try { operation(); } catch (error) { return error; } }
@@ -40,6 +40,7 @@ function storage(overrides = {}) {
   const writes = [], timers = new Map();
   let host, id = 0, failures = 0;
   const state = createOnceStateCoordinator({
+    platform: 'posix',
     async writeSettings(value) { writes.push(structuredClone(value)); host = structuredClone(value); },
     async readSettings() { return structuredClone(host); },
     onFailure() { failures++; },
@@ -57,11 +58,11 @@ for (const input of [{}, { executable: '' }, { argsText: '', args: 'ignored inva
     // Arrange
     const original = structuredClone(input);
     // Act
-    const result = classifyOnceSettings(input);
+    const result = classifyOnceSettings(input, 'posix');
     // Assert
     assert.deepEqual(result, { kind: 'setup' });
     assert.deepEqual(input, original);
-    assert.throws(() => validateOnceSettings(input), { message: 'Invalid settings.' });
+    assert.throws(() => validateOnceSettings(input, 'posix'), { message: 'Invalid settings.' });
   });
 }
 for (const args of [['two words', '', '$HOME', '*.png', 'é😀', 'a\nb'], '["two words", "", "$HOME", "*.png"]']) {
@@ -70,7 +71,7 @@ for (const args of [['two words', '', '$HOME', '*.png', 'é😀', 'a\nb'], '["tw
     const input = { executable: base.executable, args, cwd: '/synthetic/work', themeColor: '#ABCDEF' };
     const original = structuredClone(input), expected = typeof args === 'string' ? JSON.parse(args) : args;
     // Act
-    const result = validateOnceSettings(input), classified = classifyOnceSettings(input);
+    const result = validateOnceSettings(input, 'posix'), classified = classifyOnceSettings(input, 'posix');
     // Assert
     assert.deepEqual(result, { execution: { executable: base.executable, args: expected, cwd: input.cwd } });
     assert.deepEqual(classified, { kind: 'configured', ...result });
@@ -83,7 +84,7 @@ for (const argsText of ['', '"two words" \'\' $HOME *.png']) {
     // Arrange
     const input = { ...base, argsText, args: '[null]', cwd: '' };
     // Act
-    const result = validateOnceSettings(input);
+    const result = validateOnceSettings(input, 'posix');
     // Assert
     assert.deepEqual(result.execution, { executable: base.executable,
       args: argsText === '' ? [] : ['two words', '', '$HOME', '*.png'] });
@@ -105,7 +106,7 @@ for (const [index, [input, code]] of [
 ].entries()) {
   test(`Once malformed configuration ${index} has only a fixed diagnostic`, () => {
     // Arrange
-    const operation = () => classifyOnceSettings(input);
+    const operation = () => classifyOnceSettings(input, 'posix');
     // Act
     const error = capture(operation);
     // Assert
@@ -119,7 +120,7 @@ for (const field of ['executable', 'argsText', 'args', 'cwd', 'themeColor']) {
     const input = { ...base };
     Object.defineProperty(input, field, { enumerable: true, get() { calls++; throw Error(marker); } });
     // Act
-    const error = capture(() => classifyOnceSettings(input));
+    const error = capture(() => classifyOnceSettings(input, 'posix'));
     // Assert
     invalid(error, 'INVALID_SETTINGS'); assert.equal(calls, 0);
   });
@@ -129,7 +130,7 @@ test('Once unsupported prototype and throwing proxy cannot escape fixed errors',
   const inputs = [Object.assign(Object.create({ inherited: true }), base),
     new Proxy({}, { ownKeys() { throw Error(marker); } })];
   // Act
-  const results = inputs.map(input => capture(() => classifyOnceSettings(input)));
+  const results = inputs.map(input => capture(() => classifyOnceSettings(input, 'posix')));
   // Assert
   results.forEach(error => invalid(error, 'INVALID_SETTINGS'));
 });
@@ -144,7 +145,7 @@ for (const [second, expected] of [
     // Arrange
     const first = structuredClone(base);
     // Act
-    const equal = sameOnceExecutionSettings(first, second);
+    const equal = sameOnceExecutionSettings(first, second, 'posix');
     // Assert
     assert.equal(equal, expected);
   });
@@ -154,12 +155,12 @@ test('Once edits preserve complete unknown JSON and legacy argv without adding a
   const input = { executable: base.executable, args: ['legacy'], extra: { nested: [null, true, 42] } };
   const original = structuredClone(input);
   // Act
-  const result = applyOnceConfigurationEdit(input, { argsText: 'new', cwd: '', themeColor: '#ABCDEF' });
+  const result = applyOnceConfigurationEdit(input, { argsText: 'new', cwd: '', themeColor: '#ABCDEF' }, 'posix');
   result.extra.nested.push('local');
   // Assert
   assert.deepEqual(result, { ...original, argsText: 'new', cwd: '', themeColor: '#abcdef', extra: { nested: [null, true, 42, 'local'] } });
   assert.deepEqual(input, original); assert.equal(Object.hasOwn(result, 'runRequested'), false);
-  assert.deepEqual(applyOnceConfigurationEdit({}, { executable: base.executable }), base);
+  assert.deepEqual(applyOnceConfigurationEdit({}, { executable: base.executable }, 'posix'), base);
 });
 for (const [changes, code] of [[{}, 'INVALID_SETTINGS'], [{ executable: '' }, 'INVALID_EXECUTABLE'],
   [{ executable: 'relative' }, 'INVALID_EXECUTABLE'], [{ cwd: null }, 'INVALID_CWD'],
@@ -169,7 +170,7 @@ for (const [changes, code] of [[{}, 'INVALID_SETTINGS'], [{ executable: '' }, 'I
     // Arrange
     const input = structuredClone(base);
     // Act
-    const error = capture(() => applyOnceConfigurationEdit(input, changes));
+    const error = capture(() => applyOnceConfigurationEdit(input, changes, 'posix'));
     // Assert
     invalid(error, code); assert.deepEqual(input, base);
   });

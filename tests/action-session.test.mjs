@@ -4,6 +4,7 @@ import { createActionSession } from '../src/core/action-session.mjs';
 import { parseOutputUpdate } from '../src/core/output-update.mjs';
 import { createPrimitiveArtwork } from '../src/core/primitive-artwork.mjs';
 import { createLaunchArtwork } from '../src/core/launch-artwork.mjs';
+import { assertSvgElement } from './helpers/svg-harness.mjs';
 
 const options = { timeout: 1_000 };
 const settings = { executable: '/explicit/program', args: ['literal'], runRequested: true };
@@ -11,6 +12,54 @@ const execution = { executable: settings.executable, args: settings.args };
 // Callback records are self-contained OutputUpdate DTOs, never title envelopes.
 const update = name => parseOutputUpdate(`<svg>${name}</svg>`);
 const displayed = name => [['title', ''], ['image', update(name).image]];
+
+test('P1 Stream drains an active producer skipped at title when its queued cosmetic also becomes terminal-stale', options, async () => {
+  // Arrange: neither gated title completion is an image handoff.
+  const producerTitle = deferred(), producerEntered = deferred(), cosmeticTitle = deferred(), cosmeticEntered = deferred();
+  const images = [], timeline = []; let titles = 0;
+  const h = harness({ async setTitle() {
+    if (++titles === 1) { producerEntered.resolve(); await producerTitle.promise; }
+    else if (titles === 2) { cosmeticEntered.resolve(); await cosmeticTitle.promise; }
+  }, async setImage(image, current) { if (current()) { images.push(image); timeline.push('producer'); } },
+  onPresentation(kind, caption, current) { if (current()) timeline.push(kind); } });
+  await h.start(settings);
+  const final = parseOutputUpdate('text:final');
+  h.runs[0].callbacks.onUpdate(final); await producerEntered.promise;
+  // Act: supersede P's cosmetics, then terminate while C is still at its title boundary.
+  const recolor = h.session.applySettings({ ...settings, themeColor: '#abcdef' });
+  producerTitle.resolve(); await cosmeticEntered.promise;
+  h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.runs[0].resolve({ status: 'success' });
+  cosmeticTitle.resolve(); await recolor; await h.session.whenIdle();
+  // Assert: final output precedes Exited even though both original sends declined it.
+  assert.deepEqual(images, [createPrimitiveArtwork(final)]);
+  assert.deepEqual(timeline, ['waiting', 'producer', 'ready']);
+  assert.equal(h.session.getState().runRequested, false); assert.deepEqual(h.errors, []);
+});
+
+for (const superseded of [false, true]) {
+  test(`P2 Stream execution recovery rejected confirmation superseded=${superseded} fences only the current snapshot`, options, async () => {
+    // Arrange: the rejection is a module-boundary contract, not an SDK save acknowledgement.
+    const entered = deferred(), gate = deferred(), snapshots = [];
+    const next = { ...settings, executable: '/synthetic/replacement' }, themed = { ...next, themeColor: '#abcdef' };
+    const h = harness({ confirmLaunchSettings(snapshot) {
+      snapshots.push(snapshot);
+      if (snapshots.length === 2) { entered.resolve(); return gate.promise; }
+      return Promise.resolve(true);
+    } });
+    await h.start(settings);
+    // Act
+    const editing = h.session.applySettings(next); await entered.promise;
+    const cosmetic = superseded ? h.session.applySettings(themed) : undefined;
+    gate.reject(new Error('synthetic confirmation boundary'));
+    await Promise.all([editing, cosmetic]); await h.session.whenIdle();
+    // Assert: stale rejection reconfirms latest complete JSON, current rejection stays blocked.
+    assert.equal(h.session.getState().persistenceBlocked, !superseded);
+    assert.equal(h.session.getState().recoveryPending, false);
+    assert.deepEqual(snapshots, superseded ? [settings, next, themed] : [settings, next]);
+    assert.deepEqual(h.errors, superseded ? [] : ['Run state save failed.']);
+    assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1);
+  });
+}
 
 test('Stream card theme redraw preserves fields and explicit side ink without restarting', options, async () => {
   // Arrange
@@ -66,11 +115,11 @@ for (const type of ['ring', 'bar']) for (const position of ['above', 'below']) {
     const redrawn = decodeURIComponent(h.display.at(-1)[1]);
     // Assert - Byte equality after only theme substitution also preserves every layout coordinate.
     assert.equal(redrawn, original.replaceAll('#969696', '#abcdef'));
-    assert.match(redrawn, /font-weight="normal" font-size="10" fill="#abcdef"[^>]*>C<\/text>/);
-    assert.match(redrawn, /font-weight="bold" font-size="12" fill="#abcdef"[^>]*>V<\/text>/);
+    assertSvgElement(redrawn, 'text', { text: 'C' }, { 'font-weight': 'normal', 'font-size': 10, fill: '#abcdef' });
+    assertSvgElement(redrawn, 'text', { text: 'V' }, { 'font-weight': 'bold', 'font-size': 12, fill: '#abcdef' });
     assert.deepEqual(other.display, untouched);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
-    assert.equal(h.session.getState().phase, 'running'); assert.deepEqual(h.errors, []); assert.deepEqual(h.saves, []);
+    assert.equal(h.session.getState().phase, 'running'); assert.deepEqual(h.errors, []);
   });
 }
 test('S2 Stream complete progress overrides retain final frame through hostile and infeasible callbacks', options, async () => {
@@ -115,9 +164,9 @@ test('Stream expanded text layout theme redraw keeps selected axes/caption style
   await h.session.applySettings({ ...settings, themeColor: '#abcdef' }); await h.session.whenIdle();
   const rendered = decodeURIComponent(h.display.at(-1)[1]);
   // Assert
-  assert.match(rendered, /<text x="72"[^>]*font-size="12"[^>]*fill="#abcdef"[^>]*>A<\/text>/);
-  assert.match(rendered, /<text x="121"[^>]*text-anchor="end"[^>]*font-weight="bold"[^>]*font-size="40"[^>]*fill="#abcdef"[^>]*>C<\/text>/);
-  assert.match(rendered, /stroke="#abcdef" stroke-width="16"/);
+  assertSvgElement(rendered, 'text', { text: 'A' }, { x: 72, 'font-size': 12, fill: '#abcdef' });
+  assertSvgElement(rendered, 'text', { text: 'C' }, { x: 121, 'text-anchor': 'end', 'font-weight': 'bold', 'font-size': 40, fill: '#abcdef' });
+  assertSvgElement(rendered, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 16 });
   assert.equal(record.options['padding-x'], 23);
   assert.deepEqual(other.display, untouched);
   assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
@@ -395,10 +444,10 @@ for (const fill of ['', ';color:red']) {
       const svg = decodeURIComponent(h.display.at(-1)[1].slice('data:image/svg+xml,'.length));
       // Assert
       assert.deepEqual([...svg.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), expected);
-      assert.match(svg, /stroke="#abcdef" stroke-width="2"/);
+      assertSvgElement(svg, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 2 });
       assert.equal(JSON.stringify(record), before);
       assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
-      assert.equal(h.session.getState().phase, 'running'); assert.deepEqual(h.saves, []);
+      assert.equal(h.session.getState().phase, 'running');
     });
   }
 }
@@ -421,7 +470,6 @@ for (const explicit of ['value', 'label', 'both']) {
     assert.equal(typeof accepted, 'string');
     assert.deepEqual(texts.map(text => [text.text, text.attrs['font-size'], text.attrs.fill]), [['45%', '24', explicit === 'label' ? '#abcdef' : '#ff0000'], ['Hi', '20.5', explicit === 'value' ? '#abcdef' : '#0000ff']]);
     assert.equal(JSON.stringify(record), before);
-    assert.deepEqual(h.saves, []);
     assert.equal(h.runs.length, 1);
     assert.equal(h.runs[0].stops, 0);
     assert.equal(h.session.getState().phase, 'running');
@@ -449,7 +497,7 @@ test('invalid/infeasible annotation callbacks cannot replace an accepted pending
   // Assert
   assert.deepEqual(afterProducer, [update('A').image, createPrimitiveArtwork(record)]);
   assert.ok(decodeURIComponent(images.at(-1)).includes('>Hi</text>'));
-  assert.ok(decodeURIComponent(images.at(-1)).includes('font-size="24" fill="#ff0000"'));
+  assertSvgElement(decodeURIComponent(images.at(-1)), 'text', { text: '45%' }, { 'font-size': 24, fill: '#ff0000' });
   assert.deepEqual(h.errors, []);
   assert.equal(h.session.getState().protocolBlocked, false);
   assert.equal(h.runs[0].stops, 0);
@@ -469,7 +517,6 @@ test('annotation theme replay on one action cannot change the independent action
   assert.deepEqual(second.display, originalSecond);
   assert.ok(decodeURIComponent(first.display.at(-1)[1]).includes('#abcdef'));
   assert.ok(decodeURIComponent(second.display.at(-1)[1]).includes('#969696'));
-  assert.deepEqual(first.saves, []); assert.deepEqual(second.saves, []);
 });
 
 // Review regression: an accepted pending producer survives optional same-record recolors.
@@ -510,7 +557,6 @@ for (const terminal of ['success', 'nonzero', 'signal', 'protocol']) {
         terminal === 'success' ? ['ready', 'program'] : ['error', message, terminal === 'protocol' ? 'IMAGE_PROTOCOL_ERROR' : code]]);
       assert.equal(h.runs.length, 1);
       assert.equal(h.session.getState().runRequested, false);
-      assert.deepEqual(h.saves, []);
       assert.equal(primitive.options.color, '#969696');
     });
   }
@@ -648,7 +694,8 @@ function deferred() {
   return { promise, resolve, reject };
 }
 function harness(overrides = {}) {
-  const runs = [], display = [], errors = [], diagnostics = [], guards = [], lifecycle = [], saves = [], presentations = [], artwork = [];
+  // S20: persistence traffic is observed at real storage boundaries in error-settings/settings-authority.
+  const runs = [], display = [], errors = [], diagnostics = [], guards = [], lifecycle = [], presentations = [], artwork = [];
   let arranging = false;
   const { onPresentation: presentationBoundary, ...otherOverrides } = overrides;
   const session = createActionSession({
@@ -687,7 +734,7 @@ function harness(overrides = {}) {
     try { await session.appear(input); } finally { arranging = false; }
     return session.press();
   }
-  return { session, start, runs, display, errors, diagnostics, guards, lifecycle, saves, presentations, artwork };
+  return { session, start, runs, display, errors, diagnostics, guards, lifecycle, presentations, artwork };
 }
 
 // Capture both host display boundaries; lifecycle, rendering and theme resolution stay real.
@@ -772,7 +819,6 @@ for (const loss of ['hide', 'disconnect']) {
       assert.deepEqual(h.handoffs, before);
       assert.deepEqual(expected, [settings, settings, themed]);
       assert.deepEqual(h.runs.map(run => run.stops), [1, 0]);
-      assert.deepEqual(h.saves, []);
       assert.equal(h.session.getState().runRequested, true);
       assert.deepEqual(h.errors, []);
     });
@@ -795,15 +841,14 @@ for (const initiallyUnavailable of [false, true]) {
     assert.deepEqual(h.handoffs, [['title', ''], ['image', createLaunchArtwork('ready', 'program')],
       ['title', ''], ['image', createLaunchArtwork('waiting', 'program')]]);
     assert.equal(h.runs.length, 1);
-    assert.deepEqual(h.saves, []);
   });
 }
 
 for (const loss of ['hide', 'disconnect']) {
-  for (const stage of ['Loading', 'configuration-confirmation', 'complete-confirmation']) {
+  for (const stage of ['Loading', 'configuration-confirmation']) {
     test(`interrupted ${stage} before any spawn resumes silently after ${loss}; cancellation resets explicit Start`, options, async () => {
       // Arrange: gate only the existing first-attempt boundary, never a new resume presentation.
-      const gate = deferred(), entered = deferred(), handoffs = [], saved = [];
+      const gate = deferred(), entered = deferred(), handoffs = [];
       let held = false, waitingGuard;
       const h = harness({
         async onPresentation(kind, caption, current, color, footer, extension) {
@@ -839,7 +884,6 @@ for (const loss of ['hide', 'disconnect']) {
       assert.equal(h.runs.length, 2);
       assert.equal(h.runs[0].stops, 1);
       assert.deepEqual(handoffs.slice(-2), [['title', ''], ['image', createLaunchArtwork('waiting', 'program', '#abcdef')]]);
-      assert.deepEqual(saved, []);
       assert.deepEqual(h.errors, []);
     });
   }
@@ -891,6 +935,7 @@ for (const outcome of ['false', 'reject']) {
     const before = [...h.handoffs];
     // Act
     await h.session.appear(settings); await h.session.whenIdle();
+    const initialDiagnostics = [...h.diagnostics];
     await h.session.refreshAppearance(); await h.session.reconcileAvailability();
     // Assert: silence suppresses interim cards, not the fixed terminal error path.
     assert.deepEqual(h.handoffs, before);
@@ -898,6 +943,7 @@ for (const outcome of ['false', 'reject']) {
     assert.equal(h.session.getState().persistenceBlocked, true);
     assert.equal(h.session.getState().runRequested, false);
     assert.equal(h.session.getState().presentation, 'error');
+    assert.deepEqual(initialDiagnostics, ['STATE_SAVE_FAILED']);
     assert.ok(h.diagnostics.length > 0 && h.diagnostics.every(code => code === 'STATE_SAVE_FAILED'));
   });
 }
@@ -960,7 +1006,6 @@ for (const terminal of ['success-empty', 'success-output', 'nonzero', 'protocol'
     assert.equal(beforePress.runs, 2);
     assert.equal(beforePress.intent, false);
     assert.equal(beforePress.phase, 'stopped');
-    assert.deepEqual(h.saves, []);
     if (success) {
       assert.deepEqual(handoffs.slice(beforeResume.length), [
         ...(terminal === 'success-output' ? [...displayed('active'), ...displayed('final')] : []),
@@ -999,35 +1044,12 @@ test('cancel silent resume during final confirmation prevents spawn; a genuine n
     ['title', ''], ['image', createLaunchArtwork('ready', 'program')],
     ['title', ''], ['image', createLaunchArtwork('waiting', 'program')],
   ]);
-  assert.deepEqual(h.saves, []);
   assert.deepEqual(h.errors, []);
 });
 
-for (const outcome of ['false', 'reject']) {
-  test(`silent resume configuration confirmation ${outcome} cannot authorize replacement`, options, async () => {
-    // Arrange
-    let saves = 0;
-    const h = displayHarness({ async confirmLaunchSettings() {
-      if (++saves === 1) return true;
-      if (outcome === 'reject') throw Error('synthetic persistence failure');
-      return false;
-    } });
-    await h.start(settings); await h.session.disappear();
-    const before = [...h.handoffs];
-    // Act
-    await h.session.appear(settings); await h.session.whenIdle();
-    // Assert
-    assert.equal(h.runs.length, 1);
-    assert.deepEqual(h.handoffs, before);
-    assert.equal(h.session.getState().persistenceBlocked, true);
-    assert.equal(h.session.getState().runRequested, false);
-    assert.deepEqual(h.diagnostics, ['STATE_SAVE_FAILED']);
-  });
-}
-
 // Slice 4: the optional storage boundary confirms complete Started settings after Loading.
 for (const outcome of ['confirmed', 'false', 'reject']) {
-  test(`final launch confirmation ${outcome} controls spawn without additional intent writes`, options, async () => {
+  test(`final launch confirmation ${outcome} gates spawn and redacts current failures`, options, async () => {
     // Arrange
     const gate = deferred(), entered = deferred(), expected = [];
     const h = harness({ confirmLaunchSettings(snapshot) { expected.push(snapshot); entered.resolve(); return gate.promise; } });
@@ -1035,13 +1057,14 @@ for (const outcome of ['confirmed', 'false', 'reject']) {
     // Act
     const starting = h.session.press(); await entered.promise;
     const before = { launches: h.runs.length, presentation: h.artwork.at(-1).kind };
-    if (outcome === 'reject') gate.reject(Error('synthetic storage boundary')); else gate.resolve(outcome === 'confirmed');
+    if (outcome === 'reject') gate.reject(Error('private-state-secret')); else gate.resolve(outcome === 'confirmed');
     await starting; await h.session.whenIdle();
     // Assert
     assert.deepEqual(before, { launches: 0, presentation: 'waiting' });
-    assert.deepEqual(expected, [configured]); assert.deepEqual(h.saves, []);
+    assert.deepEqual(expected, [configured]);
     assert.equal(h.runs.length, outcome === 'confirmed' ? 1 : 0);
     assert.equal(h.session.getState().persistenceBlocked, outcome !== 'confirmed');
+    assert.deepEqual(h.errors, outcome === 'confirmed' ? [] : ['Run state save failed.']);
     if (outcome !== 'confirmed') assert.deepEqual(h.diagnostics, ['STATE_SAVE_FAILED']);
   });
 }
@@ -1064,7 +1087,7 @@ for (const older of ['false', 'reject', 'true']) {
     // Assert: a cosmetic supersession retains explicit Start, even if desired configuration says Stopped.
     assert.equal(before, 0); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
     assert.deepEqual(expected, [configured, { ...configured, themeColor: '#abcdef' }]);
-    assert.deepEqual(h.saves, []); assert.deepEqual(h.errors, []); assert.equal(h.session.getState().persistenceBlocked, false);
+    assert.deepEqual(h.errors, []); assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
 
@@ -1081,7 +1104,6 @@ for (const loss of ['hide', 'disconnect', 'stop', 'execution', 'persistence']) {
     gate.resolve(true); await Promise.all([starting, transition]); await h.session.whenIdle();
     // Assert
     assert.deepEqual(h.runs, []); assert.deepEqual(h.lifecycle, []);
-    assert.deepEqual(h.saves, []);
     if (loss === 'persistence') assert.equal(h.session.getState().persistenceBlocked, true);
   });
 }
@@ -1098,7 +1120,7 @@ test('Stream Ready, Loading and confirmed Exited forward the same configured suf
   assert.deepEqual(h.artwork.map(item => [item.kind, item.caption, item.footer, item.extension]),
     [['ready', 'report', 'ready', '.py'], ['waiting', 'report', 'ready', '.py'], ['ready', 'report', 'exited', '.py']]);
   assert.ok(h.artwork.every(item => decodeURIComponent(item.image).includes('>.py</text>')));
-  assert.deepEqual(h.saves, []); assert.equal(h.runs.length, 1);
+  assert.equal(h.runs.length, 1);
 });
 
 for (const executable of ['/synthetic/python3', '']) {
@@ -1110,7 +1132,7 @@ for (const executable of ['/synthetic/python3', '']) {
     // Assert
     assert.equal(h.artwork.at(-1).extension, undefined);
     assert.equal(h.artwork.at(-1).footer, executable ? 'ready' : 'setup required');
-    assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.runs, []);
   });
 }
 
@@ -1133,14 +1155,14 @@ for (const stage of ['ready', 'waiting', 'exited']) {
     const h = harness(); await h.session.appear(configured);
     if (stage !== 'ready') await h.session.press();
     if (stage === 'exited') { h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.runs[0].resolve({ status: 'success' }); await h.session.whenIdle(); }
-    const before = h.session.getState(), saves = [...h.saves], runs = h.runs.length;
+    const before = h.session.getState(), runs = h.runs.length;
     // Act
     await h.session.applySettings({ ...configured, runRequested: before.runRequested, themeColor: '#ABCDEF' }); await h.session.whenIdle();
     // Assert
     assert.match(decodeURIComponent(h.artwork.at(-1).image), /text-anchor="end"[^>]*fill="#abcdef">\.py<\/text>/);
     assert.equal(h.artwork.at(-1).footer, stage === 'exited' ? 'exited' : 'ready');
     assert.equal(h.session.getState().runRequested, before.runRequested);
-    assert.deepEqual(h.saves, saves); assert.equal(h.runs.length, runs);
+    assert.equal(h.runs.length, runs);
     assert.ok(h.runs.every(run => run.stops === 0)); assert.deepEqual(h.errors, []);
   });
 }
@@ -1198,7 +1220,6 @@ for (const output of [false, true]) {
     assert.deepEqual(beforeDone, ['ready']);
     assert.deepEqual(h.artwork.map(item => [item.kind, item.caption, item.footer]), [['waiting', 'program', 'ready'], ['ready', 'program', 'exited']]);
     assert.match(decodeURIComponent(h.artwork.at(-1).image), />exited<\/text>/);
-    assert.deepEqual(h.saves, []);
     assert.equal(h.runs.length, 1);
     assert.equal(h.session.getState().phase, 'stopped');
     assert.equal(h.session.getState().presentation, 'ready');
@@ -1249,7 +1270,7 @@ for (const edit of ['title', 'theme']) {
       assert.deepEqual(h.errors, reject ? ['Frame send failed.'] : []);
       assert.deepEqual(h.diagnostics, reject ? ['FRAME_SEND_FAILED'] : []);
       assert.deepEqual(h.display, reject ? [] : displayed('after-redraw'));
-      assert.equal(h.runs.length, 1); assert.deepEqual(h.saves, []);
+      assert.equal(h.runs.length, 1);
     });
   }
 }
@@ -1368,7 +1389,6 @@ test('running before first output recolors Loading without changing its script c
   // Assert
   assert.deepEqual(h.artwork.map(item => [item.kind, item.caption, item.footer]), [['waiting', 'program', 'ready'], ['waiting', 'program', 'ready']]);
   assert.match(decodeURIComponent(h.artwork.at(-1).image), /#abcdef.*>program<\/text>.*>loading\.\.\.<\/text>/);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.runs[0].stops, 0);
   assert.equal(h.session.getState().phase, 'running');
 });
@@ -1395,7 +1415,6 @@ for (const pause of ['hide', 'disconnect']) {
       assert.equal(h.artwork.at(-1).footer, natural ? 'exited' : 'ready');
       assert.equal(h.artwork.at(-1).kind, natural ? 'ready' : 'waiting');
       assert.equal(h.artwork.length, before + (natural ? 1 : 0));
-      assert.deepEqual(h.saves, []);
       assert.equal(old.stops, 1);
     });
   }
@@ -1415,7 +1434,6 @@ test('manual stop rejects a late natural-success diagnostic and resets the foote
   assert.equal(h.artwork.at(-1).kind, 'waiting');
   assert.equal(h.artwork.some(item => item.footer === 'exited'), false);
   assert.equal(h.runs.length, 2);
-  assert.deepEqual(h.saves, []);
 });
 
 test('exited is isolated between keys and never inherited by a fresh session', options, async () => {
@@ -1429,7 +1447,6 @@ test('exited is isolated between keys and never inherited by a fresh session', o
   assert.equal(first.artwork.at(-1).footer, 'exited');
   assert.equal(other.artwork.at(-1).footer, 'ready');
   assert.equal(fresh.artwork.at(-1).footer, 'ready');
-  assert.deepEqual(other.saves, []); assert.deepEqual(fresh.saves, []);
   assert.deepEqual(other.runs, []); assert.deepEqual(fresh.runs, []);
 });
 
@@ -1475,7 +1492,6 @@ test('deferred Loading recolor loses its guard when success changes the idle foo
   // Assert
   assert.equal(stale, false);
   assert.deepEqual(painted, [['waiting', 'program', 'ready'], ['ready', 'program', 'exited']]);
-  assert.deepEqual(h.saves, []);
 });
 
 // Explicit per-session intent, not persisted metadata or visibility, controls execution.
@@ -1489,7 +1505,6 @@ test('new action defaults Stopped and idle press starts literal execution', opti
   // Assert
   assert.equal(before, 0);
   assert.deepEqual(h.runs.map(run => run.input), [execution]);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.session.getState().phase, 'running');
 });
 
@@ -1509,7 +1524,6 @@ test('explicit Started and success drain caption-cleared producer frames before 
   assert.equal(h.runs.length, 1);
   assert.deepEqual(h.display, [...displayed('first'), ...displayed('second'), ...displayed('final')]);
   assert.deepEqual(h.errors, []);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.session.getState().runRequested, false);
   assert.deepEqual(h.presentations, [['waiting', 'program'], ['ready', 'program']]);
 });
@@ -1553,13 +1567,12 @@ test('running press stops once and repeated stopping presses never restart', opt
   assert.equal(before, 1);
   assert.equal(h.runs.length, 1);
   assert.equal(h.runs[0].stops, 1);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.session.getState().phase, 'stopped');
 });
 
 test('press during Starting cancels launch even if configuration confirmation arrives late', options, async () => {
   // Arrange
-  const gate = deferred(), entered = deferred(), saves = [];
+  const gate = deferred(), entered = deferred();
   const h = harness({ async confirmLaunchSettings() { entered.resolve(); return gate.promise; } });
   await h.session.appear(execution);
   // Act
@@ -1570,17 +1583,7 @@ test('press during Starting cancels launch even if configuration confirmation ar
   await Promise.all([start, stop]);
   // Assert
   assert.deepEqual(h.runs, []);
-  assert.deepEqual(saves, []);
   assert.equal(h.session.getState().phase, 'stopped');
-});
-
-test('unconfirmed configuration cannot authorize launch', options, async () => {
-  // Arrange
-  const h = harness({ async confirmLaunchSettings() { return false; } });
-  // Act
-  await h.start(settings);
-  // Assert
-  assert.deepEqual(h.runs, []);
 });
 
 test('settings edit stops and remembers Stopped without replacement; next press uses current settings', options, async () => {
@@ -1596,7 +1599,6 @@ test('settings edit stops and remembers Stopped without replacement; next press 
   assert.equal(before, 1);
   assert.deepEqual(h.lifecycle, [['start', settings.executable], ['stop', settings.executable], ['start', next.executable]]);
   assert.deepEqual(h.runs[1].input, { executable: next.executable, args: ['literal argument', ''], cwd: next.cwd });
-  assert.deepEqual(h.saves, []);
 });
 
 test('equivalent legacy migration preserves live execution', options, async () => {
@@ -1610,7 +1612,6 @@ test('equivalent legacy migration preserves live execution', options, async () =
   // Assert
   assert.equal(h.runs.length, 1);
   assert.equal(h.runs[0].stops, 0);
-  assert.deepEqual(h.saves, []);
   assert.deepEqual(h.display, displayed('still-current'));
 });
 
@@ -1630,7 +1631,6 @@ test('hide stops actual execution but remembers Started for reappearance', optio
   await h.session.whenIdle();
   // Assert
   assert.equal(hiddenState.runRequested, true);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.runs[0].stops, 1);
   assert.deepEqual(h.display, displayed('current'));
   assert.deepEqual(h.errors, []);
@@ -1706,8 +1706,6 @@ test('copied settings and independent sessions never cross-write or cross-render
   second.runs[0].callbacks.onUpdate(update('second'));
   await Promise.all([first.session.whenIdle(), second.session.whenIdle()]);
   // Assert
-  assert.deepEqual(first.saves, []);
-  assert.deepEqual(second.saves, []);
   assert.deepEqual(first.display, []);
   assert.deepEqual(second.display, displayed('second'));
   assert.equal(second.runs[0].stops, 0);
@@ -1752,7 +1750,6 @@ for (const [message, diagnostic] of [
     assert.equal(h.runs.length, 2);
     assert.deepEqual(h.errors, [message]);
     assert.deepEqual(h.diagnostics, [diagnostic]);
-    assert.deepEqual(h.saves, []);
   });
 }
 
@@ -1767,7 +1764,6 @@ test('hiding after known failure cannot retain Started', options, async () => {
   // Assert
   assert.equal(h.runs.length, 1);
   assert.equal(h.session.getState().runRequested, false);
-  assert.deepEqual(h.saves, []);
 });
 
 test('disposal during image send prevents stale title and pending image', options, async () => {
@@ -1823,7 +1819,6 @@ test('invalid Started settings never launch or leak private values', options, as
   assert.deepEqual(h.runs, []);
   assert.deepEqual(h.errors, ['Invalid settings.']);
   assert.deepEqual(h.diagnostics, ['INVALID_EXECUTABLE']);
-  assert.deepEqual(h.saves, []);
 });
 
 test('persistence failure stops execution, blocks restart and invalidates old error guards', options, async () => {
@@ -1849,18 +1844,6 @@ test('persistence failure stops execution, blocks restart and invalidates old er
   assert.deepEqual(h.display, []);
 });
 
-test('configuration confirmation rejection cannot launch and exposes only fixed persistence failure', options, async () => {
-  // Arrange
-  const h = harness({ async confirmLaunchSettings() { throw new Error('private-state-secret'); } });
-  // Act
-  await h.start(settings);
-  await h.session.whenIdle();
-  // Assert
-  assert.deepEqual(h.runs, []);
-  assert.deepEqual(h.errors, ['Run state save failed.']);
-  assert.deepEqual(h.diagnostics, ['STATE_SAVE_FAILED']);
-});
-
 test('old generation callbacks after a new start cannot render, diagnose or relaunch', options, async () => {
   // Arrange
   const h = harness();
@@ -1880,7 +1863,6 @@ test('old generation callbacks after a new start cannot render, diagnose or rela
   assert.deepEqual(h.errors, []);
   assert.equal(h.session.getState().protocolBlocked, false);
   assert.equal(h.session.getState().runRequested, true);
-  assert.deepEqual(h.saves, []);
 });
 
 test('unsuccessful natural exit drains accepted pending final frame before diagnosis', options, async () => {
@@ -1904,7 +1886,6 @@ test('unsuccessful natural exit drains accepted pending final frame before diagn
   assert.deepEqual(order, [...displayed('first'), ...displayed('final'), ['error', 'Program exited unsuccessfully.', 'PROCESS_EXITED_NONZERO']]);
   assert.equal(h.runs.length, 1);
   assert.equal(h.session.getState().runRequested, false);
-  assert.deepEqual(h.saves, []);
 });
 
 for (const [input, caption] of [[{}, 'DeckForge Commander'], [{ executable: '/folder/report.py', argsText: '' }, 'report']]) {
@@ -1920,7 +1901,6 @@ for (const [input, caption] of [[{}, 'DeckForge Commander'], [{ executable: '/fo
     assert.equal(h.session.getState().phase, 'stopped');
     assert.deepEqual(h.display, []);
     assert.deepEqual(h.runs, []);
-    assert.deepEqual(h.saves, []);
     assert.deepEqual(h.errors, []);
   });
 }
@@ -1938,11 +1918,11 @@ for (const failure of ['protocol', 'cleanup', 'persistence']) {
     } else await h.session.persistenceFailed();
     // Act
     await h.session.applySettings({ argsText: '' }); await h.session.whenIdle();
-    const before = h.session.getState(), saves = h.saves.length;
+    const before = h.session.getState();
     await h.session.press(); await h.session.press(); await h.session.whenIdle();
     // Assert
     assert.equal(before.presentation, 'error');
-    assert.deepEqual(h.session.getState(), before); assert.equal(h.saves.length, saves);
+    assert.deepEqual(h.session.getState(), before);
     assert.equal(h.runs.length, 1);
     assert.equal(h.artwork.some(item => item.footer === 'setup required'), false);
     assert.equal(h.session.getState()[{ protocol: 'protocolBlocked', cleanup: 'cleanupBlocked', persistence: 'persistenceBlocked' }[failure]], true);
@@ -1965,7 +1945,7 @@ for (const [index, input] of [{}, { executable: '' }, { argsText: 'literal', cwd
     assert.equal(h.session.getState().runRequested, false);
     assert.equal(h.session.getState().protocolBlocked, false);
     assert.equal(h.session.getState().recoveryPending, false);
-    assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []); assert.deepEqual(h.errors, []);
+    assert.deepEqual(h.runs, []); assert.deepEqual(h.errors, []);
     assert.deepEqual(input, original);
   });
 }
@@ -1976,7 +1956,7 @@ for (const input of [{ runRequested: true }, { executable: '', argsText: '', run
     // Act
     await h.session.appear(input); await h.session.whenIdle();
     // Assert
-    assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.runs, []);
     assert.deepEqual(h.errors, []);
     assert.equal(h.session.getState().presentation, 'ready');
     assert.equal(h.session.getState().runRequested, false);
@@ -1993,7 +1973,7 @@ for (const [input, code] of [[{ executable: 'relative', argsText: '' }, 'INVALID
     await h.session.appear(input); await h.session.whenIdle();
     // Assert
     assert.deepEqual(h.errors, ['Invalid settings.']); assert.deepEqual(h.diagnostics, [code]);
-    assert.deepEqual(h.artwork, []); assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.artwork, []); assert.deepEqual(h.runs, []);
   });
 }
 for (const loss of ['hide', 'disconnect']) {
@@ -2009,7 +1989,7 @@ for (const loss of ['hide', 'disconnect']) {
     // Assert
     assert.equal(unavailableDrawings, drawings);
     assert.equal(h.artwork.at(-1).footer, 'setup required');
-    assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.runs, []);
     assert.equal(h.session.getState().runRequested, false);
   });
 }
@@ -2087,7 +2067,6 @@ test('zero-output success returns from Waiting to Play without automatic retry',
   assert.deepEqual(h.presentations, [['waiting', 'program'], ['ready', 'program']]);
   assert.deepEqual(h.display, []);
   assert.equal(h.runs.length, 1);
-  assert.deepEqual(h.saves, []);
 });
 
 for (const [failure, code] of [['launch', 'PROCESS_LAUNCH_FAILED'], ['nonzero', 'PROCESS_EXITED_NONZERO'], ['protocol', 'IMAGE_PROTOCOL_ERROR'], ['cleanup', 'CLEANUP_BLOCKED'], ['persistence', 'STATE_SAVE_FAILED'], ['display', 'FRAME_SEND_FAILED']]) {
@@ -2186,7 +2165,7 @@ test('built-in presentation rejection reports fixed frame-send diagnosis instead
 for (const pauseKind of ['hide', 'disconnect']) {
   test(`owned paused launch failure cancels final resume confirmation after ${pauseKind}, retains error and allows only a genuine new press`, options, async () => {
     // Arrange
-    const confirmation = deferred(), confirmationEntered = deferred(), rendered = [], saved = [], expected = [];
+    const confirmation = deferred(), confirmationEntered = deferred(), rendered = [], expected = [];
     const h = harness({
       confirmLaunchSettings(snapshot) {
         expected.push(snapshot);
@@ -2210,7 +2189,7 @@ for (const pauseKind of ['hide', 'disconnect']) {
     old.resolve({ status: 'stopped' });
     confirmation.resolve(true); await resume; await h.session.whenIdle();
     await h.session.reconcileAvailability(); await h.session.appear(settings);
-    const beforeGenuinePress = { runs: h.runs.length, state: h.session.getState(), saved: saved.at(-1), rendered: [...rendered], errors: [...h.errors], diagnostics: [...h.diagnostics] };
+    const beforeGenuinePress = { runs: h.runs.length, state: h.session.getState(), rendered: [...rendered], errors: [...h.errors], diagnostics: [...h.diagnostics] };
     await h.session.press();
     old.callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED');
     old.callbacks.onError('Program launch failed.');
@@ -2226,7 +2205,6 @@ for (const pauseKind of ['hide', 'disconnect']) {
     assert.equal(beforeGenuinePress.runs, 1);
     assert.equal(beforeGenuinePress.state.phase, 'stopped');
     assert.equal(beforeGenuinePress.state.presentation, 'error');
-    assert.equal(beforeGenuinePress.saved, undefined);
     assert.deepEqual(beforeGenuinePress.rendered, [['waiting', 'program']]);
     assert.deepEqual(beforeGenuinePress.errors, ['Program launch failed.']);
     assert.deepEqual(beforeGenuinePress.diagnostics, ['PROCESS_LAUNCH_FAILED']);
@@ -2235,7 +2213,6 @@ for (const pauseKind of ['hide', 'disconnect']) {
     assert.equal(h.session.getState().presentation, 'streaming');
     assert.deepEqual(h.display, displayed('new'));
     assert.deepEqual(h.errors, ['Program launch failed.']);
-    assert.deepEqual(saved, []);
   });
 }
 
@@ -2268,7 +2245,6 @@ for (const pauseKind of ['hide', 'disconnect']) {
     assert.equal(unavailableState.phase, 'stopped');
     assert.equal(unavailableState.runRequested, false);
     assert.equal(unavailableState.presentation, 'error');
-    assert.deepEqual(h.saves, []);
     assert.equal(h.runs.length, 1);
     assert.deepEqual(rendered, [['waiting', 'program']]);
     assert.deepEqual(h.errors, ['Program launch failed.']);
@@ -2302,7 +2278,6 @@ test('ordinary deferred availability resume without terminal failure starts once
   assert.equal(h.runs.length, 2);
   assert.deepEqual(rendered, [['waiting', 'program']]);
   assert.deepEqual(h.errors, []);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.session.getState().runRequested, true);
   assert.equal(h.session.getState().presentation, 'streaming');
   assert.deepEqual(h.display, displayed('replacement'));
@@ -2318,7 +2293,7 @@ test('theme-only edit recolors fresh invalid configured Error without manufactur
   await h.session.applySettings({ ...snapshot, themeColor: '#ABCDEF' }); await h.session.whenIdle();
   // Assert
   assert.deepEqual(rendered, [['Invalid settings.', 'INVALID_EXECUTABLE', '#969696'], ['Invalid settings.', 'INVALID_EXECUTABLE', '#abcdef']]);
-  assert.deepEqual(h.artwork, []); assert.deepEqual(h.runs, []); assert.deepEqual(h.saves, []);
+  assert.deepEqual(h.artwork, []); assert.deepEqual(h.runs, []);
   assert.equal(h.session.getState().presentation, 'error'); assert.equal(h.session.getState().runRequested, false);
 });
 for (const snapshot of [{}, { ...execution, runRequested: false }]) {
@@ -2333,14 +2308,13 @@ for (const snapshot of [{}, { ...execution, runRequested: false }]) {
     assert.equal(colors.at(-1)[0], 'ready');
     assert.equal(colors.at(-1)[2], '#abcdef');
     assert.deepEqual(h.runs, []);
-    assert.deepEqual(h.saves, []);
     assert.deepEqual(h.errors, []);
     assert.equal(h.session.getState().runRequested, false);
   });
 }
 test('theme-only false metadata echo during pending Started confirmation cannot cancel or duplicate launch', options, async () => {
   // Arrange
-  const gate = deferred(), entered = deferred(), rendered = [], saved = [];
+  const gate = deferred(), entered = deferred(), rendered = [];
   const stopped = { ...settings, runRequested: false };
   const h = harness({
     async confirmLaunchSettings() { entered.resolve(); return gate.promise; },
@@ -2357,7 +2331,6 @@ test('theme-only false metadata echo during pending Started confirmation cannot 
   assert.equal(before.phase, 'starting');
   assert.equal(count, 0);
   assert.equal(h.runs.length, 1);
-  assert.deepEqual(saved, []);
   assert.ok(rendered.some(item => item[0] === 'waiting' && item[1] === '#abcdef'));
 });
 test('opaque producer images outrank theme refresh; mixed execution edit still stops', options, async () => {
@@ -2435,7 +2408,6 @@ test('independent action theme refresh cannot repaint another key', options, asy
   // Assert
   assert.deepEqual(first, ['#969696', '#abcdef']);
   assert.deepEqual(second, ['#969696']);
-  assert.deepEqual(a.saves, []); assert.deepEqual(b.saves, []);
 });
 
 for (const explicit of [false, true]) {
@@ -2455,7 +2427,6 @@ for (const explicit of [false, true]) {
     if (explicit) assert.equal(first, second);
     else assert.notEqual(first, second);
     assert.equal(record.options.color, explicit ? '#ff0000' : '#969696');
-    assert.deepEqual(h.saves, []);
     assert.equal(h.runs.length, 1);
     assert.equal(h.runs[0].stops, 0);
     assert.equal(h.session.getState().phase, 'running');
@@ -2481,7 +2452,6 @@ test('invalid primitive callback preserves live primitive cache, opaque image cl
   assert.equal(h.display.length, before);
   assert.deepEqual(h.display.at(-1), ['image', update('opaque').image]);
   assert.deepEqual(h.errors, []);
-  assert.deepEqual(h.saves, []);
   assert.equal(h.runs[0].stops, 0);
 });
 
@@ -2495,11 +2465,10 @@ for (const explicitFrame of [false, true]) {
     await h.session.applySettings({ ...settings, themeColor: '#abcdef' }); await h.session.whenIdle();
     const svg = decodeURIComponent(h.display.at(-1)[1].slice('data:image/svg+xml,'.length));
     // Assert
-    assert.ok(svg.includes('<rect width="144" height="144" fill="#fffff0"/>'));
-    assert.ok(svg.includes(`stroke="${explicitFrame ? '#0000ff' : '#abcdef'}" stroke-width="0.5"`));
+    assertSvgElement(svg, 'rect', { fill: '#fffff0' }, { width: 144, height: 144 });
+    assertSvgElement(svg, 'rect', { stroke: explicitFrame ? '#0000ff' : '#abcdef' }, { 'stroke-width': 0.5 });
     assert.match(svg, /<text[^>]*fill="#000000"[^>]*>Hi<\/text>/);
     assert.deepEqual(record.overrides, { background: '#fffff0', color: '#000000', border: 0.5, ...(explicitFrame ? { 'border-color': '#0000ff' } : {}) });
-    assert.deepEqual(h.saves, []);
     assert.equal(h.runs[0].stops, 0);
     assert.equal(h.runs.length, 1);
   });

@@ -4,6 +4,7 @@ import { createTimerSession, TIMER_HOLD_MS } from '../src/core/timer-session.mjs
 import { createTimerStateCoordinator } from '../src/core/timer-settings.mjs';
 import { parseOutputUpdate } from '../src/core/output-update.mjs';
 import { createPrimitiveArtwork } from '../src/core/primitive-artwork.mjs';
+import { assertSvgElement } from './helpers/svg-harness.mjs';
 
 const options = { timeout: 3000 };
 const base = { executable: '/synthetic/program.sh', argsText: '', intervalSeconds: 5 };
@@ -15,6 +16,28 @@ const images = h => h.events.filter(event => event[0] === 'image').map(event => 
 const errors = h => h.events.filter(event => event[0] === 'error');
 const cards = h => h.events.filter(event => ['ready', 'waiting'].includes(event[0]));
 const svg = value => decodeURIComponent(value.slice('data:image/svg+xml,'.length));
+
+for (const diagnosis of ['display', 'protocol', 'cleanup']) {
+  test(`P3 Loop pending image rejection preserves ${diagnosis} priority and cancels deadlines`, options, async () => {
+    // Arrange: no real process, SDK or wall-clock timer participates.
+    const gate = deferred(), entered = deferred();
+    const h = harness({ image() { entered.resolve(); return gate.promise; } });
+    await h.appear(); await h.tap();
+    h.runs[0].callbacks.onUpdate(image('pending')); await entered.promise;
+    // Act
+    if (diagnosis !== 'display') h.runs[0].callbacks.onError('Image protocol error.');
+    if (diagnosis === 'cleanup') h.runs[0].stopResult = false;
+    gate.reject(new Error('synthetic image boundary')); await h.session.whenIdle();
+    const beforeLate = [...h.events];
+    h.runs[0].callbacks.onUpdate(image('late')); await h.advance(100000);
+    // Assert: the late rejection still cleans up and suspends, but cannot lower error priority.
+    assert.equal(errors(h).at(-1)?.[2], diagnosis === 'protocol' ? 'IMAGE_PROTOCOL_ERROR'
+      : diagnosis === 'cleanup' ? 'CLEANUP_BLOCKED' : 'FRAME_SEND_FAILED');
+    assert.equal(h.runs[0].stops, 1); assert.equal(h.runs.length, 1);
+    assert.equal(h.session.getState().suspended, true); assert.equal(h.session.getState().dueMs, undefined);
+    assert.deepEqual(h.events, beforeLate);
+  });
+}
 
 test('TITLE-1 Loop custom built-ins retain executable badge and exact post-completion deadline', options, async () => {
   // Arrange
@@ -124,7 +147,7 @@ function harness(overrides = {}) {
   const time = clock(), events = [], runs = [], writes = [], confirmations = [], artwork = [];
   let host = {};
   const coordinator = createTimerStateCoordinator({
-    platform: overrides.platform,
+    platform: overrides.platform ?? 'posix',
     async writeSettings(value) {
       writes.push(structuredClone(value));
       if (overrides.write) await overrides.write(value);
@@ -134,7 +157,7 @@ function harness(overrides = {}) {
     setTimer: time.setTimer, clearTimer: time.clearTimer,
   });
   const session = createTimerSession({
-    platform: overrides.platform,
+    platform: overrides.platform ?? 'posix',
     initialConnected: overrides.initialConnected ?? true,
     now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer,
     async awaitConfiguration(expected) {
@@ -761,13 +784,13 @@ test('running tap disables, safely stops and rejects old output, diagnostics and
 
 test('presses during uncertain in-flight cleanup never replace the owned process', options, async () => {
   // Arrange
-  const stopped = deferred(), entered = deferred();
+  const stopped = deferred();
   const h = harness(); await h.appear({ ...base, actionOnPress: 'stop' }); await h.tap();
   h.runs[0].stopGate = stopped;
   // Act
   await h.session.keyDown(); const stopping = h.session.keyUp();
-  // The stop boundary is queued; use a microtask barrier, not wall-clock sleeps.
-  void Promise.resolve().then(() => entered.resolve()); await entered.promise;
+  // S17: exercise busy gestures only after the owned stop boundary has entered.
+  await h.runs[0].stopEntered.promise;
   void h.session.keyDown(); void h.session.keyUp();
   const before = h.runs.length; stopped.resolve(true); await stopping; await h.session.whenIdle();
   await h.tap();
@@ -1306,7 +1329,7 @@ for (const stage of ['running', 'completed']) {
         await h.edit({ themeColor: '#abcdef' }); const rendered = svg(images(h).at(-1));
         // Assert
         assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), expected);
-        assert.match(rendered, /stroke="#abcdef" stroke-width="2"/);
+        assertSvgElement(rendered, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 2 });
         assert.equal(h.session.getState().dueMs, due); assert.equal(h.session.getState().enabled, true);
         assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
         assert.equal(JSON.stringify(record), before);

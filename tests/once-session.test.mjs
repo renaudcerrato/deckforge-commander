@@ -4,6 +4,7 @@ import { createOnceSession, ONCE_HOLD_MS } from '../src/core/once-session.mjs';
 import { createOnceStateCoordinator } from '../src/core/once-settings.mjs';
 import { parseOutputUpdate } from '../src/core/output-update.mjs';
 import { createPrimitiveArtwork } from '../src/core/primitive-artwork.mjs';
+import { assertSvgElement } from './helpers/svg-harness.mjs';
 
 const options = { timeout: 3000 };
 const base = { executable: '/synthetic/report.PY', argsText: '' };
@@ -13,6 +14,27 @@ const images = h => h.events.filter(event => event[0] === 'image').map(event => 
 const errors = h => h.events.filter(event => event[0] === 'error');
 const cards = h => h.events.filter(event => ['ready', 'loading'].includes(event[0]));
 const svg = value => decodeURIComponent(value.slice('data:image/svg+xml,'.length));
+
+for (const diagnosis of ['display', 'protocol', 'cleanup']) {
+  test(`P3 Once pending image rejection preserves ${diagnosis} priority and stops automation`, options, async () => {
+    // Arrange: the real lifecycle owns diagnosis selection; only image handoff is held.
+    const gate = deferred(), entered = deferred();
+    const h = harness({ image() { entered.resolve(); return gate.promise; } });
+    await h.appear(); await h.tap();
+    h.runs[0].callbacks.onUpdate(parseOutputUpdate('<svg>pending</svg>')); await entered.promise;
+    // Act
+    if (diagnosis !== 'display') h.runs[0].callbacks.onError('Image protocol error.');
+    if (diagnosis === 'cleanup') h.runs[0].stopResult = false;
+    gate.reject(new Error('synthetic image boundary')); await h.session.whenIdle();
+    const beforeLate = [...h.events];
+    h.runs[0].callbacks.onUpdate(parseOutputUpdate('<svg>late</svg>')); await h.advance(100000);
+    // Assert: protocol/cleanup outrank the later display failure without bypassing safe stop.
+    assert.equal(errors(h).at(-1)?.[2], diagnosis === 'protocol' ? 'IMAGE_PROTOCOL_ERROR'
+      : diagnosis === 'cleanup' ? 'CLEANUP_BLOCKED' : 'FRAME_SEND_FAILED');
+    assert.equal(h.runs[0].stops, 1); assert.equal(h.runs.length, 1);
+    assert.equal(h.session.getState().suspended, true); assert.deepEqual(h.events, beforeLate);
+  });
+}
 
 test('TITLE-1 Run custom Ready, Loading and no-output Success clear to dynamic executable fallback', options, async () => {
   // Arrange
@@ -111,7 +133,7 @@ function harness(overrides = {}) {
   const time = clock(), events = [], runs = [], writes = [], confirmations = [];
   let host = {};
   const coordinator = createOnceStateCoordinator({
-    platform: overrides.platform,
+    platform: overrides.platform ?? 'posix',
     async writeSettings(value) {
       writes.push(structuredClone(value));
       if (overrides.write) await overrides.write(value);
@@ -121,7 +143,7 @@ function harness(overrides = {}) {
     setTimer: time.setTimer, clearTimer: time.clearTimer,
   });
   const session = createOnceSession({
-    platform: overrides.platform,
+    platform: overrides.platform ?? 'posix',
     initialConnected: true, now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer,
     async awaitConfiguration(expected) {
       confirmations.push(structuredClone(expected));
@@ -380,7 +402,7 @@ for (const stage of ['running', 'completed']) {
         const rendered = svg(images(h).at(-1));
         // Assert
         assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), expected);
-        assert.match(rendered, /stroke="#abcdef" stroke-width="2"/);
+        assertSvgElement(rendered, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 2 });
         assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
         assert.equal(h.session.getState().phase, stage === 'running' ? 'running' : 'stopped');
         assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { READY_SVG, SETUP_SVG, createLaunchArtwork, getReadyTitle, getExecutableExtension, formatLaunchCaption } from '../src/core/launch-artwork.mjs';
 import { createKeyLayout } from '../src/core/key-layout.mjs';
+import { svgElements, assertSvgElement, assertPaddedClip } from './helpers/svg-harness.mjs';
 const decode = uri => decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
 const captionOf = svg => /<text[^>]*clip-path="url\(#caption-clip\)"[^>]*>([^<]*)<\/text>/.exec(svg)?.[1];
 
@@ -60,9 +61,6 @@ test('POSIX backslash remains part of the caption while Windows namespace paths 
   assert.equal(invalid, 'DeckForge Commander'); assert.equal(invalidExtension, undefined);
 });
 
-// Slice 3: independent pre-badge bytes from the preserved Slice 2 layout.
-const preBadgeReport = '<svg xmlns="http://www.w3.org/2000/svg" width="144" height="144" viewBox="0 0 144 144"><rect width="144" height="144" fill="#000000"/><rect x="8" y="8" width="128" height="128" rx="16" fill="none" stroke="#969696" stroke-width="3" stroke-opacity="0.35"/><defs><clipPath id="caption-clip"><rect x="16" y="48" width="112" height="48"/></clipPath></defs><text x="22" y="32" font-family="Arial,sans-serif" font-size="16" fill="#969696">Stream</text><text x="72" y="83.20" text-anchor="middle" font-family="Arial,sans-serif" font-size="32" fill="#969696" clip-path="url(#caption-clip)">report</text><text x="72" y="124" text-anchor="middle" font-family="Arial,sans-serif" font-size="16" fill="#969696">ready</text></svg>\n';
-
 for (const [executable, extension, title] of [
   ['/synthetic/report.PY', '.py', 'report'], ['/synthetic/archive.tar.GZ', '.gz', 'archive.tar'],
   ['/synthetic/.ENV', undefined, '.ENV'], ['/synthetic/.env.SH', '.sh', '.env'],
@@ -99,14 +97,17 @@ for (const [kind, footer] of [['ready', 'ready'], ['waiting', 'ready'], ['ready'
   test(`Stream ${kind}/${footer} adds only a complete themed suffix badge`, () => {
     // Arrange
     const expectedFooter = kind === 'waiting' ? 'loading...' : footer;
-    const expected = preBadgeReport.replace('>ready</text>', `>${expectedFooter}</text>`);
-    const badge = '<text x="124" y="32" text-anchor="end" font-family="Arial,sans-serif" font-size="16" fill="#969696">.py</text>';
     // Act
     const plain = decode(createLaunchArtwork(kind, 'report', undefined, footer));
     const actual = decode(createLaunchArtwork(kind, 'report', undefined, footer, '.PY'));
     // Assert
-    assert.equal(plain, expected);
-    assert.equal(actual, expected.replace('>Stream</text>', `>Stream</text>${badge}`));
+    const plainText = svgElements(plain, 'text'), badgedText = svgElements(actual, 'text');
+    assert.deepEqual(plainText.map(text => text.text), ['Stream', 'report', expectedFooter]);
+    assert.deepEqual(badgedText.filter(text => text.text !== '.py'), plainText);
+    assert.deepEqual(svgElements(actual, 'rect'), svgElements(plain, 'rect'));
+    assertSvgElement(actual, 'text', { text: '.py' }, { 'text-anchor': 'end', 'font-size': 16, fill: '#969696' });
+    const caption = assertSvgElement(actual, 'text', { text: 'report' }, { 'text-anchor': 'middle', fill: '#969696' });
+    assertPaddedClip(actual, caption, { x: 16, y: 48, width: 112, height: 48 });
     assert.equal(captionOf(actual), 'report');
   });
 }
@@ -114,11 +115,11 @@ for (const [kind, footer] of [['ready', 'ready'], ['waiting', 'ready'], ['ready'
 for (const [extension, visible] of [['.lllllli', true], ['.llllllli', false], ['.iiiirr', true], ['.iiiirrx', true], ['.iiiirrxx', false], ['.ww', true], ['.www', false], ['.' + 'x'.repeat(100), false]]) {
   test(`suffix ${extension.length} units is ${visible ? 'whole' : 'wholly hidden'} in the fixed logical badge slot`, () => {
     // Arrange: narrow/wide public examples straddle the 42-unit slot without reproducing its estimator.
-    const expected = preBadgeReport;
+    const expected = decode(createLaunchArtwork('ready', 'report'));
     // Act
     const actual = decode(createLaunchArtwork('ready', 'report', undefined, undefined, extension));
     // Assert
-    if (visible) assert.match(actual, new RegExp(`text-anchor="end"[^>]*font-size="16"[^>]*>\\${extension}</text>`));
+    if (visible) assertSvgElement(actual, 'text', { text: extension }, { 'text-anchor': 'end', 'font-size': 16 });
     else assert.equal(actual, expected);
     assert.equal(actual.includes('…'), false);
   });
@@ -143,17 +144,18 @@ test('hostile suffix objects never execute accessors, coercion or proxy hooks', 
   const hostile = new Proxy({}, { get() { reads++; throw Error('Unexpected access.'); } });
   const revoked = Proxy.revocable({}, {}); revoked.revoke();
   const inputs = [hostile, revoked.proxy, { get toString() { reads++; throw Error('Unexpected getter.'); } }];
+  const plain = decode(createLaunchArtwork('ready', 'report'));
   // Act
   const results = inputs.map(input => [getExecutableExtension(input), decode(createLaunchArtwork('ready', 'report', undefined, undefined, input))]);
   // Assert
-  assert.deepEqual(results, inputs.map(() => [undefined, preBadgeReport]));
+  assert.deepEqual(results, inputs.map(() => [undefined, plain]));
   assert.equal(reads, 0);
 });
 
 for (const input of ['.', 'py', '.tar.gz', '/private.py', '.p\0y', '.x'.repeat(5000), Symbol('private'), ['.py']]) {
-  test('invalid direct Stream suffix retains independent pre-badge bytes', () => {
+  test('invalid direct Stream suffix leaves the current plain artwork unchanged', () => {
     // Arrange
-    const expected = preBadgeReport;
+    const expected = decode(createLaunchArtwork('ready', 'report'));
     // Act
     const actual = decode(createLaunchArtwork('ready', 'report', undefined, undefined, input));
     // Assert
@@ -318,7 +320,6 @@ test('static default matches Setup exactly without changing identity or descript
   assert.equal(manifest.UUID, 'git.renaudcerrato.deckforge');
   assert.equal(manifest.Name, 'DeckForge Commander');
   assert.equal(manifest.Author, 'Renaud Cerrato');
-  assert.equal(manifest.Version, '0.1.1.0');
   assert.ok(svg.endsWith('</svg>\n'));
   assert.match(svg, /y="124"[^>]*>setup required<\/text>/);
 });

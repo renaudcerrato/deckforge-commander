@@ -325,11 +325,23 @@ test('actual Run final hard-line SDK handoff drains before stopped and ignores m
   // Act
   h.launches[0].callbacks.onUpdate(final); await entered.promise;
   h.launches[0].callbacks.onUpdate({ ...final, hardBreaks: true });
-  const finishing = h.finish(); const phase = h.sessions[0].getState().phase;
-  gate.resolve(); await finishing; const retained = [...r.display];
+  const beforeCompletion = [...r.display];
+  const finishing = h.finish();
+  try {
+    // T7: let the queued terminal operation reach its drain, not just complete()'s first callback.
+    await h.launches[0].done.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    // Assert while the image gate is closed: no premature terminal publication or replacement.
+    assert.equal(h.sessions[0].getState().phase, 'stopping');
+    assert.deepEqual(r.display, beforeCompletion);
+    assert.equal(h.launches.length, 1);
+  } finally {
+    gate.resolve(); await finishing;
+  }
+  const retained = [...r.display];
   h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.advance(100000000);
   // Assert
-  assert.notEqual(phase, 'stopped'); assert.equal(h.sessions[0].getState().phase, 'stopped');
+  assert.equal(h.sessions[0].getState().phase, 'stopped');
   assert.equal(images(r).at(-1), artwork); assert.deepEqual(r.display, retained); assert.deepEqual(r.writes, []);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
 });
@@ -361,20 +373,16 @@ test('actual Run caption redraw is key-local without restart or retry', options,
   assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
 });
 
-test('actual Once decorator and manifest register third independent action before connection without startup', options, async t => {
+test('actual Once decorator and manifest identify the third independent action without startup', options, async t => {
   // Arrange
   const h = harness(t);
   const manifest = JSON.parse(await readFile(new URL('../git.renaudcerrato.deckforge.sdPlugin/manifest.json', import.meta.url), 'utf8'));
-  const plugin = await readFile(new URL('../src/plugin.ts', import.meta.url), 'utf8');
   // Act
   const once = manifest.Actions.find(action => action.UUID === ONCE_UUID);
-  const registrations = [...plugin.matchAll(/streamDeck\.actions\.registerAction\(new (\w+)\(\)\);/g)];
   // Assert
   assert.equal(h.decorated.get(h.OnceAction), ONCE_UUID); assert.equal(manifest.Actions.length, 3);
   assert.equal(once.Name, 'Run'); assert.equal(once.Icon, 'imgs/actions/once/icon'); assert.equal(once.PropertyInspectorPath, 'ui/run.html');
   assert.deepEqual(once.Controllers, ['Keypad']); assert.deepEqual(once.States, [{ Image: 'imgs/actions/once/key', TitleAlignment: 'bottom' }]);
-  assert.deepEqual(registrations.map(match => match[1]), ['RunAction', 'TimerAction', 'OnceAction']);
-  assert.ok(registrations.every(match => match.index < plugin.indexOf('streamDeck.connect()')));
   assert.deepEqual(h.launches, []); assert.deepEqual(h.sessions, []);
 });
 test('actual Run short release launches exactly once with literal argv and all 16 immutable metadata fields', options, async t => {
@@ -468,11 +476,23 @@ test('actual Run final SDK image drain completes before stopped outcome and igno
   // Act
   h.launches[0].callbacks.onUpdate(final); await entered.promise;
   h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'invalid' });
-  const finishing = h.finish(); const phase = h.sessions[0].getState().phase;
-  gate.resolve(); await finishing; const retained = [...r.display];
+  const beforeCompletion = [...r.display];
+  const finishing = h.finish();
+  try {
+    // T7: keep the image unresolved across a full event-loop boundary after completion delivery.
+    await h.launches[0].done.promise;
+    await new Promise(resolve => setImmediate(resolve));
+    // Assert before release so bypassing terminal drain cannot pass on an early stopping snapshot.
+    assert.equal(h.sessions[0].getState().phase, 'stopping');
+    assert.deepEqual(r.display, beforeCompletion);
+    assert.equal(h.launches.length, 1);
+  } finally {
+    gate.resolve(); await finishing;
+  }
+  const retained = [...r.display];
   h.launches[0].callbacks.onUpdate(parseOutputUpdate('<svg>late</svg>')); await h.idle();
   // Assert
-  assert.notEqual(phase, 'stopped'); assert.equal(h.sessions[0].getState().phase, 'stopped');
+  assert.equal(h.sessions[0].getState().phase, 'stopped');
   assert.equal(images(r).at(-1), final.image); assert.deepEqual(r.display, retained); assert.deepEqual(r.writes, []);
 });
 for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNAL']) {

@@ -30,9 +30,22 @@ function fixedErrorSvg(code, lines) {
 }
 
 for (const [diagnostic, code, lines] of fixedDiagnoses) {
-  test(`${diagnostic ?? 'fallback'} retains exact fixed error SVG for every status metadata category`, () => {
-    // Arrange: fabricated hostile metadata must never be inspected or rendered.
+  test(`${diagnostic ?? 'fallback'} retains its exact fixed diagnostic artwork`, () => {
+    // Arrange: every mapping independently pins its approved colors, reasons and geometry.
     const expected = fixedErrorSvg(code, lines);
+    // Act
+    const uri = createErrorArtwork(diagnostic);
+    const error = decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
+    const layout = createKeyLayout('private script caption', undefined, { code, lines });
+    // Assert
+    assert.ok(uri.startsWith('data:image/svg+xml,')); assert.equal(error, expected); assert.equal(layout, expected);
+  });
+}
+
+test('fixed error layout ignores every hostile footer/extension category without disclosure or coercion', () => {
+    // Arrange: metadata handling is shared; it need not multiply every diagnostic mapping.
+    const diagnosis = { code: 'START', lines: ["Can't start", 'Check setup'] };
+    const expected = fixedErrorSvg(diagnosis.code, diagnosis.lines);
     const cyclic = {}; cyclic.self = cyclic;
     const accessors = Object.defineProperties({}, {
       toString: { get() { throw new Error('Unexpected accessor.'); } },
@@ -47,19 +60,14 @@ for (const [diagnostic, code, lines] of fixedDiagnoses) {
       new Proxy({}, { get() { throw new Error('Unexpected proxy access.'); } }),
       () => { throw new Error('Unexpected invocation.'); }];
     // Act
-    const uri = createErrorArtwork(diagnostic);
-    const error = decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
     const layouts = metadata.flatMap(footer => [undefined, '.py', '<script>private</script>', accessors, revoked.proxy].map(extension =>
-      createKeyLayout('private script caption', undefined, { code, lines }, footer, extension)));
+      createKeyLayout('private script caption', undefined, diagnosis, footer, extension)));
     // Assert: exact bytes protect the preexisting diagnosis, colors and geometry.
-    assert.ok(uri.startsWith('data:image/svg+xml,'));
-    assert.equal(error, expected);
     for (const actual of layouts) {
       assert.equal(actual, expected);
       assert.equal(/>ready<|>exited<|>success<|>setup required<|>Stream<|>Loop<|>loading\.\.\.<|private|<script/.test(actual), false);
     }
-  });
-}
+});
 
 for (const [index, input] of [undefined, null, 42, {}, ['INVALID_EXECUTABLE'], 'private-path/env/argv/stderr', '<script onload="private">', 'PROCESS_EXITED_42', 'toString', '__proto__'].entries()) {
   test(`unknown diagnostic ${index} cannot inject or disclose input`, () => {

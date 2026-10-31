@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { parseOutputUpdate } from '../src/core/output-update.mjs';
 import { createPrimitiveArtwork } from '../src/core/primitive-artwork.mjs';
 import { snapshotOutput } from '../src/core/output-frame.mjs';
+import { svgElements as elements, assertSvgElement, assertPaddedClip, assertRingSweep } from './helpers/svg-harness.mjs';
 
 // S2: completed progress schema crosses both immutable callback and render boundaries.
 const completeProgressStyle = 'color:cyan;background:navy;font:mono;weight:bold;border:16;border-color:lime;type:ring;scale:100;thickness:1;track-color:blue;label:C;display:V;value-position:center;label-position:above;rounded:false;value-size:12;label-size:10;value-color:ivory;label-color:accent;label-weight:normal;label-gap:0.5';
@@ -124,8 +125,7 @@ for (const type of ['ring', 'bar']) for (const rounded of [true, false]) {
     if (type === 'ring') {
       const fill = elements(svg, 'circle').find(circle => circle.stroke === '#969696');
       assert.equal(fill.r, '53.6');
-      assert.equal(fill['stroke-dasharray'], '0 336.778732');
-      assert.equal(fill['stroke-linecap'], rounded ? 'round' : 'butt');
+      assertRingSweep(fill, record.value, rounded);
     } else {
       const track = elements(svg, 'rect').find(rect => rect.fill === '#333333');
       const fill = elements(svg, 'rect').find(rect => rect.fill === '#969696');
@@ -258,17 +258,99 @@ for (const type of ['ring', 'bar']) test(`S2 ${type} label weight changes measur
   assert.deepEqual(elements(svgs[0], type === 'ring' ? 'circle' : 'rect'), elements(svgs[1], type === 'ring' ? 'circle' : 'rect'));
 });
 
-// Inspect the public SVG vocabulary, without depending on attribute ordering.
-function elements(svg, name) {
-  return [...svg.matchAll(new RegExp(`<${name}\\b([^>]*)(?:>([^<]*)<\\/${name}>|\\/>)`, 'g'))].map(match => ({
-    ...Object.fromEntries([...match[1].matchAll(/([\w:-]+)="([^"]*)"/g)].map(attribute => [attribute[1], attribute[2]])),
-    text: match[2] ?? '',
-  }));
-}
 function decode(uri) {
   assert.equal(typeof uri, 'string');
   assert.ok(uri.startsWith('data:image/svg+xml,'));
   return decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
+}
+
+test('SVG target inspection accepts reordered attributes but cannot combine attributes from different elements', () => {
+  // Arrange
+  const valid = `<svg><rect stroke-width='2' fill='none' stroke='#abcdef'/></svg>`;
+  const split = `<svg><rect stroke='#abcdef' stroke-width='3'/><rect stroke='#000000' stroke-width='2'/></svg>`;
+  // Act
+  const inspect = svg => assertSvgElement(svg, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 2 });
+  // Assert
+  assert.doesNotThrow(() => inspect(valid)); assert.throws(() => inspect(split), assert.AssertionError);
+});
+
+for (const defect of ['none', 'missing main reference', 'undefined main clip', 'wrong padded bounds']) {
+  test(`main clipping inspection ${defect === 'none' ? 'accepts equivalent IDs/attribute order' : `rejects ${defect} despite clipped side lines`}`, () => {
+    // Arrange: header/footer clipping must never stand in for the main element's own reference.
+    const reference = defect === 'missing main reference' ? '' : `clip-path='url(#${defect === 'undefined main clip' ? 'missing' : 'padded'})'`;
+    const svg = `<svg><defs><clipPath id='padded'><rect height='112' width='${defect === 'wrong padded bounds' ? 111 : 112}' y='16' x='16'/></clipPath></defs><text clip-path='url(#padded)'>H</text><text ${reference}>M</text><text clip-path='url(#padded)'>F</text></svg>`;
+    const main = elements(svg, 'text').find(element => element.text === 'M');
+    // Act
+    const inspect = () => assertPaddedClip(svg, main, { x: 16, y: 16, width: 112, height: 112 });
+    // Assert
+    if (defect === 'none') assert.doesNotThrow(inspect); else assert.throws(inspect, assert.AssertionError);
+  });
+}
+
+for (const circle of [
+  { r: '10', cx: '72', cy: '72', 'stroke-linecap': 'round', 'stroke-dasharray': '15.707963,47.12389', transform: 'rotate(-90 72 72)' },
+  { r: '10', cx: '72', cy: '72', pathLength: '100', 'stroke-linecap': 'round', 'stroke-dasharray': '25 75', transform: 'rotate(270,72,72)' },
+  { r: '10', cx: '72', cy: '72', pathLength: '100', 'stroke-linecap': 'round', 'stroke-dasharray': '25 75', 'stroke-dashoffset': '25' },
+]) {
+  test('ring inspection accepts equivalent calibrated dashes and top-origin forms', () => {
+    // Arrange
+    const input = circle;
+    // Act
+    const inspect = () => assertRingSweep(input, 25, true);
+    // Assert
+    assert.doesNotThrow(inspect);
+  });
+}
+for (const changes of [
+  { 'stroke-dasharray': '24.9 75.1' }, { transform: 'rotate(0 72 72)' },
+  { transform: 'scale(-1 1)' }, { 'stroke-linecap': 'butt' }, { pathLength: '0' },
+]) {
+  test('ring inspection rejects wrong fraction, direction/origin, caps or calibration', () => {
+    // Arrange
+    const circle = { r: '10', cx: '72', cy: '72', pathLength: '100', 'stroke-linecap': 'round',
+      'stroke-dasharray': '25 75', transform: 'rotate(-90 72 72)', ...changes };
+    // Act
+    const inspect = () => assertRingSweep(circle, 25, true);
+    // Assert
+    assert.throws(inspect, assert.AssertionError);
+  });
+}
+
+test('ring inspection accepts a full calibrated endpoint but rejects rounded annotation geometry', () => {
+  // Arrange
+  const full = { r: '10', cx: '72', cy: '72', pathLength: '1', 'stroke-linecap': 'round', 'stroke-dasharray': '1 0' };
+  const rounded = { ...full, pathLength: '100', 'stroke-dasharray': '1.6 98.4', transform: 'rotate(270 72 72)' };
+  // Act
+  const inspectFull = () => assertRingSweep(full, 100, true);
+  const inspectRounded = () => assertRingSweep(rounded, 1700 / 1034, true);
+  // Assert
+  assert.doesNotThrow(inspectFull); assert.throws(inspectRounded, assert.AssertionError);
+});
+
+for (const [encoding, dashes] of [
+  ['undashed', {}], ['calibrated', { pathLength: '100', 'stroke-dasharray': '100 0' }],
+]) {
+  for (const transform of [undefined, 'rotate(0 72 72)', 'rotate(45,72,72)', 'rotate(270 72 72)']) {
+    test(`full ${encoding} ring accepts center rotation ${transform ?? 'absent'} without requiring a top origin`, () => {
+      // Arrange
+      const circle = { r: '10', cx: '72', cy: '72', 'stroke-linecap': 'round', ...dashes,
+        ...(transform === undefined ? {} : { transform }) };
+      // Act
+      const inspect = () => assertRingSweep(circle, 100, true);
+      // Assert
+      assert.doesNotThrow(inspect);
+    });
+  }
+  for (const transform of ['scale(0)', 'translate(1000 1000)']) {
+    test(`full ${encoding} ring rejects invisible or displaced geometry from ${transform}`, () => {
+      // Arrange: a complete fill must not bypass transform validation.
+      const circle = { r: '10', cx: '72', cy: '72', 'stroke-linecap': 'round', ...dashes, transform };
+      // Act
+      const inspect = () => assertRingSweep(circle, 100, true);
+      // Assert
+      assert.throws(inspect, assert.AssertionError);
+    });
+  }
 }
 
 // Card v1: observe rendered lines, not private layout helpers or complete SVG snapshots.
@@ -408,7 +490,7 @@ test('card wrap retains one clipped main line when the middle cannot fit any lin
   // Assert
   assert.deepEqual(lines.map(line => line.text), ['H', 'M', 'F']);
   assert.equal(lines[1]['font-size'], '24');
-  assert.match(rendered, /clip-path="url\(#content-clip\)"/);
+  assertPaddedClip(rendered, lines[1], { x: 16, y: 16, width: 112, height: 112 });
 });
 
 test('card oversized auto headline falls back to 16 and ellipsizes without losing side lines', () => {
@@ -432,7 +514,7 @@ test('card fixed oversized lines keep requested sizes and content behind the pad
   // Assert
   assert.deepEqual(lines.map(line => line.text), ['H', 'M', 'F']);
   assert.deepEqual(lines.map(line => line['font-size']), ['1000', '1000', '1000']);
-  assert.match(rendered, /clip-path="url\(#content-clip\)"/);
+  for (const line of lines) assertPaddedClip(rendered, line, { x: 16, y: 16, width: 112, height: 112 });
   assert.doesNotMatch(rendered, /NaN|Infinity/);
 });
 
@@ -701,8 +783,7 @@ for (const type of ['ring', 'bar']) for (const border of [0, 8, 12.25, 16]) {
       const circles = elements(svg, 'circle').filter(circle => circle.stroke);
       const span = border ? 124 - border : 144;
       close(2 * Number(circles[0].r) + Number(circles[0]['stroke-width']), span);
-      const dash = circles[1]['stroke-dasharray'].split(' ').map(Number);
-      close(dash[0] / (dash[0] + dash[1]), 0.25);
+      assertRingSweep(circles[1], 25, true);
     } else {
       const rects = elements(svg, 'rect').filter(rect => rect.fill === '#333333' || rect.fill === '#969696');
       close(rects[0].width, border ? 124 - border : 112);
@@ -901,7 +982,6 @@ for (const border of [0, 8]) {
               const fittedSize = size === 'auto' ? Math.min(48, Math.floor(span / (1 + 2 * lineHeight))) : size;
               const count = Math.min(3, 1 + Math.floor((span - fittedSize) / (fittedSize * lineHeight)));
               const complete = count === 3;
-              const expected = complete ? ['A', '', 'B'] : count === 2 ? ['A', '…'] : [span / fittedSize - 1.3 >= 0.7 * 1.04 ? 'A…' : '…'];
               const height = fittedSize * (1 + (count - 1) * lineHeight);
               const top = valign === 'top' ? effective : valign === 'bottom' ? 144 - effective - height : (144 - height) / 2;
               const update = parseOutputUpdate(`text:A\\n\\nB|font-size:${size};border:${border};padding:${padding};line-height:${lineHeight};align:${align};valign:${valign}`);
@@ -910,7 +990,13 @@ for (const border of [0, 8]) {
               const artwork = createPrimitiveArtwork(update), rendered = decode(artwork);
               const texts = elements(rendered, 'text'), clip = contentRect(rendered);
               // Assert
-              assert.deepEqual(texts.map(text => text.text), expected);
+              if (complete) assert.deepEqual(texts.map(text => text.text), ['A', '', 'B']);
+              else {
+                assert.equal(texts.length, count);
+                assert.deepEqual(texts.slice(0, -1).map(text => text.text), ['A', '', 'B'].slice(0, count - 1));
+                assert.ok(texts.at(-1).text.endsWith('…'));
+                assert.ok(['A', '', 'B'][count - 1].startsWith(texts.at(-1).text.slice(0, -1)));
+              }
               assert.ok(texts.every(text => Number(text['font-size']) === fittedSize));
               for (const [index, text] of texts.entries()) {
                 close(text.y, top + fittedSize * 0.8 + index * fittedSize * lineHeight);
@@ -1384,20 +1470,23 @@ for (const size of ['auto', 16, 32]) {
 for (const border of [0.5, 3, 8]) {
   for (const lineHeight of [1, 2]) {
       test(`border ${border} auto fitting uses corner-safe width/height at ${lineHeight}`, () => {
-        // Arrange - Mono normal M is conservatively 0.65 * 1.04 units per size.
+        // Arrange - The border's protected rectangle is geometry, not a font-width estimate.
         const padding = Math.ceil((24 - (14 - border / 2) / Math.sqrt(2)) * 1e6) / 1e6;
-        const width = 144 - 2 * padding;
-        const completeSize = Math.floor(width / (6 * 0.65 * 1.04));
-        const size = completeSize;
         const update = parseOutputUpdate(`text:${'M'.repeat(12)}|font:mono;border:${border};padding:12;line-height:${lineHeight};valign:bottom;align:left`);
         // Act
         const svg = decode(createPrimitiveArtwork(update));
         const texts = elements(svg, 'text');
+        const size = Number(texts[0]['font-size']);
+        const larger = parseOutputUpdate(`text:${'M'.repeat(12)}|font:mono;font-size:${size + 1};border:${border};padding:12;line-height:${lineHeight}`);
+        const largerTexts = elements(decode(createPrimitiveArtwork(larger)), 'text');
         // Assert
         assert.equal(texts.length, 2);
+        assert.ok(Number.isInteger(size) && size >= 16 && size <= 48);
         assert.ok(texts.every(text => Number(text['font-size']) === size));
         assert.equal(texts.at(-1).text.endsWith('…'), false);
         assert.equal(texts.map(text => text.text).join(''), 'M'.repeat(12));
+        assert.ok(largerTexts.length > texts.length || largerTexts.some(text => text.text.endsWith('…')),
+          'the next fixed size cannot keep the same complete fewest-line layout');
         for (const [index, text] of texts.entries()) {
           close(text.x, padding);
           assert.ok(Number(text.y) - size * 0.8 >= padding - 0.000001);
@@ -1497,8 +1586,12 @@ for (const type of ['bar', 'ring']) {
             assertProtectedBox(72 - allowance / 2, top, 72 + allowance / 2, bottom, border);
             if (type === 'ring') assert.ok(extent < innerRadius);
             if (index === 1) {
-              const expected = label.length * 0.65 * 1.04 * size <= allowance ? label : label.slice(0, Math.floor((allowance / size - 1.3) / (0.65 * 1.04))) + '…';
-              assert.equal(text.text, expected);
+              if (label === 'Hi') assert.equal(text.text, label);
+              else {
+                assert.ok(text.text.endsWith('…'));
+                assert.ok(label.startsWith(text.text.slice(0, -1)));
+                assert.ok(text.text.length < label.length);
+              }
             }
             assert.equal(text['clip-path'], 'url(#content-clip)');
           }
@@ -1623,19 +1716,7 @@ for (const type of ['ring', 'bar']) {
               const fill = circles.find(circle => circle.stroke === '#ff0000');
               if (value === 0) assert.equal(fill, undefined);
               else {
-                assert.equal(fill['stroke-linecap'], rounded ? 'round' : 'butt');
-                if (value === 100) {
-                  assert.equal(fill['stroke-dasharray'], undefined);
-                  assert.equal(fill.transform, undefined);
-                } else {
-                  const circumference = Math.PI * (extent - thickness);
-                  const dashes = fill['stroke-dasharray'].split(' ').map(Number);
-                  assert.equal(dashes.length, 2);
-                  close(dashes[0], circumference * value / 100);
-                  close(dashes[1], circumference * (100 - value) / 100);
-                  assert.equal(fill.transform, 'rotate(-90 72 72)');
-                  assert.equal(fill.pathLength, undefined);
-                }
+                assertRingSweep(fill, value, rounded);
               }
             } else {
               const rects = elements(svg, 'rect');
@@ -2304,31 +2385,18 @@ for (const [size, thickness] of [[80, 8], [50, 16], [100, 4]]) {
       assert.deepEqual([circle.cx, circle.cy, circle.fill], ['72', '72', 'none']);
     }
     const fill = circles.find(circle => circle.stroke === '#969696');
-    assert.equal(fill.transform, 'rotate(-90 72 72)');
-    assert.equal(fill.pathLength, undefined);
-    const dashes = fill['stroke-dasharray'].split(' ').map(Number);
-    const circumference = 2 * Math.PI * Number(fill.r);
-    close(dashes[0], circumference * 0.25);
-    close(dashes[0] + dashes[1], circumference);
+    assertRingSweep(fill, 25, true);
   });
 }
 
 for (const [value, size, thickness, rounded] of [[1, 50, 16, true], [45, 80, 8, false], [99, 100, 4, true]]) {
-  test(`partial ring ${value}% uses one physical circumference pattern`, () => {
+  test(`partial ring ${value}% preserves its top-origin clockwise fraction and caps`, () => {
     // Arrange
     const update = parseOutputUpdate(`progress:${value}|scale:${size};thickness:${thickness};rounded:${rounded};value-position:none`);
     // Act
     const fill = elements(decode(createPrimitiveArtwork(update)), 'circle').find(circle => circle.stroke === '#969696');
     // Assert
-    const dashes = fill['stroke-dasharray'].split(' ').map(Number);
-    const circumference = 2 * Math.PI * Number(fill.r);
-    assert.equal(dashes.length, 2);
-    close(dashes[0], circumference * value / 100);
-    close(dashes[1], circumference * (100 - value) / 100);
-    close(dashes[0] + dashes[1], circumference);
-    assert.equal(fill.pathLength, undefined);
-    assert.equal(fill.transform, 'rotate(-90 72 72)');
-    assert.equal(fill['stroke-linecap'], rounded ? 'round' : 'butt');
+    assertRingSweep(fill, value, rounded);
   });
 }
 
@@ -2353,8 +2421,7 @@ for (const value of [0, 100]) {
     assert.equal(circles.length, value === 0 ? 1 : 2);
     if (value === 100) {
       const fill = circles.find(circle => circle.stroke === '#969696');
-      assert.equal(fill['stroke-dasharray'], undefined);
-      assert.equal(fill.transform, undefined);
+      assertRingSweep(fill, 100, true);
     }
   });
 }
@@ -2632,13 +2699,7 @@ for (const type of ['ring', 'bar']) {
       if (type === 'ring') {
         const fill = elements(svg, 'circle').find(circle => circle.stroke === '#ff0000');
         if (percentage === 0) assert.equal(fill, undefined);
-        else if (percentage === 100) assert.equal(fill['stroke-dasharray'], undefined);
-        else {
-          const circumference = 2 * Math.PI * Number(fill.r);
-          const dash = fill['stroke-dasharray'].split(' ').map(Number);
-          close(dash[0], circumference * percentage / 100);
-          assert.ok(dash[0] > 0 && dash[1] > 0);
-        }
+        else assertRingSweep(fill, percentage, true);
       } else {
         const track = elements(svg, 'rect').find(rect => rect.fill === '#333333');
         const fill = elements(svg, 'rect').find(rect => rect.fill === '#ff0000');

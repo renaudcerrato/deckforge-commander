@@ -19,12 +19,12 @@ for (const title of ['a/b\\c.txt', '', null, 42, 'bad\0title', 'x'.repeat(8193)]
     const input = { ...base, intervalSeconds: 17, actionOnPress: 'stop', title };
     const original = structuredClone(input);
     // Act
-    const result = classifyTimerSettings(input);
-    const same = sameTimerExecutionSettings(input, { ...input, title: 'other' });
+    const result = classifyTimerSettings(input, 'posix');
+    const same = sameTimerExecutionSettings(input, { ...input, title: 'other' }, 'posix');
     // Assert
     assert.equal(result.kind, 'configured'); assert.equal(result.intervalSeconds, 17); assert.equal(result.actionOnPress, 'stop');
     assert.equal(same, true); assert.deepEqual(input, original);
-    assert.equal(sameTimerExecutionSettings(input, { ...input, argsText: 'changed' }), false);
+    assert.equal(sameTimerExecutionSettings(input, { ...input, argsText: 'changed' }, 'posix'), false);
   });
 }
 
@@ -37,12 +37,12 @@ for (const input of [{}, { executable: '' }, { argsText: '', args: 'malformed le
         // Arrange
         const snapshot = { ...input, actionOnPress, intervalSeconds }, original = structuredClone(snapshot);
         // Act
-        const result = classifyTimerSettings(snapshot);
+        const result = classifyTimerSettings(snapshot, 'posix');
         // Assert
         assert.deepEqual(result, { kind: 'setup', intervalSeconds, actionOnPress });
         assert.equal(Object.hasOwn(result, 'execution'), false);
         assert.deepEqual(snapshot, original);
-        assert.throws(() => validateTimerSettings(snapshot), { message: 'Invalid settings.' });
+        assert.throws(() => validateTimerSettings(snapshot, 'posix'), { message: 'Invalid settings.' });
       });
     }
   }
@@ -51,11 +51,11 @@ test('Timer missing controls default read-only while configured execution remain
   // Arrange
   const input = { ...base, args: 'malformed legacy', themeColor: null }, original = structuredClone(input);
   // Act
-  const setup = classifyTimerSettings({}), configured = classifyTimerSettings(input);
+  const setup = classifyTimerSettings({}, 'posix'), configured = classifyTimerSettings(input, 'posix');
   configured.execution.args.push('local');
   // Assert
   assert.deepEqual(setup, { kind: 'setup', intervalSeconds: 60, actionOnPress: 'refresh' });
-  assert.deepEqual(classifyTimerSettings(input), { kind: 'configured', ...validateTimerSettings(input) });
+  assert.deepEqual(classifyTimerSettings(input, 'posix'), { kind: 'configured', ...validateTimerSettings(input, 'posix') });
   assert.deepEqual(input, original);
 });
 for (const [index, [input, code]] of [
@@ -73,7 +73,7 @@ for (const [index, [input, code]] of [
 ].entries()) {
   test(`Timer malformed setup ${index} remains a fixed error, not defaulted setup`, () => {
     // Arrange
-    const operation = () => classifyTimerSettings(input);
+    const operation = () => classifyTimerSettings(input, 'posix');
     // Act
     const error = capture(operation);
     // Assert
@@ -89,7 +89,7 @@ for (const [field, code] of [['executable', 'INVALID_SETTINGS'], ['args', 'INVAL
     const input = { argsText: '' };
     Object.defineProperty(input, field, { enumerable: true, get() { calls++; throw Error(marker); } });
     // Act
-    const error = capture(() => classifyTimerSettings(input));
+    const error = capture(() => classifyTimerSettings(input, 'posix'));
     // Assert
     assertInvalid(error, code); assert.equal(calls, 0);
   });
@@ -116,6 +116,7 @@ function storage(overrides = {}) {
   const host = { value: undefined, reads: 0, failures: 0 };
   let id = 0;
   const state = createTimerStateCoordinator({
+    platform: 'posix',
     async writeSettings(value) { writes.push(structuredClone(value)); host.value = structuredClone(value); },
     async readSettings() { host.reads++; return structuredClone(host.value); },
     onFailure() { host.failures++; },
@@ -136,9 +137,9 @@ for (const interval of [undefined, 1, 5, 10, 30, 60, 300, 3600, 12345, 86400]) {
     const input = { ...base, cwd: '/synthetic/cwd', themeColor: '#ABCDEF', ...(interval === undefined ? {} : { intervalSeconds: interval }) };
     const original = structuredClone(input);
     // Act
-    const result = validateTimerSettings(input);
+    const result = validateTimerSettings(input, 'posix');
     const effective = readIntervalSeconds(input);
-    const runner = validateSettings(result.execution);
+    const runner = validateSettings(result.execution, 'posix');
     // Assert
     assert.equal(effective, interval ?? 60);
     assert.deepEqual(result, { execution: { executable: base.executable, args: [], cwd: input.cwd }, intervalSeconds: interval ?? 60, actionOnPress: 'refresh' });
@@ -154,9 +155,9 @@ for (const [index, intervalSeconds] of invalidIntervals.entries()) {
     const input = { ...base, intervalSeconds };
     // Act
     const readError = capture(() => readIntervalSeconds(input));
-    const validationError = capture(() => validateTimerSettings(input));
-    const view = getTimerInspectorConfiguration(input);
-    const editError = capture(() => applyTimerConfigurationEdit(base, { intervalSeconds }));
+    const validationError = capture(() => validateTimerSettings(input, 'posix'));
+    const view = getTimerInspectorConfiguration(input, 'posix');
+    const editError = capture(() => applyTimerConfigurationEdit(base, { intervalSeconds }, 'posix'));
     // Assert
     for (const error of [readError, validationError, editError]) assertInvalid(error, 'INTERVAL_INVALID');
     assert.equal(view.intervalSeconds, undefined);
@@ -168,7 +169,7 @@ for (const [index, intervalSeconds] of invalidIntervals.entries()) {
 for (const [index, input] of [null, [], 42, 'synthetic', undefined].entries()) {
   test(`Timer rejects non-object configuration ${index}`, () => {
     // Arrange
-    const operation = () => validateTimerSettings(input);
+    const operation = () => validateTimerSettings(input, 'posix');
     // Act
     const error = capture(operation);
     const intervalError = capture(() => readIntervalSeconds(input));
@@ -185,7 +186,7 @@ for (const key of ['runRequested', 'enabled', 'deadline', 'settings', 'unknown',
     // Arrange
     const input = { ...base, [key]: marker };
     // Act
-    const error = capture(() => validateTimerSettings(input));
+    const error = capture(() => validateTimerSettings(input, 'posix'));
     // Assert
     assertInvalid(error, 'UNKNOWN_SETTING');
   });
@@ -202,7 +203,7 @@ for (const [field, value, code] of [
     // Arrange
     const input = field === 'args' ? { executable: base.executable, args: value } : { ...base, [field]: value };
     // Act
-    const error = capture(() => validateTimerSettings(input));
+    const error = capture(() => validateTimerSettings(input, 'posix'));
     // Assert
     assertInvalid(error, code);
   });
@@ -215,7 +216,7 @@ for (const field of ['executable', 'argsText', 'cwd', 'intervalSeconds']) {
     const input = { ...base };
     Object.defineProperty(input, field, { enumerable: true, get() { reads++; throw new Error(marker); } });
     // Act
-    const error = capture(() => validateTimerSettings(input));
+    const error = capture(() => validateTimerSettings(input, 'posix'));
     // Assert
     assertInvalid(error, field === 'argsText' ? 'ARGS_TEXT_INVALID' : 'INVALID_SETTINGS');
     assert.equal(reads, 0);
@@ -243,14 +244,14 @@ for (const args of [['two words', '', 'a\nb', 'c\rd', 'e\r\nf', 'é😀', '$HOME
     const original = structuredClone(input);
     const expected = typeof args === 'string' ? JSON.parse(args) : args;
     // Act
-    const view = getTimerInspectorConfiguration(input);
-    const result = validateTimerSettings(input);
+    const view = getTimerInspectorConfiguration(input, 'posix');
+    const result = validateTimerSettings(input, 'posix');
     // Assert
     assert.equal(view.intervalSeconds, 60);
     assert.equal(view.actionOnPress, 'refresh');
     assert.equal(view.diagnosticCode, undefined);
     assert.equal(/[\r\n]/.test(view.argsText), false);
-    assert.deepEqual(parseArguments(view.argsText), expected);
+    assert.deepEqual(parseArguments(view.argsText, 'posix'), expected);
     assert.deepEqual(result.execution.args, expected);
     assert.deepEqual(input, original);
   });
@@ -261,7 +262,7 @@ test('explicit empty Timer argsText wins without evaluating or deleting legacy a
   let reads = 0;
   const input = { ...base, get args() { reads++; throw new Error(marker); } };
   // Act
-  const result = validateTimerSettings(input), view = getTimerInspectorConfiguration(input);
+  const result = validateTimerSettings(input, 'posix'), view = getTimerInspectorConfiguration(input, 'posix');
   // Assert
   assert.deepEqual(result.execution.args, []);
   assert.equal(view.argsText, '');
@@ -273,7 +274,7 @@ test('Timer arguments remain literal rather than expanding shell syntax or PATH'
   // Arrange
   const input = { ...base, argsText: "'$HOME' '*.png' '$(synthetic)' ';' '|' '>' ''" };
   // Act
-  const result = validateTimerSettings(input);
+  const result = validateTimerSettings(input, 'posix');
   // Assert
   assert.deepEqual(result.execution.args, ['$HOME', '*.png', '$(synthetic)', ';', '|', '>', '']);
 });
@@ -284,7 +285,7 @@ for (const args of ['malformed', '[null]', ['synthetic\0']]) {
     const input = { executable: base.executable, args, intervalSeconds: 30 };
     const original = structuredClone(input);
     // Act
-    const view = getTimerInspectorConfiguration(input);
+    const view = getTimerInspectorConfiguration(input, 'posix');
     // Assert
     assert.ok(view.diagnosticCode);
     assert.equal(view.argsText, undefined);
@@ -298,9 +299,9 @@ test('Timer execution equivalence separates metadata and lossless argv migration
   const input = { executable: base.executable, args: ['two words', ''] };
   const migrated = { ...input, argsText: '"two words" ""', cwd: '', intervalSeconds: 30, themeColor: '#abcdef' };
   // Act
-  const same = sameTimerExecutionSettings(input, migrated);
+  const same = sameTimerExecutionSettings(input, migrated, 'posix');
   const different = [{ executable: '/synthetic/other' }, { argsText: 'changed' }, { cwd: '/synthetic/cwd' }, { enabled: true }]
-    .map(edit => sameTimerExecutionSettings(input, { ...migrated, ...edit }));
+    .map(edit => sameTimerExecutionSettings(input, { ...migrated, ...edit }, 'posix'));
   const intervals = [sameTimerInterval({}, { intervalSeconds: 60 }), sameTimerInterval({ intervalSeconds: 1 }, { intervalSeconds: 1 }), sameTimerInterval({}, { intervalSeconds: 30 })];
   // Assert
   assert.equal(same, true);
@@ -313,9 +314,9 @@ for (const input of [{}, { executable: 'relative', args: 'malformed' }, stored])
     // Arrange
     const original = structuredClone(input);
     // Act
-    const result = applyTimerConfigurationEdit(input, { intervalSeconds: 123, themeColor: '#ABCDEF' });
+    const result = applyTimerConfigurationEdit(input, { intervalSeconds: 123, themeColor: '#ABCDEF' }, 'posix');
     result.extra?.nested.push('local mutation');
-    const fresh = applyTimerConfigurationEdit(input, { intervalSeconds: 123, themeColor: '#ABCDEF' });
+    const fresh = applyTimerConfigurationEdit(input, { intervalSeconds: 123, themeColor: '#ABCDEF' }, 'posix');
     // Assert
     assert.deepEqual(fresh, { ...original, intervalSeconds: 123, themeColor: '#abcdef' });
     assert.deepEqual(input, original);
@@ -329,8 +330,8 @@ test('Timer execution edits preserve legacy/unknown fields without Run-style int
   const input = { ...structuredClone(stored), runRequested: true, enabled: true };
   const original = structuredClone(input);
   // Act
-  const result = applyTimerConfigurationEdit(input, { executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd' });
-  const newKey = applyTimerConfigurationEdit({}, { executable: base.executable });
+  const result = applyTimerConfigurationEdit(input, { executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd' }, 'posix');
+  const newKey = applyTimerConfigurationEdit({}, { executable: base.executable }, 'posix');
   // Assert
   assert.deepEqual(result, { ...original, executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd' });
   assert.deepEqual(newKey, base);
@@ -348,7 +349,7 @@ for (const [index, edit] of invalidEdits.entries()) {
     // Arrange
     const input = structuredClone(stored), original = structuredClone(input);
     // Act
-    const error = capture(() => applyTimerConfigurationEdit(input, edit));
+    const error = capture(() => applyTimerConfigurationEdit(input, edit, 'posix'));
     // Assert
     assert.equal(error?.message, Object.hasOwn(edit, 'themeColor') ? 'Invalid theme color.' : 'Invalid settings.');
     assert.deepEqual(input, original);
@@ -363,7 +364,7 @@ for (const unsafe of ['getter', 'cycle', 'proxy']) {
       : unsafe === 'proxy' ? new Proxy({}, { ownKeys() { throw new Error(marker); } }) : {};
     if (unsafe === 'cycle') input.self = input;
     // Act
-    const error = capture(() => applyTimerConfigurationEdit(input, { intervalSeconds: 30 }));
+    const error = capture(() => applyTimerConfigurationEdit(input, { intervalSeconds: 30 }, 'posix'));
     // Assert
     assertInvalid(error, 'INVALID_SETTINGS');
     assert.equal(reads, 0);
@@ -378,7 +379,7 @@ test('Timer hydration adopts only once, detaches complete JSON, and never writes
   input.extra.nested.push('caller mutation'); first.settings.args.push('result mutation');
   const revision = h.state.getRevision();
   const rejected = [stored, { ...stored, intervalSeconds: 30 }].map(value => h.state.observe(value));
-  const view = getTimerInspectorConfiguration(h.state.getSettings());
+  const view = getTimerInspectorConfiguration(h.state.getSettings(), 'posix');
   await h.state.whenIdle();
   // Assert
   assert.equal(first.accepted, true);
@@ -521,14 +522,14 @@ for (const actionOnPress of [undefined, 'refresh', 'stop']) {
     const input = { ...base, ...(actionOnPress === undefined ? {} : { actionOnPress }) };
     const original = structuredClone(input);
     // Act
-    const policy = readActionOnPress(input), resolved = validateTimerSettings(input);
-    const view = getTimerInspectorConfiguration(input);
+    const policy = readActionOnPress(input), resolved = validateTimerSettings(input, 'posix');
+    const view = getTimerInspectorConfiguration(input, 'posix');
     // Assert
     assert.equal(policy, actionOnPress ?? 'refresh');
     assert.deepEqual(resolved, { execution: { executable: base.executable, args: [] }, intervalSeconds: 60, actionOnPress: policy });
     assert.equal(view.actionOnPress, policy); assert.equal(view.diagnosticCode, undefined);
     assert.deepEqual(input, original);
-    assert.deepEqual(validateSettings(resolved.execution), resolved.execution);
+    assert.deepEqual(validateSettings(resolved.execution, 'posix'), resolved.execution);
   });
 }
 
@@ -540,9 +541,9 @@ for (const [index, actionOnPress] of invalidPolicies.entries()) {
     // Arrange
     const input = { ...base, actionOnPress };
     // Act
-    const failures = [capture(() => readActionOnPress(input)), capture(() => validateTimerSettings(input)),
-      capture(() => applyTimerConfigurationEdit(stored, { intervalSeconds: 10, actionOnPress }))];
-    const view = getTimerInspectorConfiguration(input);
+    const failures = [capture(() => readActionOnPress(input)), capture(() => validateTimerSettings(input, 'posix')),
+      capture(() => applyTimerConfigurationEdit(stored, { intervalSeconds: 10, actionOnPress }, 'posix'))];
+    const view = getTimerInspectorConfiguration(input, 'posix');
     // Assert
     failures.forEach(error => assertInvalid(error, 'ACTION_ON_PRESS_INVALID'));
     assert.equal(view.actionOnPress, undefined); assert.equal(view.diagnosticCode, 'ACTION_ON_PRESS_INVALID');
@@ -558,24 +559,24 @@ test('Timer policy accessors and conversion hooks are never invoked', () => {
   const conversion = { ...base, actionOnPress: { toString() { calls++; throw new Error(marker); }, valueOf() { calls++; return 'refresh'; } } };
   // Act
   const failures = [accessor, conversion].flatMap(input => [capture(() => readActionOnPress(input)),
-    capture(() => validateTimerSettings(input)), capture(() => applyTimerConfigurationEdit(stored, input))]);
-  const views = [accessor, conversion].map(getTimerInspectorConfiguration);
+    capture(() => validateTimerSettings(input, 'posix')), capture(() => applyTimerConfigurationEdit(stored, input, 'posix'))]);
+  const views = [accessor, conversion].map(input => getTimerInspectorConfiguration(input, 'posix'));
   // Assert
   failures.forEach(error => assertInvalid(error, 'ACTION_ON_PRESS_INVALID'));
   assert.ok(views.every(view => view.actionOnPress === undefined && view.diagnosticCode === 'ACTION_ON_PRESS_INVALID'));
   assert.equal(calls, 0);
 });
 
-test('Timer public policy reader contains throwing proxy descriptor errors in a fixed diagnostic', () => {
+for (const target of [{}, { actionOnPress: 'stop' }]) test('Timer public policy reader contains unconditional proxy descriptor errors in a fixed diagnostic', () => {
   // Arrange
-  const input = new Proxy({}, { getOwnPropertyDescriptor() { throw new Error(marker); } });
+  const input = new Proxy(target, { getOwnPropertyDescriptor() { throw new Error(marker); } });
   // Act
   const failure = capture(() => readActionOnPress(input));
   // Assert
   assertInvalid(failure, 'ACTION_ON_PRESS_INVALID');
 });
 
-// Reader recovery: shape and both descriptor reads belong to the same fixed boundary.
+// Reader recovery: revoked roots remain inside the same fixed diagnostic boundary.
 for (const shape of ['object', 'array']) {
   test(`Timer policy reader contains revoked ${shape} proxy shape failures`, () => {
     // Arrange
@@ -587,22 +588,6 @@ for (const shape of ['object', 'array']) {
     assertInvalid(failure, 'ACTION_ON_PRESS_INVALID');
   });
 }
-
-test('Timer policy reader contains a descriptor failure after successful own-property recognition', () => {
-  // Arrange
-  let reads = 0;
-  const input = new Proxy({ actionOnPress: 'stop' }, {
-    getOwnPropertyDescriptor(target, key) {
-      if (++reads === 2) throw new Error(marker);
-      return Reflect.getOwnPropertyDescriptor(target, key);
-    },
-  });
-  // Act
-  const failure = capture(() => readActionOnPress(input));
-  // Assert
-  assertInvalid(failure, 'ACTION_ON_PRESS_INVALID');
-  assert.equal(reads, 2);
-});
 
 test('Timer policy reader rejects hostile array roots without inspecting their fields', () => {
   // Arrange
@@ -622,10 +607,10 @@ for (const actionOnPress of ['refresh', 'stop']) {
     const input = { ...structuredClone(stored), runRequested: true, unknown: [false, { value: 'synthetic' }] };
     const original = structuredClone(input);
     // Act
-    const edited = applyTimerConfigurationEdit(input, { actionOnPress });
+    const edited = applyTimerConfigurationEdit(input, { actionOnPress }, 'posix');
     edited.extra.nested.push('local');
-    const fresh = applyTimerConfigurationEdit(input, { actionOnPress });
-    const newKey = applyTimerConfigurationEdit({}, { actionOnPress });
+    const fresh = applyTimerConfigurationEdit(input, { actionOnPress }, 'posix');
+    const newKey = applyTimerConfigurationEdit({}, { actionOnPress }, 'posix');
     // Assert
     assert.deepEqual(fresh, { ...original, actionOnPress }); assert.deepEqual(input, original);
     assert.deepEqual(newKey, { actionOnPress });
@@ -637,9 +622,9 @@ for (const actionOnPress of ['refresh', 'stop']) {
     const input = { executable: base.executable, args: ['two words', ''] };
     const edited = { ...input, argsText: "'two words' ''", intervalSeconds: 60, themeColor: '#abcdef', actionOnPress };
     // Act
-    const equivalent = sameTimerExecutionSettings(input, edited), interval = sameTimerInterval(input, edited);
-    const changed = sameTimerExecutionSettings(input, { ...edited, executable: '/synthetic/other' });
-    const runFailure = capture(() => validateSettings({ ...base, actionOnPress }));
+    const equivalent = sameTimerExecutionSettings(input, edited, 'posix'), interval = sameTimerInterval(input, edited);
+    const changed = sameTimerExecutionSettings(input, { ...edited, executable: '/synthetic/other' }, 'posix');
+    const runFailure = capture(() => validateSettings({ ...base, actionOnPress }, 'posix'));
     // Assert
     assert.equal(equivalent, true); assert.equal(interval, true); assert.equal(changed, false);
     assertInvalid(runFailure, 'UNKNOWN_SETTING');

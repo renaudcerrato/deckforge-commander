@@ -104,7 +104,7 @@ test('manager registers three public hooks once and performs no background devic
   e.emit('connect', device); e.emit('connect', device);
   await e.manager.whenIdle();
   // Assert
-  assert.deepEqual(e.registrations, ['connect', 'disconnect', 'wake']);
+  assert.deepEqual([...e.registrations].sort(), ['connect', 'disconnect', 'wake']);
   assert.equal(beforeIdle, 1);
   assert.equal(reads, 1);
   assert.equal(h.runs.length, 1);
@@ -336,7 +336,7 @@ test('listener-only disposal is idempotent and does not imply OS/process shutdow
   e.emit('disconnect', { ...device, isConnected: false }); e.emit('wake');
   await e.manager.reconcile(); await e.manager.whenIdle();
   // Assert
-  assert.deepEqual(e.disposals, ['connect', 'disconnect', 'wake']);
+  assert.deepEqual([...e.disposals].sort(), ['connect', 'disconnect', 'wake']);
   assert.equal(h.runs[0].stops, 0);
   assert.deepEqual(h.saves, []);
 });

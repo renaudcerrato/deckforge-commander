@@ -59,6 +59,103 @@ function harness({ built = false, loading = false } = {}) {
   return { f, time, sockets, errors, events, bridge, connect, bind, open, claim, ready, last, reply, dispose,
     chained: () => chained, edits: () => sockets.at(-1).sent.filter(message => message.payload?.type === 'canvas:edit') };
 }
+
+for (const built of [false, true]) {
+  test(`P4 ${built ? 'built' : 'source'} acknowledgment of A cannot shorten B's trailing text debounce`, t => {
+    // Arrange: the clock controls delivery; no promise turns or wall-clock delays stand in for 200ms.
+    const h = harness({ built }); t.after(h.dispose); h.ready();
+    h.f.argsText.value = 'A'; h.time.advance(200); const first = h.last();
+    h.time.advance(100); h.f.argsText.value = 'B'; h.time.advance(100);
+    // Act: A is acknowledged halfway through B's independent trailing interval.
+    h.reply({ ...first, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'A' } });
+    const afterAck = h.edits().length, pendingText = h.f.argsText.value, pendingStatus = h.f.status.textContent;
+    h.time.advance(99); const beforeDeadline = h.edits().length;
+    h.time.advance(1); const second = h.last();
+    h.reply({ ...second, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'B' } });
+    // Assert: preserve B and Saving without sending it before its own deadline.
+    assert.equal(afterAck, 1); assert.equal(beforeDeadline, 1); assert.equal(h.edits().length, 2);
+    assert.equal(pendingText, 'B'); assert.equal(pendingStatus, 'Saving…');
+    assert.deepEqual(JSON.parse(JSON.stringify(second.changes)), { argsText: 'B' });
+    assert.equal(h.f.status.textContent, '');
+  });
+
+  test(`P4 ${built ? 'built' : 'source'} file selection still saves immediately during a text debounce`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose); h.ready();
+    // Act
+    h.f.argsText.value = 'pending'; h.time.advance(100);
+    const beforePicker = h.edits().length; h.f.executable.value = '/synthetic/selected';
+    const request = h.last();
+    // Assert: the immediate boundary is not made dependent on text delay or a future acknowledgment.
+    assert.equal(beforePicker, 0); assert.equal(h.edits().length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(request.changes)), { argsText: 'pending', executable: '/synthetic/selected' });
+  });
+
+  test(`P6 ${built ? 'built' : 'source'} never-connected text remains eligible for the first handshake`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose);
+    // Act
+    h.f.argsText.value = 'preconnection'; h.time.advance(200); const before = h.sockets.length;
+    h.ready(); const request = h.last();
+    h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'preconnection' } });
+    // Assert: initial buffering is distinct from a terminally failed transport.
+    assert.equal(before, 0); assert.equal(h.edits().length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(request.changes)), { argsText: 'preconnection' });
+    assert.equal(h.f.argsText.value, 'preconnection'); assert.equal(h.f.status.textContent, '');
+  });
+
+  for (const event of ['onerror', 'onclose']) {
+    test(`P6 ${built ? 'built' : 'source'} typing after ${event} retains terminal error without resend or cross-binding draft`, t => {
+      // Arrange
+      const h = harness({ built }); t.after(h.dispose); h.ready();
+      const socket = h.sockets[0], before = socket.sent.length;
+      // Act
+      socket.readyState = 3; socket[event]({ type: event, reason: 'PRIVATE_SOCKET_REASON' });
+      h.f.argsText.value = 'PRIVATE_FAILED_DRAFT'; h.time.advance(200);
+      const failed = { status: h.f.status.textContent, sent: socket.sent.length, timers: h.time.timers.size };
+      h.time.advance(15000); const afterTimeout = { status: h.f.status.textContent, sent: socket.sent.length, timers: h.time.timers.size };
+      h.ready({ ...initial, argsText: 'next-binding' }, ONCE_ACTION_UUID, 'next-key');
+      h.time.advance(200);
+      // Assert: valid typing cannot promise Saving when transport can no longer confirm it.
+      assert.deepEqual(failed, { status: 'Settings could not be confirmed.', sent: before, timers: 0 });
+      assert.deepEqual(afterTimeout, failed);
+      assert.equal(h.f.argsText.value, 'next-binding'); assert.deepEqual(h.edits(), []);
+      assert.equal(JSON.stringify(h.sockets[1].sent).includes('PRIVATE_'), false);
+    });
+  }
+}
+
+for (const sameContext of [false, true]) {
+  test(`P5 built deferred DOM never replays A configuration after invalid B ${sameContext ? 'same-key session reset' : 'different-key binding'}`, t => {
+    // Arrange: only the actual built install entry owns deferred hydration; no new production seam.
+    const h = harness({ built: true, loading: true }); t.after(h.dispose);
+    const a = { ...initial, executable: '/synthetic/PRIVATE_A.py', argsText: 'PRIVATE_A_ARG', cwd: '/synthetic/PRIVATE_A', title: 'PRIVATE_A_TITLE' };
+    h.bind(a, ONCE_ACTION_UUID, 'key-A'); const oldSocket = h.sockets[0];
+    // Act: malformed complete settings fail before onSettings can replace queued A configuration.
+    h.bind([], ONCE_ACTION_UUID, sameContext ? 'key-A' : 'key-B');
+    h.events.get('DOMContentLoaded')();
+    const values = [h.f.executable.value, h.f.argsText.value, h.f.cwd.value, h.f.title.value];
+    // Assert: B's fixed diagnosis survives without A data, hydration writes or draft transfer.
+    assert.equal(values.some(value => typeof value === 'string' && value.includes('PRIVATE_A')), false);
+    assert.equal(h.f.status.textContent, 'Settings could not be confirmed.');
+    assert.equal(h.f.timerControls.hidden, true); assert.equal(oldSocket.closed, true);
+    assert.equal(h.sockets.length, 1); assert.equal(h.time.timers.size, 0);
+    assert.deepEqual(oldSocket.sent, []);
+  });
+}
+
+test('P5 built deferred DOM still hydrates the latest valid binding without saving', t => {
+  // Arrange
+  const h = harness({ built: true, loading: true }); t.after(h.dispose);
+  h.bind({ ...initial, argsText: 'A' }, ONCE_ACTION_UUID, 'key-A');
+  // Act
+  h.bind({ ...initial, argsText: 'B' }, ONCE_ACTION_UUID, 'key-B');
+  h.events.get('DOMContentLoaded')(); h.open(); h.claim({ ...initial, argsText: 'B' });
+  // Assert
+  assert.equal(h.f.argsText.value, 'B'); assert.equal(h.f.status.textContent, '');
+  assert.deepEqual(h.edits(), []); assert.equal(h.sockets[0].closed, true);
+});
+
 for (const built of [false, true]) {
   test(`TITLE-1 Run inspector title uses shared saved-only control and debounce (built=${built})`, () => {
     // Arrange
@@ -68,12 +165,19 @@ for (const built of [false, true]) {
     h.time.advance(1); const request = h.last();
     h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, title: 'a/b.txt' } });
     h.f.title.value = ''; h.time.advance(200); const clear = h.last();
+    const pendingStatus = h.f.status.textContent;
+    h.reply({ ...clear, type: 'canvas:reply', status: 'saved', settings: { ...initial, title: '' } });
     // Assert
     assert.deepEqual(hydration, []); assert.equal(before, 0); assert.equal(beforeDeadline, 0);
     assert.equal(h.f.title.renderedHint, 'report');
     assert.deepEqual(JSON.parse(JSON.stringify(request.changes)), { title: 'a/b.txt' });
     assert.deepEqual(JSON.parse(JSON.stringify(clear.changes)), { title: '' }); assert.equal(h.f.timerControls.hidden, true);
-    assert.deepEqual(h.errors, []); h.dispose();
+    // S27: built mode exposes status/traffic, not the source-only diagnostic callback array.
+    assert.equal(pendingStatus, 'Saving…'); assert.equal(h.f.status.textContent, '');
+    assert.deepEqual(h.sockets[0].sent.filter(message => message.event === 'sendToPlugin')
+      .map(message => message.payload.type), ['canvas:hello', 'canvas:claim', 'canvas:edit', 'canvas:edit']);
+    assert.equal(h.sockets[0].sent.some(message => message.event === 'setSettings' || message.payload?.type === 'canvas:trace'), false);
+    h.dispose();
   });
 }
 test('TITLE-1 Run inspector invalid title has fixed diagnostics and old binding replies are ignored', () => {
@@ -241,6 +345,7 @@ test('Run old saved reply cannot replace newer pending text or falsely report co
   const h = harness(); h.ready(); h.f.argsText.value = 'old'; h.time.advance(200); const old = h.last();
   // Act
   h.f.argsText.value = 'new'; h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'old' } });
+  h.time.advance(200); // P4: B becomes eligible at its own trailing deadline.
   const newest = h.last(), pending = h.f.status.textContent;
   h.reply({ ...newest, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'new' } });
   // Assert
@@ -261,15 +366,27 @@ for (const action of [ONCE_ACTION_UUID, RUN_ACTION_UUID, TIMER_ACTION_UUID]) {
   });
 }
 for (const action of ['synthetic.unknown', 'git.renaudcerrato.deckforge.timer', 'git.renaudcerrato.deckforge.once']) {
-test(`${action} invalidates former Run binding without a legacy alias`, () => {
+test(`${action} invalidates former Run binding without a legacy alias or requiring a replacement socket`, t => {
   // Arrange
-  const h = harness(); h.ready(); const old = h.sockets[0];
+  const h = harness(); t.after(h.dispose); h.ready();
+  h.f.argsText.value = 'old-request'; h.time.advance(200);
+  const old = h.sockets[0], request = h.last();
   // Act
   h.bind(initial, action);
+  const before = h.sockets.map(socket => [...socket.sent]);
+  h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'PRIVATE_OLD' } }, old);
+  old.onopen(); old.onerror();
+  h.f.intervalPreset.value = '10'; h.f.actionOnPress.value = 'stop'; h.time.advance(200);
+  const invalid = h.bridge.getConnectionState(), text = h.f.argsText.value, hidden = h.f.timerControls.hidden;
+  const after = h.sockets.map(socket => [...socket.sent]);
+  h.ready({ ...initial, argsText: 'supported' }, ONCE_ACTION_UUID, 'supported-key');
+  h.f.argsText.value = 'current'; h.time.advance(200); const current = h.last();
   // Assert
-  assert.equal(old.closed, true); assert.equal(h.sockets.length, 2);
-  assert.equal(h.bridge.getConnectionState().bindingValid, false);
-  assert.equal(h.f.timerControls.hidden, true); h.dispose();
+  assert.equal(old.closed, true); assert.equal(invalid.bindingValid, false);
+  assert.equal(hidden, true); assert.equal(text, initial.argsText); assert.deepEqual(after, before);
+  assert.equal(h.bridge.getConnectionState().bindingValid, true);
+  assert.equal(current.context, 'supported-key'); assert.notEqual(current.inspectorId, request.inspectorId);
+  assert.deepEqual(current.changes, { argsText: 'current' });
 });
 }
 // PRE-MERGE-WINDOWS-01: no trace side channel on success or rejected user input.
@@ -316,14 +433,4 @@ test('built Run callback before DOM readiness still uses one replaced socket and
   // Assert
   assert.equal(h.chained(), 0); assert.equal(h.sockets.length, 1); assert.equal(h.f.timerControls.hidden, true);
   assert.deepEqual(h.edits().map(message => message.payload.changes), [{ argsText: 'literal' }]); assert.equal(h.time.timers.size, 0);
-});
-test('shared Run inspector keeps authored status placement and has no additional complete-settings writer', () => {
-  // Arrange
-  const html = asset('run.html');
-  // Act
-  const scripts = [...html.matchAll(/<script[^>]+src="([^"]+)"/g)].map(match => match[1]);
-  // Assert
-  assert.deepEqual(scripts, ['sdpi-components.js', 'run.js']); assert.equal(/\bsetting\s*=|\bApply\b|<button/.test(html), false);
-  assert.ok(html.indexOf('id="settings-status"') > html.indexOf('id="themeColor"'));
-  assert.match(html, /<div id="timer-controls" hidden>/);
 });

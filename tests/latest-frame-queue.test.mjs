@@ -13,6 +13,34 @@ const options = { timeout: 1_000 };
 const image = index => `data:image/svg+xml,${encodeURIComponent(`<svg>${index}</svg>`)}`;
 const frame = index => ({ image: image(index), outputVersion: Number.isInteger(index) ? index : 0 });
 
+for (const disposition of ['skipped', 'attempted', 'invalidated']) {
+  test(`P1 active producer ${disposition} beneath a skipped cosmetic preserves only eligible unattempted output`, options, async () => {
+    // Arrange: a title boundary can skip the active producer before any image attempt.
+    const active = deferred(), fallback = deferred(), fallbackEntered = deferred(), calls = [];
+    const producer = { ...frame(1), origin: 'producer' };
+    const cosmetic = { ...frame(1), origin: 'cosmetic', cosmeticVersion: 1 };
+    const queue = createLatestFrameQueue({ send(value) {
+      calls.push(value);
+      if (calls.length === 1) return active.promise;
+      if (value.origin === 'cosmetic') return false;
+      fallbackEntered.resolve(); return fallback.promise;
+    }, onError() { assert.fail('unexpected frame failure'); } });
+    // Act
+    queue.enqueue(producer); queue.enqueue(cosmetic);
+    if (disposition === 'invalidated') queue.discardProducerFallback();
+    let idle = false;
+    const settled = queue.whenIdle().then(() => { idle = true; });
+    active.resolve(disposition === 'attempted');
+    await Promise.race([fallbackEntered.promise, settled]);
+    const beforeDrain = idle, beforeRelease = [...calls];
+    fallback.resolve(true); await settled;
+    // Assert: idle must include the fallback; attempted or retired output must never replay.
+    assert.deepEqual(beforeRelease, disposition === 'skipped' ? [producer, cosmetic, producer] : [producer, cosmetic]);
+    assert.equal(beforeDrain, disposition !== 'skipped');
+    assert.equal(idle, true);
+  });
+}
+
 for (const explicitOrigin of [false, true]) {
   test(`skipped recolor drains one immutable ${explicitOrigin ? 'explicit' : 'default'} producer fallback and idle waits for it`, options, async () => {
     // Arrange
@@ -50,14 +78,15 @@ for (const explicitOrigin of [false, true]) {
 for (const handedOff of [true, undefined]) {
   test(`cosmetic image handoff ${String(handedOff)} consumes the alternate without double replay`, options, async () => {
     // Arrange
-    const active = deferred(), calls = [];
-    const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? active.promise : handedOff; }, onError() { assert.fail('unexpected failure'); } });
+    const active = deferred(), calls = [], errors = [];
+    const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? active.promise : handedOff; }, onError: error => errors.push(error) });
     const cosmetic = { image: image('recolored'), outputVersion: 1, cosmeticVersion: 2, origin: 'cosmetic' };
     // Act
     queue.enqueue(frame(0)); queue.enqueue(frame(1)); queue.enqueue(cosmetic);
     active.resolve(); await queue.whenIdle();
     // Assert
     assert.deepEqual(calls, [frame(0), cosmetic]);
+    assert.deepEqual(errors, []);
   });
 }
 
@@ -92,9 +121,9 @@ for (const change of ['different-version', 'new-producer', 'discard', 'dispose',
 
 test('malformed getter/proxy/schema frames cannot evict the valid producer alternate', options, async () => {
   // Arrange
-  const active = deferred(), calls = [];
+  const active = deferred(), calls = [], errors = [];
   let reads = 0;
-  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? active.promise : value.origin === 'cosmetic' ? false : true; }, onError() { assert.fail('unexpected failure'); } });
+  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? active.promise : value.origin === 'cosmetic' ? false : true; }, onError: error => errors.push(error) });
   const hostile = { get image() { reads++; throw new Error('synthetic'); }, outputVersion: 2 };
   const proxy = new Proxy(frame(2), { ownKeys() { reads++; throw new Error('synthetic'); } });
   const cosmetic = { ...frame(1), origin: 'cosmetic', cosmeticVersion: 1 };
@@ -106,13 +135,14 @@ test('malformed getter/proxy/schema frames cannot evict the valid producer alter
   assert.deepEqual(rejected, [false, false, false, false]);
   assert.equal(reads, 0);
   assert.deepEqual(calls, [frame(0), cosmetic, frame(1)]);
+  assert.deepEqual(errors, []);
 });
 
 test('prepared frames are copied, frozen and isolated from rejected getter/proxy inputs', options, async () => {
   // Arrange
-  const gate = deferred(), calls = [];
+  const gate = deferred(), calls = [], errors = [];
   let reads = 0;
-  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? gate.promise : Promise.resolve(); }, onError() { assert.fail('unexpected failure'); } });
+  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? gate.promise : Promise.resolve(); }, onError: error => errors.push(error) });
   const pending = { ...frame(1), cosmeticVersion: 2 };
   const hostile = { get image() { reads++; throw new Error('synthetic'); }, outputVersion: 2 };
   const proxy = new Proxy(frame(2), { ownKeys() { reads++; throw new Error('synthetic'); } });
@@ -128,12 +158,13 @@ test('prepared frames are copied, frozen and isolated from rejected getter/proxy
   assert.equal(reads, 0);
   assert.deepEqual(calls, [frame(0), { ...frame(1), cosmeticVersion: 2 }]);
   assert.ok(calls.every(Object.isFrozen));
+  assert.deepEqual(errors, []);
 });
 
 test('producer and cosmetic origins remain complete isolated frames and invalid cosmetics cannot evict them', options, async () => {
   // Arrange
-  const gate = deferred(), calls = [];
-  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? gate.promise : Promise.resolve(); }, onError() { assert.fail('unexpected failure'); } });
+  const gate = deferred(), calls = [], errors = [];
+  const queue = createLatestFrameQueue({ send(value) { calls.push(value); return calls.length === 1 ? gate.promise : Promise.resolve(); }, onError: error => errors.push(error) });
   const cosmetic = { ...frame(1), origin: 'cosmetic', cosmeticVersion: 3 };
   // Act
   const accepted = [queue.enqueue({ ...frame(0), origin: 'producer' }), queue.enqueue(cosmetic)];
@@ -145,18 +176,19 @@ test('producer and cosmetic origins remain complete isolated frames and invalid 
   assert.deepEqual(rejected, [false, false]);
   assert.deepEqual(calls, [{ ...frame(0), origin: 'producer' }, { ...frame(1), origin: 'cosmetic', cosmeticVersion: 3 }]);
   assert.ok(calls.every(Object.isFrozen));
+  assert.deepEqual(errors, []);
 });
 
 test('latest complete pending frame replaces all older metadata and bounds active sends', options, async () => {
   // Arrange: local promises only, no renderer-ACK assumption.
   const gate = deferred();
-  const calls = [];
+  const calls = [], errors = [];
   let active = 0, maximum = 0;
   const queue = createLatestFrameQueue({
     send(update) {
       calls.push(update); active++; maximum = Math.max(maximum, active);
       return (calls.length === 1 ? gate.promise : Promise.resolve()).then(() => { active--; });
-    }, onError: () => assert.fail('unexpected send failure'),
+    }, onError: error => errors.push(error),
   });
   // Act
   queue.enqueue(frame('first'));
@@ -169,6 +201,7 @@ test('latest complete pending frame replaces all older metadata and bounds activ
   assert.deepEqual(before, [frame('first')]);
   assert.deepEqual(calls, [frame('first'), frame(9999)]);
   assert.equal(maximum, 1);
+  assert.deepEqual(errors, []);
 });
 
 test('invalid legacy title frame never evicts the latest valid complete frame', options, async () => {

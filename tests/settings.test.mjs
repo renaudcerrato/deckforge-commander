@@ -10,15 +10,15 @@ for (const title of ['a/b\\c.txt é', '', ' \t\u202e ', null, 42, {}, ['caption'
     const input = { executable: '/synthetic/report.PY', argsText: '', title };
     const original = structuredClone(input);
     // Act
-    const classified = classifySettings(input), projected = getInspectorConfiguration(input);
-    const equivalent = sameExecutionSettings(input, { ...input, title: 'new' });
+    const classified = classifySettings(input, 'posix'), projected = getInspectorConfiguration(input, 'posix');
+    const equivalent = sameExecutionSettings(input, { ...input, title: 'new' }, 'posix');
     // Assert
     assert.equal(classified.kind, 'configured');
     assert.deepEqual(classified.execution, { executable: input.executable, args: [] });
     assert.equal(projected.diagnosticCode, undefined);
     assert.equal(projected.title, title === 'a/b\\c.txt é' ? title : '');
     assert.equal(equivalent, true); assert.deepEqual(input, original);
-    assert.equal(sameExecutionSettings(input, { ...input, title: 'new', executable: '/other' }), false);
+    assert.equal(sameExecutionSettings(input, { ...input, title: 'new', executable: '/other' }, 'posix'), false);
   });
 }
 
@@ -28,8 +28,8 @@ test('absolute execution settings preserve literal ordered argv and detach it', 
   const input = { executable: '/nonexistent folder/program.py', args: ['', '  spaces  ', '$(private); * | >', 'é😀'], cwd: '/nonexistent cwd', runRequested: true };
   const original = structuredClone(input);
   // Act
-  const result = validateSettings(input);
-  const second = validateSettings(input);
+  const result = validateSettings(input, 'posix');
+  const second = validateSettings(input, 'posix');
   result.args.push('local');
   // Assert
   assert.deepEqual(second, { executable: input.executable, args: original.args, cwd: input.cwd });
@@ -41,7 +41,7 @@ for (const cwd of [undefined, '']) {
     // Arrange
     const input = { executable: '/program', argsText: '', ...(cwd === undefined ? {} : { cwd }) };
     // Act
-    const result = validateSettings(input);
+    const result = validateSettings(input, 'posix');
     // Assert
     assert.deepEqual(result, { executable: '/program', args: [] });
   });
@@ -53,9 +53,9 @@ for (const argsText of ['', ' \t\n', '--mode "daily report" ""']) {
     const input = { executable: '/program', argsText, args: 'malformed legacy', runRequested: false };
     const original = structuredClone(input);
     // Act
-    const result = validateSettings(input);
+    const result = validateSettings(input, 'posix');
     // Assert
-    assert.deepEqual(result.args, parseArguments(argsText));
+    assert.deepEqual(result.args, parseArguments(argsText, 'posix'));
     assert.deepEqual(input, original);
   });
 }
@@ -67,10 +67,10 @@ for (const argv of [[], ['', '  spaces  ', '$(literal); * | >', 'é😀', '"quot
       const input = { executable: '/program', args, cwd: '', runRequested: true };
       const original = structuredClone(input);
       // Act
-      const view = getInspectorConfiguration(input);
-      const result = validateSettings(input);
+      const view = getInspectorConfiguration(input, 'posix');
+      const result = validateSettings(input, 'posix');
       // Assert
-      assert.deepEqual(parseArguments(view.argsText), argv);
+      assert.deepEqual(parseArguments(view.argsText, 'posix'), argv);
       assert.deepEqual(result, { executable: '/program', args: argv });
       assert.deepEqual(input, original);
       assert.equal(view.diagnosticCode, undefined);
@@ -99,14 +99,14 @@ for (const [index, input] of [{}, { executable: '' }, { argsText: '' }, { args: 
     // Arrange
     const descriptors = Object.getOwnPropertyDescriptors(input);
     // Act
-    const result = classifySettings(input);
-    const view = getInspectorConfiguration(input);
+    const result = classifySettings(input, 'posix');
+    const view = getInspectorConfiguration(input, 'posix');
     // Assert
     assert.deepEqual(result, { kind: 'setup' });
     assert.equal(Object.hasOwn(result, 'execution'), false);
     assert.deepEqual(Object.getOwnPropertyDescriptors(input), descriptors);
     assert.equal(view.themeColor, '#969696');
-    assert.throws(() => validateSettings(input), { message: 'Invalid settings.' });
+    assert.throws(() => validateSettings(input, 'posix'), { message: 'Invalid settings.' });
   });
 }
 
@@ -115,11 +115,11 @@ for (const input of [{ executable: '/synthetic/program', argsText: '', args: 'ma
   { executable: '/synthetic/program', args: '["literal"]', themeColor: null }]) {
   test('configured classification preserves the strict detached execution DTO and argument precedence', () => {
     // Arrange
-    const original = structuredClone(input), expected = validateSettings(input);
+    const original = structuredClone(input), expected = validateSettings(input, 'posix');
     // Act
-    const result = classifySettings(input);
+    const result = classifySettings(input, 'posix');
     result.execution.args.push('local');
-    const fresh = classifySettings(input);
+    const fresh = classifySettings(input, 'posix');
     // Assert
     assert.deepEqual(fresh, { kind: 'configured', execution: expected });
     assert.deepEqual(input, original);
@@ -146,7 +146,7 @@ for (const [index, [input, code]] of classificationFailures.entries()) {
     const descriptors = input && typeof input === 'object' ? Object.getOwnPropertyDescriptors(input) : undefined;
     let failure;
     // Act
-    try { classifySettings(input); } catch (error) { failure = error; }
+    try { classifySettings(input, 'posix'); } catch (error) { failure = error; }
     // Assert
     assert.equal(failure?.message, 'Invalid settings.');
     assert.equal(failure?.diagnosticCode, code);
@@ -163,7 +163,7 @@ for (const field of ['executable', 'args', 'argsText', 'cwd', 'runRequested', 't
     Object.defineProperty(input, field, { enumerable: true, get() { calls++; throw Error(marker); } });
     let failure;
     // Act
-    try { classifySettings(input); } catch (error) { failure = error; }
+    try { classifySettings(input, 'posix'); } catch (error) { failure = error; }
     // Assert
     assert.equal(failure?.message, 'Invalid settings.');
     assert.equal(failure?.diagnosticCode, 'INVALID_SETTINGS');
@@ -225,7 +225,7 @@ test('setup classification contains inspection failures and never coerces execut
   const executable = { toString() { conversions++; return '/program'; }, valueOf() { conversions++; throw Error(marker); } };
   const inputs = [new Proxy({}, { ownKeys() { throw Error(marker); } }), { executable, argsText: '' }];
   // Act
-  const failures = inputs.map(input => { try { classifySettings(input); } catch (error) { return error; } });
+  const failures = inputs.map(input => { try { classifySettings(input, 'posix'); } catch (error) { return error; } });
   // Assert
   assert.deepEqual(failures.map(error => [error.message, error.diagnosticCode, error.cause]),
     [['Invalid settings.', 'INVALID_SETTINGS', undefined], ['Invalid settings.', 'INVALID_EXECUTABLE', undefined]]);
@@ -250,7 +250,7 @@ for (const [index, [input, code]] of failures.entries()) {
     // Arrange
     let failure;
     // Act
-    try { validateSettings(input); } catch (error) { failure = error; }
+    try { validateSettings(input, 'posix'); } catch (error) { failure = error; }
     // Assert
     assert.ok(failure instanceof Error);
     assert.equal(failure.message, 'Invalid settings.');
@@ -267,7 +267,7 @@ for (const args of ['malformed-private', '[null]', Array(2), [42], ['private\0']
     const input = { ...base, args };
     const original = structuredClone(input);
     // Act
-    const result = getInspectorConfiguration(input);
+    const result = getInspectorConfiguration(input, 'posix');
     // Assert
     assert.ok(result.diagnosticCode);
     assert.equal(Object.hasOwn(result, 'argsText'), false);
@@ -280,9 +280,9 @@ test('execution equivalence ignores lossless text migration and run intent', () 
   const old = { ...base, args: ['two words', ''], runRequested: true };
   const migrated = { ...old, argsText: '"two words" ""', cwd: '', runRequested: false };
   // Act
-  const same = sameExecutionSettings(old, migrated);
-  const changed = sameExecutionSettings(old, { ...migrated, argsText: 'different' });
-  const invalid = sameExecutionSettings(old, { ...migrated, executable: 'relative' });
+  const same = sameExecutionSettings(old, migrated, 'posix');
+  const changed = sameExecutionSettings(old, { ...migrated, argsText: 'different' }, 'posix');
+  const invalid = sameExecutionSettings(old, { ...migrated, executable: 'relative' }, 'posix');
   // Assert
   assert.equal(same, true);
   assert.equal(changed, false);
@@ -298,7 +298,7 @@ test('unexpected inspection failures and forged diagnostics are redacted', () =>
   const getter = { get diagnosticCode() { reads++; throw original; } };
   // Act
   let failure;
-  try { validateSettings(input); } catch (error) { failure = error; }
+  try { validateSettings(input, 'posix'); } catch (error) { failure = error; }
   const codes = [settingsDiagnosticCode(forged), settingsDiagnosticCode(getter)];
   // Assert
   assert.notEqual(failure, original);
@@ -316,12 +316,12 @@ for (const args of [["a\nb", "c\rd", "e\r\nf", "'\\é😀", ''], JSON.stringify(
     const original = structuredClone(input);
     const expected = typeof args === 'string' ? JSON.parse(args) : args;
     // Act
-    const projected = getInspectorConfiguration(input);
-    const normalized = validateSettings({ ...input, argsText: projected.argsText });
+    const projected = getInspectorConfiguration(input, 'posix');
+    const normalized = validateSettings({ ...input, argsText: projected.argsText }, 'posix');
     // Assert
     assert.equal(/[\r\n]/.test(projected.argsText), false);
     assert.deepEqual(normalized.args, expected);
-    assert.equal(sameExecutionSettings(input, { ...input, argsText: projected.argsText }), true);
+    assert.equal(sameExecutionSettings(input, { ...input, argsText: projected.argsText }, 'posix'), true);
     assert.deepEqual(input, original);
   });
 }
@@ -331,10 +331,10 @@ test('valid raw multiline argument text is read-only canonically projected', () 
   const input = { executable: '/program', argsText: "'LF\nvalue' 'CR\rvalue' 'CRLF\r\nvalue' ''", args: ['retained'], runRequested: true };
   const original = structuredClone(input);
   // Act
-  const projected = getInspectorConfiguration(input);
+  const projected = getInspectorConfiguration(input, 'posix');
   // Assert
   assert.equal(/[\r\n]/.test(projected.argsText), false);
-  assert.deepEqual(parseArguments(projected.argsText), validateSettings(input).args);
+  assert.deepEqual(parseArguments(projected.argsText, 'posix'), validateSettings(input, 'posix').args);
   assert.equal(projected.diagnosticCode, undefined);
   assert.deepEqual(input, original);
 });
@@ -345,7 +345,7 @@ for (const argsText of ["'private\nunterminated", '"private\r\nunterminated', 'p
     const input = { executable: '/program', argsText, args: ['legacy must not override'] };
     const original = structuredClone(input);
     // Act
-    const projected = getInspectorConfiguration(input);
+    const projected = getInspectorConfiguration(input, 'posix');
     // Assert
     assert.equal(projected.diagnosticCode, 'ARGS_TEXT_INVALID');
     assert.equal(Object.hasOwn(projected, 'argsText'), false);
@@ -359,7 +359,7 @@ for (const themeColor of [undefined, null, 'bad stored metadata', '#ABCDEF']) {
     const input = { executable: '/program', argsText: '', ...(themeColor === undefined ? {} : { themeColor }) };
     const original = structuredClone(input);
     // Act
-    const execution = validateSettings(input), view = getInspectorConfiguration(input);
+    const execution = validateSettings(input, 'posix'), view = getInspectorConfiguration(input, 'posix');
     // Assert
     assert.deepEqual(execution, { executable: '/program', args: [] });
     assert.equal(view.themeColor, themeColor === '#ABCDEF' ? '#abcdef' : '#969696');
@@ -372,12 +372,12 @@ for (const input of [{}, { executable: 'relative', args: 'invalid legacy' }, { e
     // Arrange
     const themed = { ...input, themeColor: '#abcdef' };
     // Act
-    const results = [sameSettingsExceptTheme(input, themed), isThemeOnlyChange(input, themed), sameExecutionSettings(input, themed)];
+    const results = [sameSettingsExceptTheme(input, themed), isThemeOnlyChange(input, themed), sameExecutionSettings(input, themed, 'posix')];
     const mixed = { ...themed, executable: '/changed' };
     // Assert
     assert.deepEqual(results, [true, true, true]);
     assert.equal(isThemeOnlyChange(input, mixed), false);
-    assert.equal(sameExecutionSettings(input, mixed), false);
+    assert.equal(sameExecutionSettings(input, mixed, 'posix'), false);
     assert.equal(isThemeOnlyChange(themed, themed), false);
   });
 }

@@ -309,11 +309,11 @@ function install(window, document) {
   let latestConnection;
   const bridge = createInspectorBridge({
     onConnectionState(snapshot) {
-      // Deferred DOM hydration must not replay a previous bound session's error.
+      // Deferred DOM hydration must not replay a previous bound session's settings or error.
       if (latestConnection?.bindingValid && (!snapshot.bindingValid
         || latestConnection.version !== snapshot.version || latestConnection.context !== snapshot.context
         || latestConnection.inspectorId !== snapshot.inspectorId || latestConnection.actionUuid !== snapshot.actionUuid)) {
-        pendingError = pendingStatus = undefined;
+        initial = pendingError = pendingStatus = undefined;
       }
       latestConnection = snapshot;
       controller?.setActionBinding(snapshot);

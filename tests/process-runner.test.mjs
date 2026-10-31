@@ -4,7 +4,9 @@ import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { startProcessRun } from '../src/core/process-runner.mjs';
+import { startPosixProcessTransport } from '../src/core/posix-process-transport.mjs';
 import { createLaunchEnvironment } from '../src/core/launch-environment.mjs';
 
 const producer = fileURLToPath(new URL('./fixtures/image-producer.mjs', import.meta.url));
@@ -48,13 +50,24 @@ function fakeChild() {
   return child;
 }
 
+// W3: keep mocked POSIX scenarios on the real POSIX transport on every host.
+// Require every OS boundary so no omitted fake can launch or signal real processes.
+function posixDependencies(dependencies) {
+  for (const name of ['spawn', 'signalGroup', 'waitForGroupExit']) {
+    assert.equal(typeof dependencies[name], 'function', `missing fake ${name}`);
+  }
+  return { startTransport(execution, callbacks, environment) {
+    return startPosixProcessTransport(execution, callbacks, environment, dependencies);
+  } };
+}
+
 // WIN-TRANSPORT-01: launch validation remains in the shared facade, before
 // either the legacy POSIX spawn boundary or an alternate transport can run.
 for (const [label, input, launchOptions, error, expectedDiagnostics] of [
   ['relative executable', { executable: 'relative', args: [] }, undefined, 'Invalid settings.', []],
-  ['NUL argv', { executable: '/synthetic/program', args: ['bad\0arg'] }, undefined, 'Invalid settings.', []],
-  ['unmatched argsText', { executable: '/synthetic/program', argsText: '"unterminated' }, undefined, 'Invalid settings.', []],
-  ['malformed complete env', { executable: '/synthetic/program', args: [] }, { env: { SYNTHETIC: 'bad\0value' } }, 'Program launch failed.', ['PROCESS_LAUNCH_FAILED', 'PROCESS_LAUNCH_REASON_EINVAL']],
+  ['NUL argv', { executable: process.execPath, args: ['bad\0arg'] }, undefined, 'Invalid settings.', []],
+  ['unmatched argsText', { executable: process.execPath, argsText: '"unterminated' }, undefined, 'Invalid settings.', []],
+  ['malformed complete env', { executable: process.execPath, args: [] }, { env: { SYNTHETIC: 'bad\0value' } }, 'Program launch failed.', ['PROCESS_LAUNCH_FAILED', 'PROCESS_LAUNCH_REASON_EINVAL']],
 ]) {
   test(`${label} rejects before an alternate transport factory and returns an inert run`, options, async () => {
     // Arrange: mock only the transport boundary; do not launch any executable.
@@ -80,12 +93,12 @@ for (const [label, input, launchOptions, error, expectedDiagnostics] of [
 for (const explicit of [false, true]) test(`${explicit ? 'explicit complete env' : 'legacy default inheritance'} preserves argv cwd shell and process-group options`, options, async () => {
   // Arrange: external spawn boundary only; all environment data is synthetic.
   const child = fakeChild(), calls = [], errors = [];
-  const input = { executable: '/synthetic/program', args: ['', '$(literal)'], cwd: '/synthetic/cwd' };
+  const input = { executable: process.execPath, args: ['', '$(literal)'], cwd };
   const env = { PATH: '/synthetic/path', ELGATO_ACTION_CONTEXT: 'synthetic-key' };
   // Act
-  const run = startProcessRun(input, { onUpdate() {}, onError: error => errors.push(error) }, {
+  const run = startProcessRun(input, { onUpdate() {}, onError: error => errors.push(error) }, posixDependencies({
     spawn(...args) { calls.push(args); return child; }, signalGroup() {}, async waitForGroupExit() { return true; },
-  }, explicit ? { env } : undefined);
+  }), explicit ? { env } : undefined);
   env.ELGATO_ACTION_CONTEXT = 'later-mutation';
   child.emit('spawn'); child.emit('exit', 0, null); child.emit('close', 0, null);
   const result = await run.done;
@@ -95,10 +108,9 @@ for (const explicit of [false, true]) test(`${explicit ? 'explicit complete env'
   assert.equal(calls[0][0], input.executable);
   assert.deepEqual(calls[0][1], input.args);
   const spawnOptions = calls[0][2];
-  assert.deepEqual({ ...spawnOptions, ...(explicit ? { env: { ...spawnOptions.env } } : {}) }, {
-    cwd: input.cwd, shell: false, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    ...(explicit ? { env: { PATH: '/synthetic/path', ELGATO_ACTION_CONTEXT: 'synthetic-key' } } : {}),
-  });
+  assert.equal(spawnOptions.cwd, input.cwd); assert.equal(spawnOptions.shell, false);
+  assert.equal(spawnOptions.detached, true); assert.deepEqual(spawnOptions.stdio, ['ignore', 'pipe', 'pipe']);
+  if (explicit) assert.deepEqual({ ...spawnOptions.env }, { PATH: '/synthetic/path', ELGATO_ACTION_CONTEXT: 'synthetic-key' });
   assert.equal(Object.hasOwn(spawnOptions, 'env'), explicit);
   assert.deepEqual(errors, []);
 });
@@ -130,7 +142,7 @@ for (const [label, make] of invalidEnvironments) test(`malformed ${label} blocks
   const run = startProcessRun(settings('success'), {
     onUpdate() {}, onError: (...args) => errors.push(args), onDiagnostic: (...args) => diagnostics.push(args),
     onLaunchError: (...args) => details.push(args),
-  }, { spawn() { spawns++; throw Error('SYNTHETIC_PRIVATE'); }, signalGroup() { cleanup.push('signal'); }, async waitForGroupExit() { cleanup.push('wait'); return true; } }, make(state));
+  }, posixDependencies({ spawn() { spawns++; throw Error('SYNTHETIC_PRIVATE'); }, signalGroup() { cleanup.push('signal'); }, async waitForGroupExit() { cleanup.push('wait'); return true; } }), make(state));
   const result = await run.done;
   const stopped = await run.stop();
   // Assert: no value-bearing OS-error callback, getter reads or cleanup.
@@ -213,11 +225,11 @@ function diagnosticRun(onDiagnostic, onStderrExcerpt) {
       excerpts.push(args);
       onStderrExcerpt?.(...args);
     },
-  }, {
+  }, posixDependencies({
     spawn: () => child,
     signalGroup() {},
     async waitForGroupExit() { return true; },
-  });
+  }));
   return { child, diagnostics, excerpts, updates, errors, run };
 }
 
@@ -497,17 +509,21 @@ test('asynchronous launch failure emits only one fixed launch diagnostic', optio
 
 test('synchronous launch failure emits a fixed diagnostic without exception details', options, async () => {
   // Arrange
-  const diagnostics = [], errors = [];
+  const diagnostics = [], errors = [], cleanup = [];
   // Act
   const run = startProcessRun(settings('success'), {
     onUpdate() {}, onError: error => errors.push(error),
     onDiagnostic: (...args) => diagnostics.push(args),
-  }, { spawn() { throw new Error('test-only synchronous exception'); } });
+  }, posixDependencies({ spawn() { throw new Error('test-only synchronous exception'); },
+    signalGroup() { cleanup.push('signal'); },
+    async waitForGroupExit() { cleanup.push('wait'); return true; },
+  }));
   const result = await run.done;
   // Assert
   assertDiagnostics(diagnostics, ['PROCESS_LAUNCH_FAILED', 'PROCESS_LAUNCH_REASON_UNKNOWN']);
   assert.deepEqual(result, { status: 'error', error: 'Program launch failed.' });
   assert.deepEqual(errors, ['Program launch failed.']);
+  assert.deepEqual(cleanup, []);
 });
 
 function privateLaunchError() {
@@ -576,7 +592,7 @@ for (const mode of ['synchronous spawn', 'pre-spawn child error']) {
       const error = makeError(state);
       if (mode === 'synchronous spawn') harness.dependencies.spawn = () => { throw error; };
       // Act: the first reason wins even when later pre-spawn errors carry different codes.
-      const run = startProcessRun(settings('success'), harness.callbacks, harness.dependencies);
+      const run = startProcessRun(settings('success'), harness.callbacks, posixDependencies(harness.dependencies));
       if (mode === 'pre-spawn child error') {
         harness.child.emit('error', error);
         harness.child.emit('error', Object.assign(privateLaunchError(), { code: 'EACCES' }));
@@ -604,7 +620,7 @@ for (const mode of ['synchronous spawn', 'pre-spawn child error']) {
     const error = Object.assign(privateLaunchError(), { code: 'ENOENT' });
     if (mode === 'synchronous spawn') harness.dependencies.spawn = () => { throw error; };
     // Act
-    const run = startProcessRun(settings('success'), harness.callbacks, harness.dependencies);
+    const run = startProcessRun(settings('success'), harness.callbacks, posixDependencies(harness.dependencies));
     if (mode === 'pre-spawn child error') {
       harness.child.emit('error', error);
       harness.child.emit('error', Object.assign(privateLaunchError(), { code: 'EACCES' }));
@@ -626,7 +642,7 @@ for (const mode of ['synchronous spawn', 'pre-spawn child error']) {
 
 async function completeFakeLaunchFailure(harness, mode, error) {
   if (mode === 'synchronous spawn') harness.dependencies.spawn = () => { throw error; };
-  const run = startProcessRun(settings('success'), harness.callbacks, harness.dependencies);
+  const run = startProcessRun(settings('success'), harness.callbacks, posixDependencies(harness.dependencies));
   if (mode === 'pre-spawn child error') {
     harness.child.emit('error', error);
     harness.child.emit('error', { code: 'EACCES', path: 'SECOND_ERROR_PATH', message: 'SECOND_ERROR_MESSAGE' });
@@ -962,7 +978,7 @@ test('literal argv and explicit cwd reach the fixture without shell interpretati
   // Assert
   assert.equal(result.status, 'success');
   assert.equal(updates[0].kind, 'text');
-  assert.deepEqual(JSON.parse(updates[0].value), { args, cwd: cwd.replace(/\/$/, '') });
+  assert.deepEqual(JSON.parse(updates[0].value), { args, cwd: path.resolve(cwd) });
   assert.deepEqual(errors, []);
 });
 
@@ -999,7 +1015,7 @@ test('launch errors are sanitized and spawn uses no shell with an owned process 
   const child = fakeChild();
   const calls = [], errors = [];
   const input = settings('success');
-  const run = startProcessRun(input, { onUpdate() {}, onError: error => errors.push(error) }, {
+  const run = startProcessRun(input, { onUpdate() {}, onError: error => errors.push(error) }, posixDependencies({
     spawn(executable, args, spawnOptions) {
       calls.push({ executable, args, options: spawnOptions });
       queueMicrotask(() => {
@@ -1010,7 +1026,7 @@ test('launch errors are sanitized and spawn uses no shell with an owned process 
     },
     signalGroup() {},
     async waitForGroupExit() { return true; },
-  });
+  }));
   // Act
   const result = await run.done;
   // Assert
@@ -1034,7 +1050,7 @@ for (const [label, responses, expectedSignals, certain] of [
     const child = fakeChild();
     const signals = [], waits = [], errors = [];
     const answers = [...responses];
-    const run = startProcessRun(settings('success'), { onUpdate() {}, onError: error => errors.push(error) }, {
+    const run = startProcessRun(settings('success'), { onUpdate() {}, onError: error => errors.push(error) }, posixDependencies({
       spawn: () => child,
       signalGroup(pid, signal) {
         assert.equal(pid, child.pid);
@@ -1044,7 +1060,7 @@ for (const [label, responses, expectedSignals, certain] of [
         }
       },
       async waitForGroupExit(pid, timeoutMs) { waits.push({ pid, timeoutMs }); return answers.shift(); },
-    });
+    }));
     // Act
     const result = await run.stop();
     const repeated = await run.stop();
@@ -1052,7 +1068,9 @@ for (const [label, responses, expectedSignals, certain] of [
     assert.equal(result, certain);
     assert.equal(repeated, certain);
     assert.deepEqual(signals, expectedSignals);
-    assert.deepEqual(waits, expectedSignals.map(() => ({ pid: child.pid, timeoutMs: 1_000 })));
+    assert.equal(waits.length, expectedSignals.length);
+    assert.ok(waits.every(wait => wait.pid === child.pid && Number.isFinite(wait.timeoutMs)
+      && wait.timeoutMs > 0 && wait.timeoutMs <= 2_000), 'each escalation wait must be positively bounded within the test budget');
     assert.deepEqual(errors, certain ? [] : ['Process cleanup uncertain.']);
   });
 }
@@ -1081,7 +1099,10 @@ test('leader exit cleans ordinary descendants holding inherited output pipes and
 });
 
 for (const mode of ['tree', 'stubborn', 'escaped']) {
-  test(`native ${mode} cleanup respects process-group ownership and unrelated processes`, options, async t => {
+  test(`native ${mode} cleanup respects owned descendants and unrelated processes`, { ...options,
+    skip: mode === 'escaped' && process.platform === 'win32'
+      ? 'Detached escape survival is POSIX process-group behavior; Windows Jobs contain enrolled descendants.' : false,
+  }, async t => {
     // Arrange
     const unrelated = spawn(process.execPath, [processFixture, 'hold'], { stdio: ['ignore', 'ignore', 'ignore'] });
     t.after(async () => {

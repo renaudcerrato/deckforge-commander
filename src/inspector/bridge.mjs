@@ -70,6 +70,7 @@ export function createInspectorBridge({
   let transportContext;
   let open = false;
   let ready = false;
+  let transportFailed = false;
   let requestId = 0;
   let latestRequest;
   let debounceTimer;
@@ -79,6 +80,7 @@ export function createInspectorBridge({
   const acknowledged = new Map();
   const dirtyValues = new Map();
   let observingConnection = false;
+  let observedConnection;
 
   /** Local identity and platform binding for the controller; never sent to the plugin. */
   function getConnectionState() {
@@ -94,8 +96,12 @@ export function createInspectorBridge({
 
   function observeConnection() {
     if (observingConnection) return;
+    const snapshot = getConnectionState();
+    const signature = JSON.stringify(snapshot);
+    if (signature === observedConnection) return;
+    observedConnection = signature;
     observingConnection = true;
-    try { void Promise.resolve(onConnectionState(getConnectionState())).catch(() => {}); } catch {}
+    try { void Promise.resolve(onConnectionState(snapshot)).catch(() => {}); } catch {}
     finally { observingConnection = false; }
   }
 
@@ -158,9 +164,10 @@ export function createInspectorBridge({
       socket.send(JSON.stringify({ event: 'sendToPlugin', action, context: transportContext, payload }));
       observeConnection();
     } catch {
-      if (replyTimer !== undefined) clearTimer(replyTimer);
-      replyTimer = undefined;
       open = false;
+      ready = false;
+      transportFailed = true;
+      clearTimers();
       latestRequest.active = false;
       observeConnection();
       failure();
@@ -235,6 +242,8 @@ export function createInspectorBridge({
         return false;
       }
     }
+    // Failed transports keep local control edits visible without promising another save.
+    if (transportFailed) return true;
     let changed = false;
     for (const [key, value] of Object.entries(edit)) {
       if ((key === 'themeColor' || key === 'intervalSeconds' || key === 'actionOnPress') && dirtyValues.get(key) === value) continue;
@@ -307,7 +316,7 @@ export function createInspectorBridge({
     }
     onStatus(protectedFields().size === 0 ? 'saved' : 'saving');
     hydrate(settings);
-    if (version === connectionVersion && ready && pending) flush();
+    if (version === connectionVersion && ready && pending && debounceTimer === undefined) flush();
     observeConnection();
   }
 
@@ -315,6 +324,7 @@ export function createInspectorBridge({
     connectionVersion++;
     open = false;
     ready = false;
+    transportFailed = true;
     bindingValid = false;
     platform = 'posix';
     os = deviceModel = coordinates = imageSize = undefined;
@@ -328,6 +338,7 @@ export function createInspectorBridge({
 
   function connect(port, propertyInspectorUUID, registerEvent, _info, actionInfoText) {
     disconnect();
+    transportFailed = false;
     // Host registration metadata is not a setting or a remembered inspector binding.
     // Older callbacks and malformed/unknown metadata retain the POSIX default.
     let registration;
@@ -380,11 +391,16 @@ export function createInspectorBridge({
         observeConnection();
         return;
       }
-      socket = createSocket(`ws://127.0.0.1:${number}`);
+      try { socket = createSocket(`ws://127.0.0.1:${number}`); } catch {
+        transportFailed = true;
+        clearTimers();
+        failure();
+        return;
+      }
       const connectedSocket = socket;
       observeConnection();
       socket.onopen = () => {
-        if (version !== connectionVersion) return;
+        if (version !== connectionVersion || transportFailed) return;
         observeConnection();
         try {
           connectedSocket.send(JSON.stringify({ event: registerEvent, uuid: propertyInspectorUUID }));
@@ -392,7 +408,7 @@ export function createInspectorBridge({
           open = true;
           sendRequest('canvas:hello');
           flush();
-        } catch { observeConnection(); failure(); }
+        } catch { transportFailed = true; clearTimers(); observeConnection(); failure(); }
       };
       socket.onmessage = event => {
         if (version !== connectionVersion || !open) return;
@@ -402,6 +418,7 @@ export function createInspectorBridge({
         if (version !== connectionVersion) return;
         open = false;
         ready = false;
+        transportFailed = true;
         if (latestRequest) latestRequest.active = false;
         clearTimers();
         observeConnection();

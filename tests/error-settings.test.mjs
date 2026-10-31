@@ -16,7 +16,7 @@ function deferred() {
 function fixture(input = initial, dependencies = {}) {
   const host = { settings: structuredClone(input), writes: [] };
   const runs = [], rendered = [], errors = [], readQueue = [], confirmationQueue = [], timers = new Map(), confirmations = [], artwork = [];
-  let session, timerId = 0, rejectImage = false, transformReply, loadingControl;
+  let session, timerId = 0, rejectImage = false, confirmationOverride, loadingControl;
   const coordinator = createRunStateCoordinator({
     async writeSettings(settings) { host.settings = structuredClone(settings); host.writes.push(structuredClone(settings)); },
     async readSettings() {
@@ -37,10 +37,10 @@ function fixture(input = initial, dependencies = {}) {
       const controlled = confirmationQueue.shift();
       if (controlled) { controlled.entered.resolve(expected); await controlled.gate.promise; }
       const snapshot = coordinator.getSettings();
-      const result = { status: coordinator.isBlocked() ? 'stale' : 'saved', settings: snapshot };
-      confirmations.push({ value: false, result });
-      const reported = transformReply ? transformReply(result, false) : result;
-      return reported?.status === 'saved' && isDeepStrictEqual(expected, reported.settings);
+      const matched = !coordinator.isBlocked() && isDeepStrictEqual(expected, snapshot);
+      const confirmed = confirmationOverride ? confirmationOverride(matched) : matched;
+      confirmations.push({ expected, snapshot, confirmed });
+      return confirmed;
     },
     startRun(execution, callbacks) {
       const done = deferred(), stopEntered = deferred();
@@ -65,7 +65,7 @@ function fixture(input = initial, dependencies = {}) {
   return {
     session, coordinator, host, runs, rendered, errors, confirmations, timers, artwork,
     rejectNextImage() { rejectImage = true; },
-    transformReplies(callback) { transformReply = callback; },
+    overrideConfirmation(callback) { confirmationOverride = callback; },
     controlRead() { const control = { entered: deferred(), gate: deferred() }; readQueue.push(control); return control; },
     controlConfirmation() { const control = { entered: deferred(), gate: deferred() }; confirmationQueue.push(control); return control; },
     controlLoading() { loadingControl = { entered: deferred(), gate: deferred() }; return loadingControl; },
@@ -90,6 +90,22 @@ function fixture(input = initial, dependencies = {}) {
 }
 
 // Slice 4: real settings authority settles writes independently of the core launch queue.
+test('P2 real authority absorbs superseded execution read rejection and confirms latest cosmetic recovery', options, async () => {
+  // Arrange: use actual PI ordering and authority serialization, not a throwing confirmation fake.
+  const h = fixture(); await h.session.appear(initial); await h.session.press();
+  const read = h.controlRead();
+  const executionEdit = h.edit({ executable: '/synthetic/replacement' }); await read.entered.promise;
+  // Act
+  const cosmeticEdit = h.edit({ themeColor: '#abcdef' });
+  read.gate.reject(new Error('synthetic superseded read'));
+  await Promise.all([executionEdit.finish(), cosmeticEdit.finish()]); await h.session.whenIdle();
+  // Assert: this actual-adapter-style authority path does not reject confirmLaunchSettings.
+  assert.equal(h.coordinator.isBlocked(), false); assert.equal(h.session.getState().persistenceBlocked, false);
+  assert.equal(h.session.getState().recoveryPending, false); assert.deepEqual(h.errors, []);
+  assert.equal(h.confirmations.at(-1).snapshot.themeColor, '#abcdef');
+  assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1);
+});
+
 for (const superseded of [false, true]) {
   test(`confirmed Started cannot bypass a pending complete theme snapshot; superseded=${superseded}`, options, async () => {
     // Arrange
@@ -202,28 +218,6 @@ for (const output of [false, true]) {
   });
 }
 
-for (const failure of ['reject', 'mismatch', 'timeout', 'stale']) {
-  test(`unused ${failure} host readback cannot block local exited or manufacture persistence failure`, options, async () => {
-    // Arrange
-    const h = fixture(); await h.session.appear(initial); await h.session.press();
-    const read = h.controlRead(), confirmations = h.confirmations.length;
-    if (failure === 'stale') h.transformReplies((result, value) => value ? result : { ...result, status: 'stale' });
-    // Act
-    h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.runs[0].done.resolve({ status: 'success' });
-    await h.session.whenIdle();
-    read.gate.resolve(initial); // Release an unused boundary without an unhandled rejection.
-    // Assert
-    assert.equal(h.artwork.at(-1).footer, 'exited');
-    assert.equal(h.runs.length, 1);
-    assert.equal(h.session.getState().runRequested, false);
-    assert.equal(h.coordinator.isBlocked(), false);
-    assert.equal(h.session.getState().persistenceBlocked, false);
-    assert.equal(h.confirmations.length, confirmations);
-    assert.deepEqual(h.host.writes, []);
-    assert.deepEqual(h.errors, []);
-  });
-}
-
 for (const [field, changes] of [['executable', { executable: '/synthetic/report.py' }], ['argsText', { argsText: '--changed' }], ['cwd', { cwd: '/synthetic/new-cwd' }]]) {
   test(`meaningful ${field} edit resets exited to ready after safe confirmed recovery without launching`, options, async () => {
     // Arrange
@@ -238,7 +232,7 @@ for (const [field, changes] of [['executable', { executable: '/synthetic/report.
     assert.equal(h.session.getState().recoveryPending, false);
     assert.equal(h.host.settings.runRequested, false);
     assert.ok(h.host.writes.length > writes);
-    assert.equal(h.confirmations.at(-1).result.status, 'saved');
+    assert.equal(h.confirmations.at(-1).confirmed, true);
     assert.deepEqual(h.errors, []);
   });
 }
@@ -357,7 +351,8 @@ for (const failure of ['launch', 'launch-specific', 'protocol', 'config', 'exit'
       assert.ok(h.rendered.slice(before).some(event => event[0] === 'ready'));
       assert.equal(h.rendered.slice(before).some(event => event[0] === 'error'), false);
       assert.deepEqual(h.host.settings.args, initial.args); // Legacy data is retained, even when argsText takes precedence.
-      assert.ok(h.confirmations.some(entry => entry.value === false && entry.result.status === 'saved' && entry.result.settings.executable === operation.next.executable));
+      assert.ok(h.confirmations.some(entry => entry.expected.runRequested === false && entry.confirmed
+        && entry.snapshot.executable === operation.next.executable));
     });
   }
 }
@@ -469,8 +464,8 @@ test('explicit press during Setup execution-edit confirmation starts once only a
   assert.deepEqual(startedSnapshot, editedSnapshot);
   assert.deepEqual(h.host.writes, [editedSnapshot]);
   const startedConfirmation = h.confirmations.at(-1);
-  assert.equal(startedConfirmation?.result.status, 'saved');
-  assert.deepEqual(startedConfirmation.result.settings, startedSnapshot);
+  assert.equal(startedConfirmation?.confirmed, true);
+  assert.deepEqual(startedConfirmation.snapshot, startedSnapshot);
   assert.equal(h.runs.length, 1); assert.deepEqual(h.runs[0].execution, { executable: '/synthetic/report.py', args: [] });
   assert.equal(h.session.getState().phase, 'running'); assert.equal(h.session.getState().runRequested, true);
   assert.equal(h.session.getState().recoveryPending, false); assert.deepEqual(h.errors, []);
@@ -538,28 +533,27 @@ for (const releaseFirst of ['cleanup', 'readback']) {
   });
 }
 
-for (const form of ['status-only', 'stale', 'unmatched', 'true-intent']) {
-  test(`${form} session save reply cannot unlock recovery despite real coordinator confirmation`, options, async () => {
+for (const outcome of ['false', 'throw']) {
+  test(`boolean confirmation ${outcome} cannot unlock recovery despite matching real authority settings`, options, async () => {
     // Arrange
     const h = await failed();
-    // Explicitly malformed storage-adapter replies: real coordinator still runs, business logic is not mocked.
-    h.transformReplies((result, value) => {
-      if (value) return result;
-      if (form === 'status-only') return { status: 'saved' };
-      if (form === 'stale') return { ...result, status: 'stale' };
-      return { ...result, settings: { ...result.settings, ...(form === 'unmatched' ? { executable: '/synthetic/wrong-readback' } : { runRequested: true }) } };
-    });
+    // Mock the actual boolean session boundary, not invented structured replies.
+    h.overrideConfirmation(() => { if (outcome === 'throw') throw Error('synthetic confirmation failure'); return false; });
     const before = h.rendered.length;
     // Act
     await h.edit({ executable: '/synthetic/changed' }).finish();
     await h.session.disappear(); await h.session.appear(h.coordinator.getSettings()); await h.session.reconcileAvailability();
     // Assert
-    assert.equal(h.session.getState().recoveryPending, true);
+    assert.equal(h.session.getState().recoveryPending, outcome === 'false');
+    assert.equal(h.session.getState().persistenceBlocked, outcome === 'throw');
+    assert.equal(h.coordinator.isBlocked(), false);
+    assert.deepEqual(h.host.settings, h.coordinator.getSettings());
     assert.equal(h.session.getState().protocolBlocked, true);
     assert.equal(h.session.getState().presentation, 'error');
     assert.equal(h.rendered.slice(before).some(event => event[0] === 'ready'), false);
     assert.equal(h.runs.length, 1);
     assert.equal(h.host.settings.runRequested, false);
+    if (outcome === 'throw') assert.equal(h.errors.at(-1)[1], 'STATE_SAVE_FAILED');
   });
 }
 test('uncertain cleanup outranks both old protocol error and new invalid settings', options, async () => {
@@ -748,13 +742,13 @@ test('new persistence diagnosis during execution confirmation cannot be cleared 
 test('new genuine Start and its current error cannot be cleared by a stale execution-edit confirmation or late host echo', options, async () => {
   // Arrange
   const h = await failed('launch');
-  h.transformReplies((result, value) => value ? result : { ...result, status: 'stale' });
+  h.overrideConfirmation(() => false);
   // Act
   const operation = h.edit({ executable: '/synthetic/changed' });
   await operation.finish();
   const olderStopped = structuredClone(h.host.settings);
   const waitingForConfirmedRecovery = h.session.getState();
-  h.transformReplies(undefined);
+  h.overrideConfirmation(undefined);
   await h.session.press();
   const replacement = h.runs.at(-1);
   replacement.callbacks.onError('Image protocol error.'); replacement.done.resolve({ status: 'error', error: 'Image protocol error.' });

@@ -613,14 +613,13 @@ export function createActionSession({
       if (!eligible()) { completeExecutionRecovery(recovery); return; }
       const settings = desiredSettings;
       let confirmed = false;
-      try { confirmed = await confirmLaunchSettings(copyRunSettings(settings)); } catch {
-        if (current()) void persistenceFailed();
-        return;
-      }
+      let rejected = false;
+      try { confirmed = await confirmLaunchSettings(copyRunSettings(settings)); } catch { rejected = true; }
       if (!current()) return;
       if (!eligible()) { completeExecutionRecovery(recovery); return; }
       // Cosmetic edits may supersede the complete snapshot without superseding execution recovery.
       if (settings !== desiredSettings) continue;
+      if (rejected) { void persistenceFailed(); return; }
       if (confirmed) completeExecutionRecovery(recovery);
       return;
     }

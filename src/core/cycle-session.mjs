@@ -247,11 +247,11 @@ export function createCycleSession({
     return run.stopping;
   }
 
-  async function stopOwned(reason, drain = false) {
+  async function stopOwned(reason) {
     const run = generation;
     if (!run || run.finished) return !cleanupBlocked;
     const frames = queue;
-    if (!drain) frames?.dispose();
+    frames?.dispose();
     const certain = await requestStop(run, reason);
     if (!certain) latchCleanup();
     await frames?.whenIdle();
@@ -388,7 +388,6 @@ export function createCycleSession({
     const update = snapshotOutput(input);
     if (!update || imageFor(update) === undefined || !eligible()) return;
     run.acceptedOutput = true;
-    ++run.outputVersion;
     ++outputVersion;
     // One latest bounded DTO, shared with the outcome; no per-completion history.
     retain(Object.freeze({ kind: 'output', update, cosmeticVersion }));
@@ -467,7 +466,7 @@ export function createCycleSession({
   }
 
   function startGeneration(execution, intent) {
-    const run = { intent, active: true, terminal: false, finished: false, acceptedOutput: false, outputVersion: 0 };
+    const run = { intent, active: true, terminal: false, finished: false, acceptedOutput: false };
     generation = run;
     // An ordinary prior Error remains displayed until valid output or this run's terminal result.
     phase = 'running';
@@ -513,7 +512,7 @@ export function createCycleSession({
     });
   }
 
-  function disable({ recover = false, drain = false } = {}) {
+  function disable({ recover = false } = {}) {
     enabled = false;
     ++intentVersion;
     ++launchVersion;
@@ -523,10 +522,10 @@ export function createCycleSession({
     if (generation) generation.stopReason ??= 'intent';
     if (generation) void requestStop(generation, 'intent');
     phase = 'stopping';
-    const oldFrames = !drain ? invalidateDisplay() : undefined;
+    const oldFrames = invalidateDisplay();
     return schedule(async () => {
       await oldFrames?.whenIdle();
-      const certain = await stopOwned('intent', drain);
+      const certain = await stopOwned('intent');
       const confirmed = await confirmedCurrent();
       if (intent !== intentVersion) return;
       phase = 'stopped';
@@ -548,7 +547,9 @@ export function createCycleSession({
   function failDisplay() {
     if (displayFailurePending || cleanupBlocked || persistenceBlocked) return tail;
     displayFailurePending = true;
-    fatalError = Object.freeze({ kind: 'error', message: 'Frame send failed.', code: 'FRAME_SEND_FAILED', fatal: true });
+    if ((ERROR_PRIORITY.get(fatalError?.message) ?? -1) < ERROR_PRIORITY.get('Frame send failed.')) {
+      fatalError = Object.freeze({ kind: 'error', message: 'Frame send failed.', code: 'FRAME_SEND_FAILED', fatal: true });
+    }
     cancelDeadline();
     ++launchVersion;
     const intent = intentVersion;

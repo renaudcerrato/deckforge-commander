@@ -4,7 +4,6 @@ import { parseOutputCommand, parseOutputNumber, resolveOutputOptions } from './o
 
 const MAX_LINE_BYTES = 262_144;
 const IMAGE_PREFIX = /^(?:\s*<svg|data:image)/;
-const RAW_IMAGE = /^(?:data:image\/(?:png|jpeg|svg\+xml|webp);base64,[A-Za-z0-9+/=]+$|\s*<svg(?:\s|\/?>))/;
 
 function validateRecord(line) {
   if (typeof line !== 'string' || line.length > MAX_LINE_BYTES || Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
@@ -45,8 +44,6 @@ export function parseOutputUpdate(line, defaults = {}) {
   validateRecord(line);
   if (/^\p{White_Space}*$/u.test(line)) return undefined;
   if (IMAGE_PREFIX.test(line)) {
-    // Never enter the legacy parser's JSON branch, even for malformed image prefixes.
-    if (!RAW_IMAGE.test(line)) throw new Error('Image protocol error.');
     const { image } = parseImageUpdate(line);
     return Object.freeze({ kind: 'image', image });
   }

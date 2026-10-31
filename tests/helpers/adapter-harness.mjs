@@ -45,9 +45,10 @@ export function createAdapterLoader(codes, { process: syntheticProcess, resolve 
   observe = (_, actual) => actual }) {
   if (!syntheticProcess) throw new Error('Synthetic process is required');
   const modules = new Map();
+  const platformPath = syntheticProcess.platform === 'win32' ? path.win32 : path.posix;
   const boundaries = new Map([
     ['shlex', shlex], ['node:util', { types }], ['node:buffer', { Buffer }],
-    ['node:path', { default: syntheticProcess.platform === 'win32' ? path.win32 : path.posix }],
+    ['node:path', { ...platformPath, default: platformPath }],
     ['node:os', { homedir: () => '/synthetic/home' }],
     ['node:crypto', { randomUUID: blocked('random UUID request') }],
     ['node:fs/promises', Object.fromEntries(['lstat', 'mkdir', 'open', 'realpath']

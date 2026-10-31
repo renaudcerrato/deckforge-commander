@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import ts from 'typescript';
 import { executionPlatform, isAbsoluteExecutionPath, executionBasename } from '../src/core/execution-paths.mjs';
 import { validateSettings, classifySettings, validateExecutionEdit, sameExecutionSettings } from '../src/core/settings.mjs';
 import { applyConfigurationEdit } from '../src/core/run-state.mjs';
@@ -49,11 +50,14 @@ test('POSIX keeps backslash as literal basename content and rejects relative pat
 });
 test('browser-safe default has no Node dependency and runtime default follows the actual platform', () => {
   // Arrange: isolate globals, never mutate process.platform.
-  const source = readFileSync(new URL('../src/core/execution-paths.mjs', import.meta.url), 'utf8').replaceAll('export function ', 'function ');
+  const source = readFileSync(new URL('../src/core/execution-paths.mjs', import.meta.url), 'utf8');
+  const code = ts.transpileModule(source, { compilerOptions: {
+    target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS,
+  } }).outputText;
   // Act
-  const browser = runInNewContext(`${source}\nexecutionPlatform()`);
-  const windows = runInNewContext(`${source}\nexecutionPlatform()`, { process: { platform: 'win32' } });
-  const unknown = runInNewContext(`${source}\nexecutionPlatform()`, { process: { platform: 'unknown' } });
+  const browser = runInNewContext(`${code}\nexports.executionPlatform()`, { exports: {} });
+  const windows = runInNewContext(`${code}\nexports.executionPlatform()`, { exports: {}, process: { platform: 'win32' } });
+  const unknown = runInNewContext(`${code}\nexports.executionPlatform()`, { exports: {}, process: { platform: 'unknown' } });
   // Assert
   assert.equal(browser, 'posix'); assert.equal(windows, 'win32'); assert.equal(unknown, 'posix');
   assert.equal(executionPlatform(), process.platform === 'win32' ? 'win32' : 'posix');

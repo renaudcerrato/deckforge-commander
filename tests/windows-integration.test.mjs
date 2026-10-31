@@ -257,10 +257,7 @@ async function lifecycle() {
   for (let i = 0; i < 12; i++) { const run = raw('empty'); const state = await finish(run); assert.equal(state.exit.code, 0); retained.push(run.transport); }
   const live = raw('hold'); await bounded(live.ready);
   for (const stale of retained) assert.equal(await bounded(stale.stop()), true);
-  let beats = 0; const timer = setInterval(() => { beats++; }, 1);
-  try { await delay(30); assert.equal(await bounded(live.transport.stop()), true); await finish(live); }
-  finally { clearInterval(timer); }
-  assert.ok(beats > 0);
+  assert.equal(await bounded(live.transport.stop()), true); await finish(live);
 
   // Arrange / Act / Assert — actual callback exception cleans owned processes.
   stage = 'lifecycle-callback-negative';

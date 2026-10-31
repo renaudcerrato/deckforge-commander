@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { createInspectorFixture } from './helpers/inspector-harness.mjs';
+import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
+import { createInspectorFixture, extractInspectorMarkup, assertInspectorMarkup } from './helpers/inspector-harness.mjs';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
 
 // Objective: markup changes update the boundary fixture without a second ID inventory.
@@ -40,25 +42,219 @@ test('inspector fixture never invents absent IDs from comments, scripts, styles 
   assert.equal(fixture.elements.size, 1);
 });
 
+// S24: one static contract covers authored/generated markup and equivalent formatting.
+const staticControls = readFileSync(new URL('../src/inspector/run.html', import.meta.url), 'utf8');
+const generatedControls = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
+
+function reformatMarkup(html) {
+  return html.replace(/<([a-z][\w-]*)\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>/gi, (_, tag, source) => {
+    // Reformat only opening tags; preserve text, CSS, script bodies and closing tags.
+    const attributes = source.match(/[^\s=/>]+(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g) ?? [];
+    return `<${tag}\n ${attributes.reverse().map(attribute => attribute
+      .replace(/^([^\s=/>]+)\s*=\s*"([^"]*)"$/, (_, name, value) => value.includes("'")
+        ? `${name} = "${value}"` : `${name} = '${value}'`)).join('\n ')}${/\/\s*$/.test(source) ? ' /' : ''} >`;
+  });
+}
+const markupVariants = [['authored', staticControls], ['authored reformatted', reformatMarkup(staticControls)],
+  ['generated', generatedControls], ['generated reformatted', reformatMarkup(generatedControls)]];
+
+for (const [variant, html] of markupVariants) {
+  test(`central inspector static contract holds for ${variant} markup`, () => {
+    // Arrange
+    const input = html;
+    // Act
+    const verify = () => assertInspectorMarkup(input);
+    // Assert: bindings, accessibility, presets, writers and CSS share one contract.
+    assert.doesNotThrow(verify);
+  });
+}
+
+test('static control semantics tolerate reordered attributes, quotes and whitespace', () => {
+  // Arrange: equivalent static controls, not a browser rendering claim.
+  const formatted = markupVariants[1][1];
+  // Act
+  const fixtures = [staticControls, formatted].map(createInspectorFixture);
+  // Assert
+  assert.notEqual(formatted, staticControls);
+  assert.equal(fixtures[1].fields.timerControls.hidden, fixtures[0].fields.timerControls.hidden);
+  assert.equal(fixtures[1].fields.status.getAttribute('aria-live'), 'polite');
+});
+
+for (const [label, html, placeholder] of [
+  ['apostrophes', `<sdpi-textfield id="draft" placeholder="owner's folder" title='say "hello"'></sdpi-textfield>`, "owner's folder"],
+  ['embedded equals and quotes', `<sdpi-textfield id="draft" placeholder='--mode="daily report"' title='say "hello"'></sdpi-textfield>`, '--mode="daily report"'],
+]) {
+  test(`markup reformatting preserves ${label} and quoted attribute values`, () => {
+    // Arrange
+    const original = createInspectorFixture(html).fields.draft;
+    // Act
+    const formatted = reformatMarkup(html), field = createInspectorFixture(formatted).fields.draft;
+    // Assert: quote changes cannot split a valid attribute or invent extra attributes.
+    assert.notEqual(formatted, html);
+    assert.equal(field.getAttribute('placeholder'), placeholder);
+    assert.equal(field.getAttribute('title'), original.getAttribute('title'));
+    assert.equal(extractInspectorMarkup(formatted).nodes[0].attributes.size, 3);
+  });
+}
+
+for (const css of [
+  '#custom-interval[hidden],#timer-controls[hidden]{display:none!important}',
+  '#timer-controls[ hidden ] { display : none ! important ; } #custom-interval[hidden]{display:none !important;}',
+]) {
+  test('static CSS contract accepts equivalent whitespace and selector order', () => {
+    // Arrange
+    const html = staticControls.replace(/#timer-controls\[hidden\][^}]*}/, css)
+      .replace('#settings-status { color: #969696; }', '#settings-status{color : #969696}');
+    // Act
+    const verify = () => assertInspectorMarkup(html);
+    // Assert
+    assert.doesNotThrow(verify);
+  });
+}
+for (const [defect, css] of [
+  ['missing hidden rule', ''],
+  ['missing custom selector', '#timer-controls[hidden]{display:none!important}'],
+  ['visible hidden rows', '#timer-controls[hidden],#custom-interval[hidden]{display:block!important}'],
+  ['nonimportant hidden rule', '#timer-controls[hidden],#custom-interval[hidden]{display:none}'],
+  ['descendant instead of hidden control', '#timer-controls [hidden],#custom-interval[hidden]{display:none!important}'],
+]) {
+  test(`static CSS contract rejects ${defect}`, () => {
+    // Arrange
+    const html = staticControls.replace(/#timer-controls\[hidden\][^}]*}/, css);
+    // Act
+    const verify = () => assertInspectorMarkup(html);
+    // Assert
+    assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const css of ['#settings-status{color:red}', '#settings-status{opacity:1}']) {
+  test('static CSS contract still rejects incorrect or missing status color', () => {
+    // Arrange
+    const html = staticControls.replace('#settings-status { color: #969696; }', css);
+    // Act
+    const verify = () => assertInspectorMarkup(html);
+    // Assert
+    assert.throws(verify, assert.AssertionError);
+  });
+}
+test('static CSS contract rejects SDPI backgrounds while status color remains valid', () => {
+  // Arrange: change only the forbidden background, not the independent status rule.
+  const html = staticControls.replace('#settings-status { color: #969696; }',
+    '$&\n SDPI-item { BACKGROUND-COLOR: black; }');
+  // Act
+  const verify = () => assertInspectorMarkup(html);
+  // Assert: without the background guard, this otherwise-valid fixture would pass.
+  assert.notEqual(html, staticControls);
+  assert.throws(verify, assert.AssertionError);
+});
+
+// Use the existing extractor's ranges, not a second parser or authored spelling.
+function mutateMarkup(html, select, edit) {
+  const { nodes, scripts } = extractInspectorMarkup(html);
+  const matches = [...nodes, ...scripts].filter(select);
+  assert.equal(matches.length, 1, 'mutation must identify exactly one target');
+  const node = matches[0];
+  const draft = { tag: node.tag, attributes: new Map(node.attributes),
+    content: html.slice(node.openEnd, node.closeStart), remove: false, wrap: false };
+  edit(draft);
+  const attributes = [...draft.attributes].map(([name, value]) => `${name}="${value.replaceAll('"', '&quot;')}"`).join(' ');
+  const opening = `<${draft.tag} ${attributes}>`;
+  let replacement = draft.remove ? '' : opening + (node.end === node.openEnd ? '' : `${draft.content}</${draft.tag}>`);
+  if (draft.wrap) replacement = `<div>${replacement}</div>`;
+  return html.slice(0, node.start) + replacement + html.slice(node.end);
+}
+const idIs = id => node => node.attributes.get('id') === id;
+const presetIs = value => node => node.tag === 'option' && node.attributes.get('value') === value
+  && node.parent.attributes.get('id') === 'intervalPreset';
+const entryScript = node => node.tag === 'script' && node.attributes.get('src') === 'run.js';
+const body = node => node.tag === 'body';
+
+for (const [defect, select, edit] of [
+  ['missing hidden attribute', idIs('timer-controls'), node => node.attributes.delete('hidden')],
+  ['wrong live region', idIs('settings-status'), node => node.attributes.set('aria-live', 'off')],
+  ['missing status role', idIs('settings-status'), node => node.attributes.delete('role')],
+  ['wrong preset value', presetIs('60'), node => node.attributes.set('value', '61')],
+  ['wrong preset label', presetIs('60'), node => { node.content = 'Other'; }],
+  ['nested preset content', presetIs('60'), node => { node.content = '1mn<b>Other</b>'; }],
+  ['missing preset', presetIs('custom'), node => { node.remove = true; }],
+  ['wrong control ancestry', idIs('actionOnPress'), node => { node.wrap = true; }],
+  ['remote script', entryScript, node => node.attributes.set('src', 'https://example.invalid/run.js')],
+  ['inline script', entryScript, node => { node.content = 'unexpected()'; }],
+  ['additional settings writer', idIs('intervalPreset'), node => node.attributes.set('setting', 'intervalSeconds')],
+  ['wrong picker element', idIs('executable'), node => { node.tag = 'sdpi-textfield'; }],
+  ['wrong native color type', idIs('themeColor'), node => node.attributes.set('type', 'text')],
+  ['wrong initial color', idIs('themeColor'), node => node.attributes.set('value', '#969696')],
+  ['wrong native color label', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Theme color', node => node.attributes.set('label', 'Other')],
+  ['wrong color accessibility label', idIs('themeColor'), node => node.attributes.set('aria-label', 'Other')],
+  ['environment field', body, node => { node.content += '<input id="environment" />'; }],
+  ['persisted mode control', body, node => { node.content += '<sdpi-select id="mode"></sdpi-select>'; }],
+  ['Apply writer', body, node => { node.content += '<button>Apply</button>'; }],
+  ['nonempty status', idIs('settings-status'), node => { node.content = 'unexpected'; }],
+  ['duplicate writer control', body, node => { node.content += '<sdpi-file id="executable"></sdpi-file>'; }],
+]) {
+  for (const [variant, input] of markupVariants) {
+    test(`static control assertions still reject ${defect} in ${variant} markup`, () => {
+      // Arrange
+      const html = input;
+      // Act
+      const invalid = mutateMarkup(html, select, edit);
+      // Assert: a no-op fixture must never masquerade as a rejected defect.
+      assert.notEqual(invalid, html, 'mutation must change its input');
+      assert.throws(() => assertInspectorMarkup(invalid), assert.AssertionError);
+    });
+  }
+}
+
+// Reject ambiguous attributes instead of emulating a browser's recovery rules.
+for (const [label, html] of [
+  ['role', '<p role="button" role="status"></p>'],
+  ['mixed-case role', "<p ROLE='button' role='status'></p>"],
+  ['ID', "<input id='wrong' ID='executable' />"],
+  ['script source', "<script SRC='remote.js' src='run.js'></script>"],
+  ['style attribute', "<style media='print' MEDIA='screen'></style>"],
+]) {
+  test(`static extraction rejects duplicate ${label} attributes consistently`, () => {
+    // Arrange
+    const input = html;
+    // Act
+    const extract = () => extractInspectorMarkup(input), fixture = () => createInspectorFixture(input);
+    // Assert
+    assert.throws(extract, { message: 'Duplicate static inspector attribute' });
+    assert.throws(fixture, { message: 'Duplicate static inspector attribute' });
+  });
+}
+
 // Objective: an actual missing required link still fails the existing production entry.
-for (const id of ['github-project', 'ask-chatgpt']) {
-  test(`built inspector detects absent authored ${id} rather than receiving an invented element`, () => {
+for (const id of [undefined, 'github-project', 'ask-chatgpt']) {
+  test(`built inspector initialization ${id ? `rejects absent ${id}` : 'accepts complete markup'} without connection side effects`, () => {
     // Arrange
     const html = readFileSync(new URL('../src/inspector/run.html', import.meta.url), 'utf8');
     const script = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8');
-    const fixture = createInspectorFixture(html.replace(`id="${id}"`, ''));
+    const source = createInspectorFixture(html);
+    if (id) assert.ok(source.getElementById(id), 'required link must exist before removal');
+    const input = id ? mutateMarkup(html, idIs(id), node => { node.remove = true; }) : html;
+    const fixture = createInspectorFixture(input);
+    const unrelated = [...fixture.elements].filter(([key]) => key !== id);
+    if (id) {
+      assert.notEqual(input, html);
+      assert.equal(fixture.getElementById(id), null, 'required link must be absent before bundle evaluation');
+      assert.deepEqual([...fixture.elements.keys()], [...source.elements.keys()].filter(key => key !== id));
+    }
+    const effects = { timers: 0, sockets: 0, settings: 0 };
     const context = { window: { addEventListener() {} },
       document: { readyState: 'complete', getElementById: fixture.getElementById },
-      setTimeout() { throw new Error('Unexpected timer before connection'); }, clearTimeout() {},
-      WebSocket: class { constructor() { throw new Error('Unexpected socket before connection'); } },
+      setTimeout() { effects.timers++; }, clearTimeout() {},
+      WebSocket: class { constructor() { effects.sockets++; } send() { effects.settings++; } },
     };
     // Act
     let failure;
     try { runInNewContext(script, context, { timeout: 1000 }); } catch (error) { failure = error; }
     // Assert
-    assert.equal(fixture.getElementById(id), null);
-    assert.equal(failure?.name, 'TypeError');
-    assert.match(failure.message, /addEventListener/);
+    if (id) assert.equal(fixture.getElementById(id), null);
+    for (const [key, field] of unrelated) assert.equal(fixture.getElementById(key), field);
+    assert.equal(failure !== undefined, id !== undefined);
+    assert.deepEqual(effects, { timers: 0, sockets: 0, settings: 0 });
+    if (!id) assert.equal(typeof context.window.connectElgatoStreamDeckSocket, 'function');
   });
 }
 
@@ -96,17 +292,19 @@ test('SDPI edits strip CRLF and dispatch synchronously without detail, then resp
   assert.equal(field.value, 'afterremoval');
 });
 
-test('native color boundary emits input/change rather than SDPI events and removes listeners', () => {
+test('native color assignment and event delivery are independent and listener removal is respected', () => {
   // Arrange
   const field = createInspectorFixture().fields.themeColor, events = [];
   const input = () => events.push('input'), change = () => events.push('change');
   field.addEventListener('input', input); field.addEventListener('change', change);
   field.addEventListener('valuechange', () => events.push('unexpected SDPI event'));
   // Act
-  field.userEdit('#abcdef'); field.removeEventListener('input', input); field.removeEventListener('change', change);
-  field.userEdit('#123456');
+  field.value = '#abcdef'; const assigned = [...events];
+  field.dispatch('input'); field.dispatch('change');
+  field.removeEventListener('input', input); field.removeEventListener('change', change);
+  field.userEdit('#123456'); field.dispatch('input'); field.dispatch('change');
   // Assert
-  assert.deepEqual(events, ['input', 'change']); assert.equal(field.value, '#123456');
+  assert.deepEqual(assigned, []); assert.deepEqual(events, ['input', 'change']); assert.equal(field.value, '#123456');
 });
 
 test('placeholder attributes repaint only on requestUpdate and unsupported SDPI property text fails', () => {
@@ -135,23 +333,34 @@ test('status accepts literal plaintext and rejects HTML insertion without changi
 const adapterCodes = await loadAdapterCode(['run', 'once', 'timer']);
 const syntheticProcess = platform => ({ platform, env: platform === 'win32'
   ? { LOCALAPPDATA: 'C:/synthetic/local' } : {}, cwd: () => '/synthetic/cwd' });
+// Compile actual import syntax through the same loader; the probe exists only in memory.
+const pathProbe = fileURLToPath(new URL('../src/actions/harness-path-probe.ts', import.meta.url));
+const pathProbeCodes = new Map(adapterCodes);
+pathProbeCodes.set(pathProbe, ts.transpileModule(`
+  import paths, { join, isAbsolute, sep } from 'node:path';
+  export function inspect(base: string) {
+    return { named: join(base, 'Library', 'Application Support'),
+      default: paths.join(base, 'Library', 'Application Support'), sep,
+      absolute: isAbsolute(base), relative: isAbsolute('synthetic/home'),
+      sameImplementation: join === paths.join && isAbsolute === paths.isAbsolute };
+  }
+`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText);
 
 // Objective: follow extensionless TS and transitive MJS imports, including real
 // parsing and validation, under the same synthetic platform as the adapter.
 for (const platform of ['darwin', 'win32']) {
-  test(`injected path namespace follows synthetic ${platform} rather than the host`, () => {
+  test(`named and default path imports follow the same synthetic ${platform} namespace rather than the host`, () => {
     // Arrange
-    const load = createAdapterLoader(adapterCodes, { process: syntheticProcess(platform) });
+    const load = createAdapterLoader(pathProbeCodes, { process: syntheticProcess(platform) });
     const base = platform === 'win32' ? 'C:/synthetic/home' : '/synthetic/home';
     // Act
-    const paths = load('node:path').default;
-    const joined = paths.join(base, 'Library', 'Application Support');
-    const absolute = paths.isAbsolute(base), relative = paths.isAbsolute('synthetic/home');
+    const result = load('./harness-path-probe').inspect(base);
     // Assert
-    assert.equal(joined, platform === 'win32'
+    const joined = platform === 'win32'
       ? String.raw`C:\synthetic\home\Library\Application Support`
-      : '/synthetic/home/Library/Application Support');
-    assert.equal(absolute, true); assert.equal(relative, false);
+      : '/synthetic/home/Library/Application Support';
+    assert.deepEqual(result, { named: joined, default: joined, sep: platform === 'win32' ? '\\' : '/',
+      absolute: true, relative: false, sameImplementation: true });
   });
 
   test(`adapter graph uses real script draft parsing with ${platform} paths and argument grammar`, () => {

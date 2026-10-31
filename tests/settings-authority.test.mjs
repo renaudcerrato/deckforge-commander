@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
 import { createRunStateCoordinator } from '../src/core/run-state.mjs';
 import { createActionSession } from '../src/core/action-session.mjs';
+import { svgElements } from './helpers/svg-harness.mjs';
 
 const options = { timeout: 3000 };
 const initial = { executable: '/synthetic/program', args: ['legacy', ''], runRequested: false, extra: { nested: ['retained'] } };
@@ -260,13 +261,28 @@ function adapter({ firstStopGate } = {}) {
   const action = new exports.RunAction({ onDeviceDidConnect: register('connect'), onDeviceDidDisconnect: register('disconnect'), onSystemDidWakeUp: register('wake') });
   return { action, launches, replies, emit(name, device) { listeners.get(name)({ device }); } };
 }
+function footerText(svg) {
+  return svgElements(svg, 'text').find(text => text['text-anchor'] === 'middle' && !text['clip-path'])?.text;
+}
+
+test('artwork footer observation follows centered unclipped status text, not a fixed baseline', () => {
+  // Arrange: the caption deliberately contains another status-looking word.
+  const caption = `<text clip-path='url(#caption)' text-anchor='middle' y='124'>ready</text>`;
+  const complete = `<svg>${caption}<text y='119' fill='#969696' text-anchor='middle'>loading...</text></svg>`;
+  const absent = `<svg>${caption}<text text-anchor='end' y='124'>.py</text></svg>`;
+  // Act
+  const observed = [footerText(complete), footerText(absent)];
+  // Assert
+  assert.deepEqual(observed, ['loading...', undefined]);
+});
+
 function runtime(id = 'synthetic-key', input = executionInitial, host = { value: structuredClone(input), writes: 0, reads: 0, images: [], footers: [], titles: [] }) {
   const action = { id, manifestId: 'synthetic-action', isKey: () => true, coordinates: { column: 0, row: 0 }, device: { id: 'synthetic-device', name: 'synthetic', type: 0, size: { columns: 1, rows: 1 }, isConnected: true },
     async getSettings() { host.reads++; return structuredClone(host.value); }, async setSettings(value) { host.writes++; host.value = structuredClone(value); },
     async setImage(image) {
       host.images.push(image);
       const svg = decodeURIComponent(image.slice('data:image/svg+xml,'.length));
-      host.footers.push(svg.match(/<text\b[^>]*\by="124"[^>]*>([^<]*)<\/text>/)?.[1]);
+      host.footers.push(footerText(svg));
     }, async setTitle(title) { host.titles.push(title); },
   };
   return { action, host };

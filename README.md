@@ -35,7 +35,7 @@ Hidden keys do not start background work: Stream stops, while Loop and Run may l
 
 Choose an absolute executable path. Programs run directly with your permissions—no shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang; on Windows, select an interpreter executable and pass the script path as an argument. Use only programs you trust; see [Windows setup](docs/windows-support.md#choose-an-executable).
 
-In Windows **Arguments**, backslashes stay literal: `C:\Scripts\showcase.py` is one argument. Use single or double quotes to group spaces, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`; macOS argument syntax is unchanged.
+In Windows **Arguments**, backslashes stay literal: `C:\Scripts\showcase.py` is one argument. Use single or double quotes to group spaces, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`.
 
 ## Install a packaged build
 
@@ -48,9 +48,7 @@ npm install
 npm run pack
 ```
 
-`pack` builds the native addon and minified plugin/inspector bundles, then creates `dist/git.renaudcerrato.deckforge.streamDeckPlugin`. Use `npm run build` to build without packaging. Both work on macOS arm64/x64, Linux x64 (build-only), or Windows x64 without Stream Deck or a device. The first build downloads pinned tools; later builds reuse the cache. See the [Windows guide](docs/windows-support.md).
-
-To prepare a release draft, open **Actions → CI → Run workflow**, select **main**, and start it. CI prepares an unpublished draft only after build, tests, and validation pass. If a draft is missing its installer, rerun that workflow run for the same commit; recovery requires the version tag to still point to the tested commit, and a mismatch fails without moving the tag. Complete drafts and published releases are left unchanged. Publishing is manual—wait for the run to finish before publishing the draft or changing its tag.
+Open the resulting `dist/git.renaudcerrato.deckforge.streamDeckPlugin` to install. Use `npm run build` to build without packaging. Building requires neither Stream Deck nor a device; see [Requirements](#requirements) and the [Windows guide](docs/windows-support.md).
 
 For an optional local Stream Deck test, link the checkout:
 
@@ -126,7 +124,7 @@ Start options with `|`; separate `key:value` pairs with `;`. Omitted options res
 | Escapes | Use a backslash to escape `;`, `\|`, or another backslash. Unknown escapes remain literal; a dangling escape invalidates the command. |
 | Hard breaks | Only explicit `text:` main content decodes `\n`, after command parsing. Plain stdout, captions, card fields, and progress keep it literal. Physical `LF`/`CRLF` always end records. |
 | Numbers | Finite decimals only: no whitespace, exponent notation, or hex. |
-| Defaults | Output styles are not saved preferences. `header`, `footer`, `label`, and `display` are record content; they never persist or inherit caller defaults. |
+| Defaults | Output styles are not saved preferences. `header`, `footer`, `label`, and `display` apply only to the current record; omission clears them or restores their documented defaults. |
 
 ```text
 text:A\|B\;C\\D
@@ -313,7 +311,7 @@ Send a percentage or ratio. `display` changes the annotation, not the fill. Defa
 | Annotation colors | Lowercase `accent` follows effective fill, including theme-only redraws without explicit fill. Explicit opaque colors stay fixed. |
 | Fit | Explicit display/labels may ellipsize; default percentages never truncate. Font sizes and geometry never shrink. The whole track and every visible annotation must fit the 144-unit canvas and any protected border; infeasible or undrawable layouts skip the entire record. |
 | Caption gap | `label-gap` is exact for a centered ring pair or a same-side value/caption pair; otherwise it is a minimum subject to geometry. |
-| Centered ring value + label | Pair centered at coordinate 72 with height `value-size + label-size + label-gap`. A solo annotation is unchanged. |
+| Centered ring value + label | Value and caption are centered together. |
 
 </details>
 
@@ -344,7 +342,7 @@ Basic MIME/base64 checks only, not full decoding or parsing. Images ignore gener
 | Invalid reserved command; duplicate, unknown, or inapplicable option; impossible layout | Skip the record; keep the previous frame; do not reinterpret as text. |
 | Invalid UTF-8, oversized payload, unterminated nonblank record at EOF, or malformed recognized image prefix | Stop the program; the key shows Error with the fixed `Image protocol error.` status. |
 
-Fix malformed output, then retry: **Stream**—tap; **Loop**—hold one second to disable, then tap. Restarting the plugin also clears a protocol error. Uncertain cleanup or saving blocks retry.
+Fix malformed output, then retry: **Stream**—tap; **Loop**—hold one second to disable, then tap. Restarting the plugin also clears a protocol error. Retry is blocked if the previous program cannot be confirmed stopped or a settings save remains unconfirmed.
 
 <details>
 <summary>Error recovery rules</summary>

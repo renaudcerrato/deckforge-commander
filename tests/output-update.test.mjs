@@ -32,7 +32,7 @@ for (const type of ['ring', 'bar']) test(`S2 ${type} expanded progress provenanc
   const next = parseOutputUpdate('progress:101', defaults);
   const rejected = ['label-gap:-1', 'label-weight:Bold', 'padding-x:0', 'padding-y:0', 'label-align:left', 'scale:0', 'thickness:-1', 'value-size:0', 'label-size:1e2', 'label-gap:0;label-gap:2'].map(suffix => parseOutputUpdate(`progress:1|color:red;${suffix}`));
   // Assert
-  assert.equal(first.value, 1700 / 1034);
+  assert.ok(Math.abs(first.value - 1700 / 1034) <= (1700 / 1034) * 1e-14);
   for (const key of ['type', 'scale', 'thickness', 'value-size', 'label-size', 'label', 'display', 'label-weight', 'label-gap']) assert.equal(redraw[key], first.options[key]);
   assert.deepEqual([redraw['value-color'], redraw['label-color'], first.options['label-color'], first.overrides['label-color']], ['#00ff00', '#00ff00', '#0000ff', 'accent']);
   assert.deepEqual([next.value, next.options.type, next.options.scale, next.options.thickness, next.options['value-size'], next.options['label-size'], next.options['label-weight'], next.options['label-gap'], next.options.label, next.options.display, next.overrides], [100, 'ring', 80, 8, 16, 16, 'bold', 2, '', undefined, {}]);
@@ -59,7 +59,13 @@ test('text layout provenance re-resolves against a new theme and resets on the n
   assert.ok(Object.isFrozen(first) && Object.isFrozen(first.options) && Object.isFrozen(first.overrides));
   assert.equal(invalid, undefined);
 });
-for (const suffix of ['font-size:15;label-size:13.9', 'font-size:48.1;label-size:32.1', 'padding:0;padding-x:3;padding-y:33;line-height:3', 'font-size:0.5;label-size:0.5;label-gap:0;border:16']) {
+// S04 / README Text options: expected wire values must not come from the parser's own overrides.
+for (const [suffix, expectedOverrides, axes] of [
+  ['font-size:15;label-size:13.9', { label: 'C', 'font-size': 15, 'label-size': 13.9 }, [16, 16]],
+  ['font-size:48.1;label-size:32.1', { label: 'C', 'font-size': 48.1, 'label-size': 32.1 }, [16, 16]],
+  ['padding:0;padding-x:3;padding-y:33;line-height:3', { label: 'C', padding: 0, 'padding-x': 3, 'padding-y': 33, 'line-height': 3 }, [3, 33]],
+  ['font-size:0.5;label-size:0.5;label-gap:0;border:16', { label: 'C', 'font-size': 0.5, 'label-size': 0.5, 'label-gap': 0, border: 16 }, [16, 16]],
+]) {
   test(`formerly restricted text values parse literally with immutable provenance: ${suffix}`, () => {
     // Arrange
     const wire = `text:A|label:C;${suffix}`;
@@ -68,7 +74,9 @@ for (const suffix of ['font-size:15;label-size:13.9', 'font-size:48.1;label-size
     // Assert
     assert.equal(result.kind, 'text');
     assert.equal(result.value, 'A');
-    for (const [key, value] of Object.entries(result.overrides)) assert.equal(result.options[key], value);
+    assert.deepEqual(result.overrides, expectedOverrides);
+    for (const [key, value] of Object.entries(expectedOverrides)) assert.equal(result.options[key], value);
+    assert.deepEqual([result.options['padding-x'], result.options['padding-y']], axes);
     assert.ok(Object.isFrozen(result.options) && Object.isFrozen(result.overrides));
   });
 }
@@ -248,6 +256,21 @@ for (const image of ['<svg/>', ' <svg><broken></svg>', '<svg>é😀 #%</svg>']) 
     const result = parseOutputUpdate(image);
     // Assert
     assert.deepEqual(result, expected);
+  });
+}
+
+for (const [encoding, body] of [['ASCII', 'x'.repeat(262133)], ['multibyte', 'é'.repeat(131066) + 'x']]) {
+  test(`recognized ${encoding} SVG accepts the exact byte limit and rejects one extra byte`, () => {
+    // Arrange: image delegation must not bypass the output record's UTF-8 byte bound.
+    const image = `<svg>${body}</svg>`, oversized = `<svg>${body}x</svg>`;
+    let failure;
+    // Act
+    const result = parseOutputUpdate(image);
+    try { parseOutputUpdate(oversized); } catch (error) { failure = error; }
+    // Assert
+    assert.deepEqual(result, { kind: 'image', image: `data:image/svg+xml,${encodeURIComponent(image)}` });
+    assert.equal(failure?.message, 'Image protocol error.');
+    assert.equal(failure?.cause, undefined);
   });
 }
 
@@ -444,7 +467,9 @@ for (const [source, expected] of [
     const result = parseOutputUpdate(line);
     // Assert
     assert.equal(result.kind, 'progress');
-    assert.ok(Math.abs(result.value - expected) <= Math.max(Number.MIN_VALUE, Math.abs(expected) * 1e-14));
+    // S06: computed ratios allow rounding noise; clamping and extreme underflow stay exact.
+    if (expected === 0 || expected === 100) assert.equal(result.value, expected);
+    else assert.ok(Math.abs(result.value - expected) <= Math.max(Number.MIN_VALUE, Math.abs(expected) * 1e-14));
     assert.equal(result.options.display, undefined);
     assert.ok(Object.isFrozen(result));
   });
@@ -468,7 +493,7 @@ test('literal ratio display and accent provenance survive cosmetic re-resolution
   const next = parseOutputUpdate('progress:17/1034', defaults);
   // Assert
   assert.equal(first.options.display, String.raw`17;done|path\x:{value},"q"`);
-  assert.equal(first.value, 1700 / 1034);
+  assert.ok(Math.abs(first.value - 1700 / 1034) <= (1700 / 1034) * 1e-14);
   assert.equal(redraw.display, first.options.display);
   assert.equal(redraw['value-color'], '#00ff00');
   assert.equal(first.overrides['value-color'], 'accent');

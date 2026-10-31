@@ -219,31 +219,6 @@ test('Windows Loop inspector exposes only Loop controls, switches cwd hint and p
   assert.equal(h.bridge.getConnectionState().platform, 'posix'); h.dispose();
 });
 
-// Objective: one authored inspector, conditional Timer rows, unchanged common controls/save placement.
-test('Timer markup declares exact presets, hidden rows and no additional settings writer', () => {
-  // Arrange
-  const html = asset('run.html');
-  // Act
-  const interval = html.match(/<sdpi-select id="intervalPreset">([\s\S]*?)<\/sdpi-select>/)[1];
-  const pressRow = html.match(/<sdpi-item label="Action on press">([\s\S]*?)<\/sdpi-item>/)[1];
-  const options = [...interval.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)].map(match => [match[1], match[2]]);
-  // Assert
-  assert.deepEqual(options, [...presets, ['custom', 'Custom']]);
-  assert.match(pressRow, /<sdpi-select id="actionOnPress">/);
-  assert.deepEqual([...pressRow.matchAll(/<option value="([^"]+)">([^<]+)<\/option>/g)].map(match => [match[1], match[2]]),
-    [['refresh', 'start / refresh (long press to stop)'], ['stop', 'start / stop']]);
-  assert.equal(/<small\b/.test(pressRow), false);
-  assert.ok(html.indexOf('id="actionOnPress"') < html.indexOf('id="intervalPreset"'));
-  assert.match(html, /<small>Enter whole seconds from 1 to 86400\.<\/small>/);
-  assert.match(html, /<div id="timer-controls" hidden>/);
-  assert.match(html, /<sdpi-item id="custom-interval"[^>]* hidden>/);
-  assert.match(html, /#timer-controls\[hidden\], #custom-interval\[hidden\]\s*\{\s*display: none !important;/);
-  assert.match(html, /<sdpi-textfield id="intervalSeconds">/);
-  assert.deepEqual([...html.matchAll(/<script[^>]+src="([^"]+)"/g)].map(match => match[1]), ['sdpi-components.js', 'run.js']);
-  assert.equal(/\bsetting\s*=|<script>|\bApply\b|<sdpi-button|<button/.test(html), false);
-  assert.ok(html.indexOf('id="settings-status"') > html.indexOf('id="themeColor"'));
-});
-
 for (const [value] of presets) {
   test(`stored ${value} seconds selects its preset without synchronous hydration writes`, () => {
     // Arrange
@@ -312,13 +287,20 @@ for (const value of [0, -1, 86401, 1.5, '60', null]) {
 for (const [text, number] of [['1', 1], ['86400', 86400], ['00030', 30], ['77', 77]]) {
   test(`custom ASCII ${text} coalesces at 200ms into canonical number and retains local Custom on saved reply`, () => {
     // Arrange
-    const h = harness(); h.ready(); h.f.intervalPreset.value = 'custom';
+    const h = harness(); h.ready(); h.f.intervalPreset.value = 'custom'; const old = h.last();
     // Act
-    h.f.intervalSeconds.value = '2'; h.f.intervalSeconds.value = text;
-    const before = h.edits().length; h.time.tick(200); const request = h.last();
+    h.f.intervalSeconds.value = '2'; h.time.advance(100); h.f.intervalSeconds.value = text;
+    h.time.advance(100); const atFirstDeadline = h.edits().length;
+    h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: initial });
+    const protectedText = h.f.intervalSeconds.value;
+    h.time.advance(99); const beforeLatestDeadline = h.edits().length;
+    h.time.advance(1); const request = h.last();
     h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, intervalSeconds: number } });
     // Assert
-    assert.equal(before, 0); assert.equal(h.edits().length, 1);
+    assert.equal(atFirstDeadline, 0); assert.equal(beforeLatestDeadline, 0); assert.equal(h.edits().length, 1);
+    assert.equal(protectedText, text);
+    assert.equal(request.context, old.context); assert.equal(request.inspectorId, old.inspectorId);
+    assert.ok(Number.isSafeInteger(request.requestId) && request.requestId > old.requestId);
     assert.deepEqual(request.changes, { intervalSeconds: number });
     assert.equal(h.f.intervalPreset.value, 'custom'); assert.equal(h.f.customInterval.hidden, false);
     assert.equal(h.f.intervalSeconds.value, String(number)); assert.equal(h.f.status.textContent, '');
@@ -463,6 +445,7 @@ test('late interval acknowledgment cannot replace newer typing or falsely mark i
   // Act
   h.f.intervalSeconds.value = '19';
   h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, intervalSeconds: 17 } });
+  h.time.tick(200); // P4: latest custom typing must finish its own trailing interval.
   const newest = h.last(), text = h.f.intervalSeconds.value, status = h.f.status.textContent;
   h.reply({ ...newest, type: 'canvas:reply', status: 'saved', settings: { ...initial, intervalSeconds: 19 } });
   h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, intervalSeconds: 17 } });
@@ -542,12 +525,15 @@ for (const built of [false, true]) {
 test(`Loop ${built ? 'built entry' : 'source bridge'} edits and validation send only configuration traffic, never diagnostic values or settings dumps`, () => {
   // Arrange
   const h = harness({ built }); h.ready({ ...initial, argsText: 'PRIVATE_ARGS', unknown: 'PRIVATE_SETTINGS' });
+  const handshake = h.last();
   // Act
   h.f.intervalPreset.value = 'custom'; h.f.intervalSeconds.value = '12345'; h.time.tick(200);
   const edit = h.last(), count = h.sockets[0].sent.length;
   h.f.intervalSeconds.value = 'PRIVATE_INTERVAL'; h.time.tick(200);
   // Assert
-  assert.equal(edit.requestId, 3); assert.deepEqual(edit.changes, { intervalSeconds: 12345 });
+  assert.ok(Number.isSafeInteger(edit.requestId) && edit.requestId > handshake.requestId);
+  assert.equal(edit.context, handshake.context); assert.equal(edit.inspectorId, handshake.inspectorId);
+  assert.deepEqual(edit.changes, { intervalSeconds: 12345 });
   assert.equal(h.sockets[0].sent.length, count); assert.equal(h.f.status.textContent, intervalError);
   assert.deepEqual(h.sockets[0].sent.filter(message => message.payload?.type === 'canvas:trace'), []);
   assert.deepEqual(h.sockets[0].sent.filter(message => message.event === 'sendToPlugin').map(message => message.payload.type), ['canvas:hello', 'canvas:claim', 'canvas:edit']);

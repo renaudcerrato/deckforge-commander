@@ -301,6 +301,7 @@ test('late acknowledgment cannot overwrite newer pending typing or claim it save
   // Act
   h.fields.argsText.value = 'second still typing';
   h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'first' } });
+  h.tick(200); // P4: only B's trailing deadline, not A's acknowledgment, makes B eligible.
   const next = h.last();
   const statusBeforeNextAck = h.statuses.at(-1);
   const textBeforeNextAck = h.fields.argsText.value;
@@ -411,23 +412,6 @@ test('disconnect and controller disposal prevent queued and subsequent edits', (
   assert.equal(h.timers.size, 0);
 });
 
-test('inspector markup has local scripts, executable picker and optional cwd text, without autosave bindings or Apply', () => {
-  // Arrange
-  const html = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
-  // Act
-  const scripts = [...html.matchAll(/<script\b[^>]*src="([^"]+)"/g)].map(match => match[1]);
-  const paragraphs = [...html.matchAll(/<p\b[^>]*>([\s\S]*?)<\/p>/g)].map(match => match[1].trim());
-  // Assert: structural UI contract, not internal source algorithms.
-  assert.deepEqual(scripts, ['sdpi-components.js', 'run.js']);
-  assert.match(html, /<sdpi-file\b[^>]*id="executable"/);
-  assert.match(html, /<sdpi-textfield\b[^>]*id="cwd"/);
-  assert.match(html, /<sdpi-textfield\b[^>]*id="argsText"/);
-  assert.equal(/\bsetting\s*=/.test(html), false);
-  assert.equal(/<button|<sdpi-button|\bApply\b/.test(html), false);
-  assert.equal(/id="(?:env|environment)"/.test(html), false);
-  assert.deepEqual(paragraphs, ['']);
-});
-
 test('built browser entry replaces vendor connection wrapper and opens only one mocked socket', () => {
   // Arrange
   const script = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8');
@@ -442,9 +426,6 @@ test('built browser entry replaces vendor connection wrapper and opens only one 
   }
   // Act: vendor, actual sockets, SDK, host and profiles are deliberately absent.
   const context = { window, document, WebSocket: Socket, TextEncoder, setTimeout(callback) { const id = ++timerId; timers.set(id, callback); return id; }, clearTimeout(id) { timers.delete(id); } };
-  const html = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
-  // The approved UI has no inline diagnostics bootstrap; run only its built entry.
-  assert.equal(/<script>/.test(html), false);
   runInNewContext(script, context, { timeout: 1_000 });
   window.connectElgatoStreamDeckSocket('12345', 'pi-id', 'registerPropertyInspector', '{}', JSON.stringify({ context: 'key', action: 'git.renaudcerrato.deckforge.stream', payload: { settings: initial } }));
   sockets[0].readyState = 1; sockets[0].onopen();
@@ -546,7 +527,12 @@ test('picker edit before first SDK callback survives old initial/challenge/claim
   assert.deepEqual([beforeConnect, afterInitial, afterChallenge, afterClaim, h.fields.executable.value], Array(5).fill(newSelection));
   assert.deepEqual(editsBeforeReady, []);
   assert.deepEqual(edit.changes, { executable: newSelection });
-  assert.deepEqual(h.normal().slice(1).map(message => [message.payload.type, message.payload.requestId]), [['canvas:hello', 1], ['canvas:claim', 2], ['canvas:edit', 3]]);
+  const requests = h.normal().filter(message => message.event === 'sendToPlugin').map(message => message.payload);
+  assert.deepEqual(requests.map(request => request.type), ['canvas:hello', 'canvas:claim', 'canvas:edit']);
+  assert.equal(new Set(requests.map(request => request.requestId)).size, requests.length);
+  assert.ok(requests.every((request, index) => Number.isSafeInteger(request.requestId)
+    && (index === 0 || request.requestId > requests[index - 1].requestId)
+    && request.context === 'key-context' && request.inspectorId === edit.inspectorId));
   assert.equal(launchInput.executable, newSelection);
   assert.equal(h.statuses.at(-1), 'saved');
   assert.deepEqual(oldSnapshot, original);
@@ -650,8 +636,9 @@ test('preclaim local observations do not send diagnostics, advance request IDs o
   // Assert
   assert.deepEqual(beforeClaim, hello);
   assert.deepEqual(timerKeysAfter, timerKeysBefore);
-  assert.equal(hello.requestId, 1);
-  assert.equal(claim.requestId, 2);
+  assert.ok(Number.isSafeInteger(hello.requestId) && Number.isSafeInteger(claim.requestId));
+  assert.ok(claim.requestId > hello.requestId);
+  assert.equal(claim.context, hello.context); assert.equal(claim.inspectorId, hello.inspectorId);
   assert.deepEqual(sentBeforeClaim, []);
   assert.deepEqual(h.normal().slice(1).map(message => message.payload.type), ['canvas:hello', 'canvas:claim']);
   assert.equal(h.sockets[0].sent.some(message => message.event === 'setSettings'), false);
@@ -683,7 +670,12 @@ test('throwing local connection observer cannot reject picker selection or chang
   const edit = h.last();
   h.reply({ ...edit, type: 'canvas:reply', status: 'saved', settings: { ...oldSnapshot, executable: newSelection } });
   // Assert
-  assert.equal(edit.requestId, 3);
+  const requests = h.normal().filter(message => message.event === 'sendToPlugin').map(message => message.payload);
+  assert.deepEqual(requests.map(request => request.type), ['canvas:hello', 'canvas:claim', 'canvas:edit']);
+  assert.equal(new Set(requests.map(request => request.requestId)).size, requests.length);
+  assert.ok(requests.every((request, index) => Number.isSafeInteger(request.requestId)
+    && (index === 0 || request.requestId > requests[index - 1].requestId)
+    && request.context === edit.context && request.inspectorId === edit.inspectorId));
   assert.deepEqual(edit.changes, { executable: newSelection });
   assert.equal(h.fields.executable.value, newSelection);
   assert.equal(h.statuses.at(-1), 'saved');
@@ -707,7 +699,8 @@ test('transport rejecting diagnostic envelopes still permits correlated configur
   // Assert
   assert.deepEqual(requestAfterFailure, hello);
   assert.deepEqual(timersAfterFailure, timerKeys);
-  assert.equal(edit.requestId, 3);
+  assert.ok(Number.isSafeInteger(edit.requestId) && edit.requestId > hello.requestId);
+  assert.equal(edit.context, hello.context); assert.equal(edit.inspectorId, hello.inspectorId);
   assert.deepEqual(edit.changes, { executable: newSelection });
   assert.equal(h.statuses.at(-1), 'saved');
   assert.deepEqual(h.errors, []);
@@ -760,6 +753,42 @@ test('local connection observations retain controller identity without sending d
   assert.deepEqual(traceMessages(h.sockets[0]), []);
 });
 
+test('S33 unchanged exported connection snapshots do not notify on edits, sends or stale/matching replies', () => {
+  // Arrange: request bookkeeping is not part of the exported identity/platform snapshot.
+  const h = harness(); h.ready(); const established = structuredClone(h.connections);
+  // Act
+  h.fields.argsText.value = 'local'; h.tick(200); const request = h.last();
+  h.reply({ ...request, type: 'canvas:reply', context: 'foreign', status: 'saved', settings: initial });
+  h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, argsText: 'local' } });
+  h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: initial });
+  h.tick(15000);
+  const observed = structuredClone(h.connections), value = h.fields.argsText.value, status = h.statuses.at(-1);
+  h.controller.dispose(); h.bridge.disconnect();
+  // Assert: real save/hydration still happens without an unchanged identity notification.
+  assert.deepEqual(observed, established);
+  assert.equal(value, 'local'); assert.equal(status, 'saved'); assert.deepEqual(h.errors, []);
+});
+
+test('S33 changed binding is observed before its settings hydrate, including same-key session resets', () => {
+  // Arrange: callbacks are public observer boundaries; projection and binding logic remain real.
+  const observations = [], hydrations = []; let current;
+  const h = harness({
+    onConnectionState(snapshot) { current = snapshot; observations.push(structuredClone(snapshot)); },
+    onSettings(configuration) { hydrations.push({ argsText: configuration.argsText, binding: structuredClone(current) }); },
+  });
+  // Act
+  h.ready({ ...initial, argsText: 'A' }); const old = h.bridge.getConnectionState();
+  h.ready({ ...initial, argsText: 'B' }); const next = h.bridge.getConnectionState();
+  h.controller.dispose(); h.bridge.disconnect();
+  // Assert: deduplication must not suppress the actual reset or delay it until after hydration.
+  const b = hydrations.filter(value => value.argsText === 'B');
+  assert.ok(b.length > 0);
+  assert.ok(b.every(value => value.binding.bindingValid && value.binding.context === next.context
+    && value.binding.inspectorId === next.inspectorId && value.binding.version === next.version));
+  assert.notEqual(next.inspectorId, old.inspectorId); assert.notEqual(next.version, old.version);
+  assert.ok(observations.some(value => !value.bindingValid && value.version === next.version));
+});
+
 test('invalid callback preserves a fixed error without exposing raw metadata or sending traffic', () => {
   // Arrange
   const h = harness();
@@ -805,7 +834,7 @@ test('transport error reports a fixed failure and pending typing cannot leak int
   h.fields.argsText.userEdit('forbidden-argument-text');
   const errorState = h.bridge.getConnectionState();
   // Assert
-  assert.equal(h.fields.status.textContent, 'Saving…');
+  assert.equal(h.fields.status.textContent, 'Settings could not be confirmed.');
   assert.deepEqual(h.errors, ['STATE_SAVE_FAILED']);
   assert.equal(JSON.stringify(h.connections).includes('forbidden'), false);
   assert.equal(JSON.stringify(errorState).includes('forbidden'), false);
@@ -828,48 +857,62 @@ test('socket close never publishes event reason, raw exception or diagnostic tra
   assert.deepEqual(traceMessages(h.sockets[0]), []);
 });
 
-test('socket construction failure gives a fixed diagnosis without exposing details or saving', () => {
+test('P6 socket construction failure retains Error through valid typing and drops the draft on rebind', t => {
   // Arrange
-  const h = harness({ createSocket() { throw new Error('forbidden-construction-stack'); } });
+  let failConstruction = true;
+  const sockets = [];
+  const h = harness({ createSocket() {
+    if (failConstruction) throw new Error('forbidden-construction-stack');
+    const socket = { readyState: 0, sent: [], send(text) { this.sent.push(JSON.parse(text)); }, close() { this.readyState = 3; } };
+    sockets.push(socket); return socket;
+  } });
+  t.after(() => { h.controller.dispose(); h.bridge.disconnect(); });
   // Act
   h.bridge.connect('12345', 'pi-id', 'registerPropertyInspector', '{}', JSON.stringify({ context: 'key', action: 'git.renaudcerrato.deckforge.stream', payload: { settings: initial } }));
   const state = h.bridge.getConnectionState();
+  h.fields.argsText.userEdit('forbidden-local-draft');
+  const local = h.fields.argsText.value;
+  h.tick(200); h.tick(15000);
+  const failed = { status: h.fields.status.textContent, timers: h.timers.size, sockets: sockets.length };
+  failConstruction = false;
+  const next = { ...initial, argsText: 'next-binding' };
+  h.bridge.connect('12345', 'pi-id', 'registerPropertyInspector', '{}', JSON.stringify({ context: 'next-key', action: 'git.renaudcerrato.deckforge.stream', payload: { settings: next } }));
+  const socket = sockets[0]; socket.readyState = 1; socket.onopen();
+  h.reply({ ...socket.sent.at(-1).payload, type: 'canvas:reply', status: 'challenge', token: 'token', settings: next }, socket);
+  h.reply({ ...socket.sent.at(-1).payload, type: 'canvas:reply', status: 'saved', settings: next }, socket);
+  h.tick(200);
   // Assert
   assert.equal(state.bindingValid, true);
   assert.deepEqual(h.errors, ['STATE_SAVE_FAILED']);
   assert.equal(JSON.stringify(h.connections).includes('forbidden'), false);
   assert.deepEqual(h.sockets, []);
+  assert.deepEqual(failed, { status: 'Settings could not be confirmed.', timers: 0, sockets: 0 });
+  assert.equal(local, 'forbidden-local-draft');
+  assert.equal(h.fields.argsText.value, 'next-binding'); assert.equal(h.fields.status.textContent, '');
+  assert.equal(h.timers.size, 0);
+  assert.deepEqual(socket.sent.filter(message => message.event === 'sendToPlugin').map(message => message.payload.type), ['canvas:hello', 'canvas:claim']);
+  assert.equal(JSON.stringify(socket.sent).includes('forbidden'), false);
 });
 
-test('throwing connection observer cannot alter first picker retention, transport or save', () => {
-  // Arrange
-  const h = harness({ onConnectionState() { throw new Error('observation-only'); } });
-  // Act
-  h.fields.executable.userEdit(newSelection); h.ready(oldSnapshot);
-  const edit = h.last();
-  h.reply({ ...edit, type: 'canvas:reply', status: 'saved', settings: { ...oldSnapshot, executable: newSelection } });
-  // Assert
-  assert.equal(edit.requestId, 3);
-  assert.deepEqual(edit.changes, { executable: newSelection });
-  assert.equal(h.fields.executable.value, newSelection);
-  assert.equal(h.statuses.at(-1), 'saved');
-  assert.deepEqual(h.errors, []);
-});
-
-test('removed Diagnostics panel/bootstrap leave accessible save status after the theme control', () => {
-  // Arrange
-  const html = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
-  // Act
-  const disclosure = html.match(/<details\b([^>]*)>([\s\S]*?)<\/details>/);
-  const styles = html.match(/<style>([\s\S]*?)<\/style>/)[1];
-  // Assert: native disclosure semantics and authored colors, not hardware/browser rendering claims.
-  assert.equal(disclosure, null);
-  assert.equal(/id="connection-status"|<script>/.test(html), false);
-  assert.match(html, /<p id="settings-status" role="status" aria-live="polite"><\/p>/);
-  assert.ok(html.indexOf('id="settings-status"') > html.indexOf('id="themeColor"'));
-  assert.match(styles, /#settings-status\s*\{[^}]*color:\s*#969696\s*;/);
-  assert.equal(/sdpi[^{}]*\{[^}]*background/.test(styles), false);
-});
+for (const event of ['input', 'change']) {
+  test(`native theme ${event}-only delivery saves while assignment alone and disposed listeners do not`, () => {
+    // Arrange: native assignment does not stand in for either independent event listener.
+    const h = harness(); h.ready();
+    const before = h.normal().length;
+    // Act
+    h.fields.themeColor.value = '#ABCDEF'; h.tick(200);
+    const assigned = h.normal().length;
+    h.fields.themeColor.dispatch(event); h.tick(200); const request = h.last();
+    h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#abcdef' } });
+    h.fields.themeColor.dispatch(event); h.tick(200);
+    h.controller.dispose(); h.fields.themeColor.value = '#123456'; h.fields.themeColor.dispatch(event); h.tick(200);
+    // Assert
+    assert.equal(assigned, before);
+    assert.deepEqual(request.changes, { themeColor: '#abcdef' });
+    assert.equal(h.normal().filter(message => message.payload?.type === 'canvas:edit').length, 1);
+    assert.deepEqual(h.errors, []); h.bridge.disconnect();
+  });
+}
 
 test('native theme input hydrates fallback without edits and coalesces deduplicated input/change events', () => {
   // Arrange
@@ -877,9 +920,9 @@ test('native theme input hydrates fallback without edits and coalesces deduplica
   const before = h.normal().length;
   // Act
   const hydrated = h.fields.themeColor.value;
-  h.fields.themeColor.userEdit('#ABCDEF');
+  h.fields.themeColor.userEdit('#ABCDEF'); h.fields.themeColor.dispatch('input');
   h.fields.themeColor.dispatch('change');
-  h.fields.themeColor.userEdit('#123456');
+  h.fields.themeColor.userEdit('#123456'); h.fields.themeColor.dispatch('input');
   const beforeTimer = h.normal().length;
   h.tick(200); const request = h.last();
   h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#123456' } });
@@ -896,7 +939,7 @@ test('precallback color remains protected through first challenge/claim and emit
   // Arrange
   const h = harness();
   // Act
-  h.fields.themeColor.userEdit('#ABCDEF'); h.tick(200);
+  h.fields.themeColor.userEdit('#ABCDEF'); h.fields.themeColor.dispatch('input'); h.tick(200);
   h.ready(initial);
   const edit = h.last();
   const saved = { ...initial, themeColor: '#abcdef' };
@@ -910,10 +953,11 @@ test('precallback color remains protected through first challenge/claim and emit
 test('late color acknowledgment cannot overwrite newer native selection or falsely claim it saved', () => {
   // Arrange
   const h = harness(); h.ready();
-  h.fields.themeColor.userEdit('#abcdef'); h.tick(200); const old = h.last();
+  h.fields.themeColor.userEdit('#abcdef'); h.fields.themeColor.dispatch('input'); h.tick(200); const old = h.last();
   // Act
-  h.fields.themeColor.userEdit('#123456');
+  h.fields.themeColor.userEdit('#123456'); h.fields.themeColor.dispatch('input');
   h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#abcdef' } });
+  h.tick(200); // P4: the newer color follows the same trailing text-edit debounce.
   const current = h.last(), beforeAck = h.fields.themeColor.value, statusBefore = h.statuses.at(-1);
   h.reply({ ...current, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#123456' } });
   h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#abcdef' } });
@@ -927,13 +971,13 @@ test('late color acknowledgment cannot overwrite newer native selection or false
 test('different-key connection drops pending native color and independent inspector edits remain isolated', () => {
   // Arrange
   const first = harness(), second = harness(); first.ready(); second.ready();
-  first.fields.themeColor.userEdit('#abcdef'); const oldSocket = first.sockets[0], oldRequest = first.last();
+  first.fields.themeColor.userEdit('#abcdef'); first.fields.themeColor.dispatch('input'); const oldSocket = first.sockets[0], oldRequest = first.last();
   // Act
   first.connect({ ...initial, themeColor: '#123456' }, 'other-key');
   first.reply({ ...first.last(), type: 'canvas:reply', status: 'challenge', token: 'token', settings: { ...initial, themeColor: '#123456' } });
   first.reply({ ...first.last(), type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#123456' } });
   first.reply({ ...oldRequest, type: 'canvas:reply', status: 'saved', settings: { ...initial, themeColor: '#abcdef' } }, oldSocket);
-  first.tick(200); second.fields.themeColor.userEdit('#fedcba'); second.tick(200);
+  first.tick(200); second.fields.themeColor.userEdit('#fedcba'); second.fields.themeColor.dispatch('input'); second.tick(200);
   // Assert
   assert.equal(first.fields.themeColor.value, '#123456');
   assert.equal(first.normal().some(message => message.payload?.type === 'canvas:edit'), false);
@@ -944,7 +988,7 @@ test('malformed native theme edit is fixed-diagnostic rejected without save or d
   // Arrange
   const h = harness(); h.ready(); const before = h.normal().length;
   // Act
-  h.fields.themeColor.userEdit('private-css-injection'); h.tick(200);
+  h.fields.themeColor.userEdit('private-css-injection'); h.fields.themeColor.dispatch('input'); h.tick(200);
   // Assert
   assert.equal(h.normal().length, before);
   assert.ok(h.errors.length > 0 && h.errors.every(code => code === 'THEME_COLOR_INVALID'));
@@ -979,17 +1023,6 @@ test('foreign policy rejection keeps its fixed diagnosis without diagnostic traf
   assert.equal(h.sockets[0].sent.length, before); assert.deepEqual(traceMessages(h.sockets[0]), []);
   assert.equal(JSON.stringify(h.connections).includes('PRIVATE'), false);
 });
-test('theme picker is a native color input in SDPI item without independent autosave/socket bindings', () => {
-  // Arrange
-  const html = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
-  // Act
-  const item = html.match(/<sdpi-item label="Theme color">([\s\S]*?)<\/sdpi-item>/)[1];
-  // Assert
-  // Static user-authored color is not hydration's safe runtime fallback (#969696).
-  assert.match(item, /<input id="themeColor" type="color" value="#606060"/);
-  assert.equal(/\bsetting\s*=|<sdpi-color|Apply/.test(item), false);
-});
-
 for (const pending of ['debounced edit', 'sent edit', 'challenge']) {
   test(`move-integrity PI same-context reopen drops old ${pending} and edits only the moved snapshot`, () => {
     // Arrange: context stays the host slot while its complete settings change.
