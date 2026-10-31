@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { parseArguments, serializeArguments } from "./core/arguments.mjs";
 import { executionPlatform, isAbsoluteExecutionPath } from "./core/execution-paths.mjs";
+import { validateTitleEdit } from "./core/settings.mjs";
 
 export type ScriptDraft = {
 	source: string;
@@ -12,6 +13,7 @@ export type ScriptDraft = {
 	interpreter: string;
 	args: string;
 	cwd: string;
+	title?: string;
 };
 
 function invalidImport(): never {
@@ -22,7 +24,7 @@ function invalidImport(): never {
 export function parseScriptDraft(input: unknown): ScriptDraft {
 	if (!input || typeof input !== "object" || Array.isArray(input)) return invalidImport();
 	const value = input as Record<string, unknown>;
-	if (Object.keys(value).some(key => !["source", "extension", "interpreter", "args", "cwd"].includes(key))) return invalidImport();
+	if (Object.keys(value).some(key => !["source", "extension", "interpreter", "args", "cwd", "title"].includes(key))) return invalidImport();
 	if (typeof value.source !== "string" || !value.source.trim() || value.source.includes("\0")
 		|| Buffer.byteLength(value.source, "utf8") > 131_072) return invalidImport();
 	if (typeof value.extension !== "string" || !/^[a-z0-9]{1,12}$/.test(value.extension)) return invalidImport();
@@ -39,11 +41,16 @@ export function parseScriptDraft(input: unknown): ScriptDraft {
 		|| arg.length > 8192 || arg.includes("\0"))) return invalidImport();
 	if (argv.filter(arg => arg === "{{script}}").length !== (interpreter ? 1 : 0)
 		|| argv.some(arg => arg !== "{{script}}" && arg.includes("{{script}}"))) return invalidImport();
-	return { source: value.source, extension: value.extension, interpreter, args, cwd };
+	const draft: ScriptDraft = { source: value.source, extension: value.extension, interpreter, args, cwd };
+	if (Object.hasOwn(value, "title")) {
+		validateTitleEdit(value.title);
+		draft.title = value.title as string;
+	}
+	return draft;
 }
 
 /** Called only for a complete token-targeted callback. Names and storage locations are plugin-owned. */
-export async function writeImportedScript(draft: ScriptDraft): Promise<{ executable: string; argsText: string; cwd: string }> {
+export async function writeImportedScript(draft: ScriptDraft): Promise<{ executable: string; argsText: string; cwd: string; title?: string }> {
 	if (process.platform !== "darwin" && process.platform !== "win32") return invalidImport();
 	if (process.platform === "win32" && !draft.interpreter) return invalidImport();
 	const base = process.platform === "win32" ? process.env.LOCALAPPDATA
@@ -66,5 +73,6 @@ export async function writeImportedScript(draft: ScriptDraft): Promise<{ executa
 		executable: draft.interpreter || filename,
 		argsText: serializeArguments(parseArguments(draft.args, executionPlatform()).map(arg => arg === "{{script}}" ? filename : arg), executionPlatform()),
 		cwd: draft.cwd,
+		...(Object.hasOwn(draft, "title") ? { title: draft.title } : {}),
 	};
 }

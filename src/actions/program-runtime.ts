@@ -107,7 +107,7 @@ const owners = new Map<string, SessionRecord>();
 export async function receiveScriptImport(path: string, query: URLSearchParams, hrefLength: number): Promise<void> {
 	if (path !== "/import" || !Number.isSafeInteger(hrefLength) || hrefLength < 0
 		|| "streamdeck://plugins/message/git.renaudcerrato.deckforge".length + hrefLength >= 2000
-		|| [...query.keys()].some(key => !["token", "source", "extension", "interpreter", "args", "cwd"].includes(key)
+		|| [...query.keys()].some(key => !["token", "source", "extension", "interpreter", "args", "cwd", "title"].includes(key)
 			|| query.getAll(key).length !== 1)
 		|| query.getAll("token").length !== 1 || !query.has("source") || !query.has("extension")) return;
 	const token = query.get("token");
