@@ -69,6 +69,15 @@ const inspectorConfig = {
 		nodeResolve({ browser: true, preferBuiltins: false }),
 		commonjs(),
 		!isWatching && terser(),
+		{
+			name: "emit-inspector-html",
+			async generateBundle() {
+				const template = url.fileURLToPath(new URL("./src/inspector/run.html", import.meta.url));
+				this.addWatchFile(template);
+				const source = await readFile(template);
+				this.emitFile({ type: "asset", fileName: "run.html", source });
+			}
+		},
 	],
 };
 

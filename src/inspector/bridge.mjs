@@ -8,10 +8,31 @@ const FIELDS = new Set(['executable', 'argsText', 'cwd', 'themeColor', 'title'])
 export const RUN_ACTION_UUID = 'git.renaudcerrato.deckforge.stream';
 export const TIMER_ACTION_UUID = 'git.renaudcerrato.deckforge.loop';
 export const ONCE_ACTION_UUID = 'git.renaudcerrato.deckforge.run';
+// Device types: https://docs.elgato.com/streamdeck/sdk/guides/devices#device-types
+const DEVICE_MODELS = new Map([
+  [0, 'Stream Deck'],
+  [1, 'Stream Deck Mini'],
+  [2, 'Stream Deck XL'],
+  [7, 'Stream Deck +'],
+  [9, 'Stream Deck Neo'],
+  [10, 'Stream Deck Studio'],
+  [11, 'Virtual Stream Deck'],
+  [13, 'Stream Deck + XL'],
+]);
+const KEY_IMAGE_PIXELS = new Map([
+  [0, [72, 72]], // Stream Deck / MK.2: https://docs.elgato.com/streamdeck/hid/stream-deck-classic
+  [1, [80, 80]], // https://docs.elgato.com/streamdeck/hid/mini
+  [2, [96, 96]], // https://docs.elgato.com/streamdeck/hid/stream-deck-xl
+  [7, [120, 120]], // https://docs.elgato.com/streamdeck/hid/stream-deck-plus
+  [9, [96, 96]], // https://docs.elgato.com/streamdeck/hid/stream-deck-neo
+  [10, [144, 112]], // Stream Deck Studio
+  [13, [112, 112]], // https://docs.elgato.com/streamdeck/hid/stream-deck-plus-xl
+]);
 const SAFE_REASONS = new Set([
   'STATE_SAVE_FAILED', 'INVALID_SETTINGS', 'INVALID_EXECUTABLE', 'INVALID_CWD',
   'ARGS_TEXT_INVALID', 'ARGS_JSON_INVALID', 'ARGS_NOT_ARRAY', 'INVALID_ARGUMENT',
   'THEME_COLOR_INVALID', 'INTERVAL_INVALID', 'ACTION_ON_PRESS_INVALID', 'TITLE_INVALID',
+  'SCRIPT_IMPORT_FAILED',
 ]);
 // Temporary, value-free diagnostics for the inspector save boundary.
 export const DIAGNOSTIC_STAGES = new Set([
@@ -42,6 +63,10 @@ export function createInspectorBridge({
   let context;
   let action;
   let platform = 'posix';
+  let os;
+  let deviceModel;
+  let coordinates;
+  let imageSize;
   let transportContext;
   let open = false;
   let ready = false;
@@ -60,6 +85,10 @@ export function createInspectorBridge({
     return {
       bindingValid, platform, version: connectionVersion, inspectorId: connectionText(inspectorId),
       actionUuid: connectionText(action), context: connectionText(context),
+      ...(os ? { os } : {}),
+      ...(bindingValid && deviceModel ? { deviceModel } : {}),
+      ...(bindingValid && coordinates ? { coordinates: { ...coordinates } } : {}),
+      ...(bindingValid && imageSize ? { imageSize: { ...imageSize } } : {}),
     };
   }
 
@@ -110,7 +139,8 @@ export function createInspectorBridge({
     if (!open) return;
     if (replyTimer !== undefined) clearTimer(replyTimer);
     const id = ++requestId;
-    latestRequest = { id, type, active: true, versions: new Map(versions), fields: Object.keys(changes ?? {}) };
+    latestRequest = { id, type, active: true, versions: new Map(versions),
+      fields: type === 'canvas:script' ? [] : Object.keys(changes ?? {}) };
     const version = connectionVersion;
     replyTimer = setTimer(() => {
       replyTimer = undefined;
@@ -227,6 +257,15 @@ export function createInspectorBridge({
   function receive(message) {
     if (message?.event !== 'sendToPropertyInspector') return;
     const payload = message.payload;
+    if (payload?.type === 'canvas:script-result') {
+      if (ready && payload.context === context && payload.inspectorId === inspectorId
+        && payload.requestId === latestRequest?.id && !latestRequest.active && !pending && protectedFields().size === 0) {
+        if (payload.status === 'saved') {
+          if (hydrate(payload.settings)) onStatus('imported');
+        } else if (payload.status === 'error') failure('SCRIPT_IMPORT_FAILED', 'PLUGIN_REPLY');
+      }
+      return;
+    }
     if (!payload || payload.type !== 'canvas:reply' || payload.context !== context
       || payload.inspectorId !== inspectorId || payload.requestId !== latestRequest?.id || !latestRequest.active) {
       observeConnection();
@@ -252,7 +291,7 @@ export function createInspectorBridge({
       failure(payload.status === 'error' ? payload.diagnosticCode : 'STATE_SAVE_FAILED', stage);
       return;
     }
-    if (request.type !== 'canvas:claim' && request.type !== 'canvas:edit') { observeConnection(); failure('STATE_SAVE_FAILED', 'PLUGIN_REPLY'); return; }
+    if (!['canvas:claim', 'canvas:edit', 'canvas:script'].includes(request.type)) { observeConnection(); failure('STATE_SAVE_FAILED', 'PLUGIN_REPLY'); return; }
     let settings;
     try { settings = copyRunSettings(payload.settings); } catch { observeConnection(); failure('STATE_SAVE_FAILED', 'INSPECTOR_HYDRATION'); return; }
     for (const key of request.fields) {
@@ -278,6 +317,7 @@ export function createInspectorBridge({
     ready = false;
     bindingValid = false;
     platform = 'posix';
+    os = deviceModel = coordinates = imageSize = undefined;
     clearTimers();
     const previous = socket;
     socket = undefined;
@@ -287,13 +327,16 @@ export function createInspectorBridge({
   }
 
   function connect(port, propertyInspectorUUID, registerEvent, _info, actionInfoText) {
-    bindingValid = false;
-    observeConnection();
     disconnect();
     // Host registration metadata is not a setting or a remembered inspector binding.
     // Older callbacks and malformed/unknown metadata retain the POSIX default.
+    let registration;
     try {
-      if (JSON.parse(_info)?.application?.platform === 'windows') platform = 'win32';
+      registration = JSON.parse(_info);
+      if (registration?.application?.platform === 'windows') {
+        platform = 'win32';
+        os = 'Windows';
+      } else if (registration?.application?.platform === 'mac') os = 'macOS';
     } catch { /* Registration info was historically optional; do not invalidate identity. */ }
     inspectorId = connectionCount++ === 0 ? inspectorIdPrefix : `${inspectorIdPrefix}.${connectionCount}`;
     if (hasBoundContext) {
@@ -319,6 +362,18 @@ export function createInspectorBridge({
       action = info.action;
       bindingValid = info.context.length > 0
         && (action === RUN_ACTION_UUID || action === TIMER_ACTION_UUID || action === ONCE_ACTION_UUID);
+      if (bindingValid) {
+        const position = info.payload?.coordinates;
+        if (Number.isSafeInteger(position?.column) && position.column >= 0
+          && Number.isSafeInteger(position?.row) && position.row >= 0) {
+          coordinates = { column: position.column, row: position.row };
+        }
+        const device = Array.isArray(registration?.devices)
+          ? registration.devices.find(device => typeof info.device === 'string' && device?.id === info.device) : undefined;
+        deviceModel = DEVICE_MODELS.get(device?.type);
+        const pixels = KEY_IMAGE_PIXELS.get(device?.type);
+        if (pixels) imageSize = { width: pixels[0], height: pixels[1] };
+      }
       transportContext = propertyInspectorUUID;
       observeConnection();
       if (!hydrate(info.payload?.settings ?? {})) {
@@ -358,5 +413,20 @@ export function createInspectorBridge({
     }
   }
 
-  return { connect, edit, flush, disconnect, hydrate, getConnectionState };
+  function beginScriptImport(token) {
+    if (!open || !ready || pending || protectedFields().size > 0 || latestRequest?.active) return false;
+    sendRequest('canvas:script', { token });
+    return true;
+  }
+
+  function openUrl(url) {
+    // Only the fixed project link and ChatGPT prompt integration may open externally.
+    if (!open || typeof url !== 'string' || url.length > 16000
+      || (url !== 'https://github.com/renaudcerrato/deckforge-commander'
+        && !url.startsWith('https://chatgpt.com/?q='))) return false;
+    try { socket.send(JSON.stringify({ event: 'openUrl', payload: { url } })); return true; }
+    catch { return false; }
+  }
+
+  return { connect, edit, flush, disconnect, hydrate, getConnectionState, beginScriptImport, openUrl };
 }

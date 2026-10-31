@@ -15,7 +15,6 @@ tasks:
       - Taskfile.yml
       - scripts/bootstrap-toolchain.mjs
       - git.renaudcerrato.deckforge.sdPlugin/manifest.json
-      - git.renaudcerrato.deckforge.sdPlugin/ui/run.html
     cmds:
       - task: build
       - cmd: npm run restart

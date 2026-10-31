@@ -1,4 +1,4 @@
-import { createInspectorBridge, TIMER_ACTION_UUID } from './bridge.mjs';
+import { createInspectorBridge, RUN_ACTION_UUID, TIMER_ACTION_UUID, ONCE_ACTION_UUID } from './bridge.mjs';
 import { DEFAULT_THEME_COLOR, normalizeThemeColor, resolveThemeColor } from '../core/theme.mjs';
 import { MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS } from '../core/timer-settings.mjs';
 import { getReadyTitle } from '../core/key-layout.mjs';
@@ -16,9 +16,72 @@ const REASONS = new Map([
   ['INTERVAL_INVALID', 'Enter whole seconds from 1 to 86400.'],
   ['ACTION_ON_PRESS_INVALID', 'Choose start / refresh or start / stop.'],
   ['TITLE_INVALID', 'Use a title of at most 8192 characters without NUL.'],
+  ['SCRIPT_IMPORT_FAILED', 'Script import could not be confirmed. Ask ChatGPT again or save the script locally.'],
 ]);
 
 const INTERVAL_PRESETS = new Set(['1', '10', '30', '60', '600', '1800', '3600']);
+const ACTION_DESCRIPTIONS = new Map([
+  [RUN_ACTION_UUID, 'Stream — toggle a live program; stops when it exits.'],
+  [TIMER_ACTION_UUID, 'Loop — repeat after completion and the configured delay.'],
+  [ONCE_ACTION_UUID, 'Run — execute once and retain successful output.'],
+]);
+
+function scriptPrompt(token, binding) {
+  const action = binding.bindingValid ? ACTION_DESCRIPTIONS.get(binding.actionUuid) : undefined;
+  const setup = [];
+  if (binding.os) setup.push(`- OS: ${binding.os}`);
+  if (binding.deviceModel) setup.push(`- Device: ${binding.deviceModel}`);
+  if (action) setup.push(`- Action: ${action}`);
+  if (binding.coordinates) setup.push(`- Key position: column ${binding.coordinates.column}, row ${binding.coordinates.row} (zero-based).`);
+  const size = binding.imageSize;
+  const returnUrl = token ? `streamdeck://plugins/message/git.renaudcerrato.deckforge/import?token=${encodeURIComponent(token)}` : undefined;
+  return `Help me create a script for a Stream Deck key using DeckForge Commander.
+I’m not a developer: keep questions simple and setup instructions practical.
+${setup.length ? `
+## My setup
+${setup.join('\n')}
+` : ''}
+## Display
+- Supports text, cards, progress indicators, and images.
+- Text, cards, and progress use a 144 × 144 logical canvas.
+${size ? `- Physical key image: ${size.width} × ${size.height} pixels.\n` : ''}- Keep content readable on a small key.
+
+## Start here
+Ask what I want the key to display or do.
+Choose a suitable scripting language and confirm its runtime is available.
+
+## Protocol
+Read:
+https://github.com/renaudcerrato/deckforge-commander/blob/main/README.md#protocol
+If web retrieval fails, try another available download method (such as curl), using the environment’s supported approval mechanism if network access is blocked, before asking me to paste the protocol. Do not guess the protocol.
+
+## Deliver
+${returnUrl ? `Provide the complete script and import URL.
+Return URL: ${returnUrl}
+Append individually URL-encoded parameters:
+- source: complete script
+- extension: file extension without the dot
+- interpreter: absolute interpreter path, if required
+- args: argument text, including {{script}} for the saved script path
+- cwd: optional absolute working directory
+Provide the complete import URL on a single line inside a code block, with instructions to paste it into my browser’s address bar. This automatically saves a unique script file and configures the original key, even if its inspector is closed; it never runs the script. Ask me to review the source before using the URL, since scripts run with my permissions and are not sandboxed. Keep the complete URL under 2,000 characters. If it is too long, omit the URL and explain how to save the complete script to a local file and configure the key’s normal Executable, Arguments, and optional Working directory fields.` : 'A return link is not available. Provide the complete script and explain how to save it to a local file and configure the key’s normal Executable, Arguments, and optional Working directory fields; do not invent a return link.'}`;
+}
+
+function installChatGptLink(document, bridge) {
+  document.getElementById('ask-chatgpt').addEventListener('click', event => {
+    event.preventDefault();
+    let token;
+    try {
+      token = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+    } catch { token = undefined; }
+    const registered = token && bridge.beginScriptImport(token);
+    const prompt = scriptPrompt(registered ? token : undefined, bridge.getConnectionState());
+    // Never wait for the plugin reply before opening ChatGPT.
+    const opening = bridge.openUrl(`https://chatgpt.com/?q=${encodeURIComponent(prompt)}`);
+    if (!opening) document.getElementById('settings-status').textContent = 'The browser request could not be sent. Try the ChatGPT link again.';
+    else if (!registered) document.getElementById('settings-status').textContent = 'ChatGPT requested. Automatic import is unavailable; use the local-file setup instructions.';
+  });
+}
 
 function parseIntervalText(value) {
   if (typeof value !== 'string' || value.length === 0 || /[^0-9]/.test(value)) return undefined;
@@ -114,8 +177,8 @@ export function createInspectorController({
   }
 
   function showStatus(value) {
-    if (value === 'saved') bridgeError = undefined;
-    if (value === 'saving' || value === 'saved' || value === 'error') bridgeStatus = value;
+    if (value === 'saved' || value === 'imported') bridgeError = undefined;
+    if (value === 'saving' || value === 'saved' || value === 'error' || value === 'imported') bridgeStatus = value;
     renderStatus();
   }
 
@@ -124,7 +187,7 @@ export function createInspectorController({
     status.textContent = invalidIntervalText ? REASONS.get('INTERVAL_INVALID')
       : invalidPressPolicy ? REASONS.get('ACTION_ON_PRESS_INVALID')
         : bridgeStatus === 'error' ? REASONS.get(bridgeError) ?? REASONS.get('STATE_SAVE_FAILED')
-          : bridgeStatus === 'saving' ? 'Saving…' : '';
+          : bridgeStatus === 'saving' ? 'Saving…' : bridgeStatus === 'imported' ? 'Script imported. Press the key to run.' : '';
   }
 
   function hydrateInterval(configuration, protectedFields) {
@@ -261,7 +324,7 @@ function install(window, document) {
     onError(code) { pendingError = code; controller?.showError(code); },
     onStatus(value) {
       pendingStatus = value;
-      if (value === 'saved') pendingError = undefined;
+      if (value === 'saved' || value === 'imported') pendingError = undefined;
       controller?.showStatus(value);
     },
   });
@@ -270,6 +333,11 @@ function install(window, document) {
   // Pinned SDPI4 controls have no setting bindings. Replace, rather than chain, its socket wrapper.
   window.connectElgatoStreamDeckSocket = bridge.connect;
   const ready = () => {
+    document.getElementById('github-project').addEventListener('click', event => {
+      event.preventDefault();
+      bridge.openUrl('https://github.com/renaudcerrato/deckforge-commander');
+    });
+    installChatGptLink(document, bridge);
     controller = createInspectorController({
       executable: document.getElementById('executable'),
       argsText: document.getElementById('argsText'),

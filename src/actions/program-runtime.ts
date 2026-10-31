@@ -22,6 +22,8 @@ import { copySettings, equalJson as sameSettingsJson } from "../core/settings-au
 import { settingsDiagnosticCode } from "../core/settings.mjs";
 import type { ExecutionSettings } from "../core/settings.mjs";
 import { DEFAULT_THEME_COLOR, settingsThemeColor } from "../core/theme.mjs";
+import { parseScriptDraft, writeImportedScript } from "../script-import";
+import type { ScriptDraft } from "../script-import";
 
 /** Complete-settings authority operations, without any action-specific saved intent. */
 export interface ProgramState {
@@ -92,6 +94,8 @@ export type SessionRecord<State extends ProgramState = ProgramState, Session ext
 	cleanupBlocked: boolean;
 	ready: Promise<void>;
 	ownedRun?: ProcessRun;
+	scriptImport?: { token: string; revision: number; busy: boolean };
+	importScript(draft: ScriptDraft): Promise<void>;
 	retire(): Promise<void>;
 };
 
@@ -99,12 +103,31 @@ export type SessionRecord<State extends ProgramState = ProgramState, Session ext
 // Keep only their current generation; SDK wrapper identity is not an incarnation.
 const owners = new Map<string, SessionRecord>();
 
+/** Complete callbacks configure only the original live generation, without any PI dependency. */
+export async function receiveScriptImport(path: string, query: URLSearchParams, hrefLength: number): Promise<void> {
+	if (path !== "/import" || !Number.isSafeInteger(hrefLength) || hrefLength < 0
+		|| "streamdeck://plugins/message/git.renaudcerrato.deckforge".length + hrefLength >= 2000
+		|| [...query.keys()].some(key => !["token", "source", "extension", "interpreter", "args", "cwd"].includes(key)
+			|| query.getAll(key).length !== 1)
+		|| query.getAll("token").length !== 1 || !query.has("source") || !query.has("extension")) return;
+	const token = query.get("token");
+	for (const record of owners.values()) {
+		const pending = record.scriptImport;
+		if (!record.active || !pending || pending.token !== token || pending.busy) continue;
+		try {
+			const draft = parseScriptDraft(Object.fromEntries([...query].filter(([key]) => key !== "token")));
+			await record.importScript(draft);
+		} catch { /* Invalid callbacks never create files or expose payload errors. */ }
+		return;
+	}
+}
+
 function saveFailed(): Error {
 	return Object.assign(new Error("Settings save failed."), { diagnosticCode: "STATE_SAVE_FAILED" });
 }
 
 type InspectorRequest = {
-	type: "canvas:hello" | "canvas:claim" | "canvas:edit";
+	type: "canvas:hello" | "canvas:claim" | "canvas:edit" | "canvas:script";
 	context: string;
 	inspectorId: string;
 	requestId: number;
@@ -160,7 +183,7 @@ function inspectorRequest(payload: unknown, context: string): InspectorRequest |
 	const value = payload as InspectorRequest;
 	if (value.context !== context || typeof value.inspectorId !== "string" || value.inspectorId.length > 128
 		|| value.inspectorId.length === 0 || !Number.isSafeInteger(value.requestId) || value.requestId < 1) return undefined;
-	if (value.type !== "canvas:hello" && value.type !== "canvas:claim" && value.type !== "canvas:edit") return undefined;
+	if (!["canvas:hello", "canvas:claim", "canvas:edit", "canvas:script"].includes(value.type)) return undefined;
 	const keys = value.type === "canvas:hello"
 		? ["type", "context", "inspectorId", "requestId"]
 		: value.type === "canvas:claim"
@@ -290,7 +313,7 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 		const record = this.getSession(ev.action.id, ev.action);
 		// A claimed current owner may save while hidden; hiding grants no new PI claim.
 		// Edits still pass the generation's inspector/request checks below.
-		if (!record?.active || (record.hidden && request.type !== "canvas:edit")) return;
+		if (!record?.active || (record.hidden && request.type !== "canvas:edit" && request.type !== "canvas:script")) return;
 		if (request.type === "canvas:hello") {
 			if (record.retiredInspectors.has(request.inspectorId)) return;
 			if (record.inspector?.id === request.inspectorId && request.requestId <= record.inspector.requestId) return;
@@ -343,6 +366,15 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 		let diagnosticStage = "PLUGIN_EDIT_BEGIN";
 		try {
 			if (record.persistenceUncertain) throw saveFailed();
+			if (request.type === "canvas:script") {
+				const command = copySettings(request.changes);
+				if (Object.keys(command).some(key => key !== "token") || record.scriptImport?.busy || record.state.isBlocked()
+					|| typeof command.token !== "string" || !/^[a-f0-9]{32}$/.test(command.token)
+					|| [...owners.values()].some(owner => owner.active && owner.scriptImport?.token === command.token)) throw saveFailed();
+				record.scriptImport = { token: command.token, revision: record.state.getRevision(), busy: false };
+				await this.reply(record, request, { status: "saved", settings: record.state.getSettings() });
+				return;
+			}
 			const saving = record.state.editConfiguration(request.changes);
 			diagnosticStage = "PLUGIN_APPLY_BEGIN";
 			const applying = record.session.applySettings(record.state.getSettings());
@@ -380,6 +412,43 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 			});
 		} catch {
 			// The PI's bounded request timer reports a fixed failure; no raw transport errors are logged.
+		}
+	}
+
+	private async importScript(record: SessionRecord, draft: ScriptDraft): Promise<void> {
+		const pending = record.scriptImport;
+		if (!pending || pending.busy) return;
+		pending.busy = true;
+		const current = () => record.active && owners.get(record.runtime.current.id) === record
+			&& record.scriptImport === pending && !record.persistenceUncertain && !record.state.isBlocked();
+		const unchanged = () => current() && record.state.getRevision() === pending.revision;
+		let status = "error";
+		try {
+			await record.ready;
+			await record.state.whenIdle();
+			if (!unchanged()) return;
+			const changes = await writeImportedScript(draft);
+			// A replaced owner or intervening configuration edit cannot be overwritten after file I/O.
+			if (!unchanged()) return;
+			const saving = record.state.editConfiguration(changes);
+			const applying = record.session.applySettings(record.state.getSettings());
+			const [result] = await Promise.all([saving, applying]);
+			await this.showSafetyError(record);
+			if (current() && result.status === "saved" && result.revision === record.state.getRevision()) status = "saved";
+		} catch { /* Only a fixed outcome leaves this boundary; never log source, paths, or exceptions. */ }
+		finally {
+			// Consume each attempted import, including uncertain saves; retries must use a fresh prompt.
+			if (record.scriptImport === pending) record.scriptImport = undefined;
+			const inspector = record.inspector;
+			if (record.active && inspector) {
+				try {
+					await streamDeck.ui.sendToPropertyInspector({
+						type: "canvas:script-result", context: record.runtime.current.id,
+						inspectorId: inspector.id, requestId: inspector.requestId, status,
+						...(status === "saved" ? { settings: record.state.getSettings() } : {}),
+					});
+				} catch { /* A closed or different inspector never gates the import. */ }
+			}
 		}
 	}
 
@@ -537,6 +606,7 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 		sessionRef.current = session;
 		record = {
 			session, state, runtime, display, initialized: false,
+			importScript: draft => this.importScript(record, draft),
 			handshakes: new Map(), retiredInspectors: new Set(previous?.retiredInspectors),
 			handshakeVersion: previous?.handshakeVersion ?? 0,
 			active: true, hidden: false, pendingWrite: false,
@@ -546,6 +616,7 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 			retire: () => {
 				if (!record.active) return record.ready;
 				record.active = false;
+				record.scriptImport = undefined;
 				record.persistenceUncertain ||= record.pendingWrite || state.isBlocked();
 				if (record.inspector) record.retiredInspectors.add(record.inspector.id);
 				for (const inspector of record.handshakes.keys()) record.retiredInspectors.add(inspector);

@@ -31,7 +31,7 @@ The display name is DeckForge Commander; plugin UUID is `git.renaudcerrato.deckf
 - Work from the repository root. Use Node.js 24, Stream Deck SDK 3, and the standalone SDPI 4 inspector components. Pin SDK assumptions to the installed version (3.0.1 / schema 0.5.1); recheck them when changing dependencies.
 - `src/core/`: settings, lifecycle, process ownership, protocol, and rendering. Loop and Run share `cycle-session`; their facades select trusted policies.
 - `src/actions/`: SDK adapters and shared process/display boundary. `src/native/windows-process-transport.c` is the Windows x64 Node-API 8 transport.
-- `src/inspector/`: shared inspector bridge and controller. Authored markup is `git.renaudcerrato.deckforge.sdPlugin/ui/run.html`.
+- `src/inspector/`: shared inspector bridge and controller. Authored markup is `src/inspector/run.html`; Rollup generates `git.renaudcerrato.deckforge.sdPlugin/ui/run.html`.
 - `tests/`: production behavior tests. `demos/`: standalone examples. `assets/`: README previews and generator.
 - Rollup generates plugin and inspector bundles. Edit source, not generated JavaScript or source maps.
 - Keep `.opencode/` local and ignored. Do not force-add it.

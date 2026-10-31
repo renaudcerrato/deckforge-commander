@@ -153,13 +153,14 @@ for (const scenario of ['missing required UI', 'linked stage', 'file stage root'
     if (scenario === 'file stage root') assert.equal(await readFile(path.join(f.root, candidate), 'utf8'), 'retained stage root');
   });
 }
-async function generateAssets(root) {
+async function generateAssets(root, configurationIndex = 0) {
   await put(root, 'rollup.config.mjs', await readFile(path.join(repository, 'rollup.config.mjs')));
   const { default: configurations } = await import(pathToFileURL(path.join(root, 'rollup.config.mjs')).href);
-  const plugins = configurations[0].plugins.filter(item => item && ['emit-windows-native-assets', 'emit-module-package-file'].includes(item.name));
+  const configuration = configurations[configurationIndex];
+  const plugins = configuration.plugins.filter(item => item && ['emit-windows-native-assets', 'emit-module-package-file', 'emit-inspector-html'].includes(item.name));
   const bundle = await rollup({ input: 'fixture', plugins: [
     { name: 'fixture-entry', resolveId: id => id === 'fixture' ? id : null, load: id => id === 'fixture' ? 'export const fixture = true;' : null }, ...plugins] });
-  try { return (await bundle.generate({ format: 'es' })).output.filter(item => item.type === 'asset'); }
+  try { return (await bundle.generate({ file: configuration.output.file, format: 'es' })).output.filter(item => item.type === 'asset'); }
   finally { await bundle.close(); }
 }
 test('Rollup emits transport bytes and ES module metadata', options, async () => {
@@ -176,6 +177,24 @@ test('Rollup refuses a missing transport', options, async () => {
   const root = await newRoot();
   // Act / Assert
   await assert.rejects(generateAssets(root), /ENOENT/);
+});
+test('Rollup emits authored inspector HTML bytes unchanged next to the inspector bundle', options, async () => {
+  // Arrange: generate the authored markup, not a stale shipped destination.
+  const root = await newRoot(), source = await readFile(path.join(repository, 'src/inspector/run.html'));
+  await put(root, 'src/inspector/run.html', source);
+  await put(root, `${plugin}/ui/run.html`, 'stale inspector HTML');
+  // Act
+  const assets = await generateAssets(root, 1);
+  // Assert: run.html is relative to the configured inspector output directory.
+  assert.deepEqual(assets.map(asset => asset.fileName), ['run.html']);
+  assert.deepEqual(Buffer.from(assets[0].source), source);
+});
+test('Rollup rejects missing authored inspector HTML despite a stale destination', options, async () => {
+  // Arrange: retain a stale destination without creating the authored source.
+  const root = await newRoot();
+  await put(root, `${plugin}/ui/run.html`, 'stale inspector HTML');
+  // Act / Assert: stale output must never make generation succeed.
+  await assert.rejects(generateAssets(root, 1), /ENOENT/);
 });
 test('test kit contains only driver, producer and transport and supports rebuild', options, async () => {
   // Arrange
