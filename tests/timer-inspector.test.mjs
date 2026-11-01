@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
-import { createInspectorFixture } from './helpers/inspector-harness.mjs';
+import { createInspectorFixture, isHiddenByAncestry } from './helpers/inspector-harness.mjs';
 import { createInspectorBridge, RUN_ACTION_UUID, TIMER_ACTION_UUID, ONCE_ACTION_UUID } from '../src/inspector/bridge.mjs';
 import { createInspectorController } from '../src/inspector/run.mjs';
 import { getTimerInspectorConfiguration, validateTimerSettings, classifyTimerSettings } from '../src/core/timer-settings.mjs';
@@ -29,7 +29,7 @@ function clock() {
 const edits = socket => socket.sent.filter(message => message.payload?.type === 'canvas:edit');
 const normal = socket => socket.sent;
 function harness({ built = false, loading = false } = {}) {
-  const fixture = createInspectorFixture(), f = fixture.fields;
+  const fixture = built ? createInspectorFixture(asset('run.html')) : createInspectorFixture(), f = fixture.fields;
   const time = clock(), sockets = [], errors = [], states = [], events = new Map();
   let controller, bridge, chained = 0;
   class Socket {
@@ -122,10 +122,46 @@ for (const built of [false, true]) {
       const changes = h.edits().map(message => message.payload.changes);
       // Assert
       assert.equal(h.f.timerControls.hidden, !loop);
+      assert.equal(isHiddenByAncestry(h.f.actionOnPress), !loop);
+      assert.equal(isHiddenByAncestry(h.f.intervalPreset), !loop);
+      assert.equal(isHiddenByAncestry(h.f.intervalSeconds), true);
       assert.deepEqual(changes, loop ? [{ intervalSeconds: 10 }, { actionOnPress: 'stop' }] : []);
       if (!built) assert.equal(h.bridge.getConnectionState().bindingValid, valid);
       assert.ok(h.sockets[0].sent.filter(message => message.event === 'sendToPlugin').every(message => message.action === action));
       h.dispose();
+    });
+  }
+}
+
+// Observe the actual controls through managed ancestors, not just container flags.
+for (const built of [false, true]) {
+  for (const reset of ['Stream', 'Run', 'invalid JSON', 'invalid port', 'missing context', 'unknown action', 'Loop reopen']) {
+    test(`${built ? 'built' : 'source'} control visibility follows custom selection and ${reset} binding reset`, t => {
+      // Arrange: source uses independent nested/reordered controls; built uses unchanged artifact HTML.
+      const h = harness({ built }); t.after(h.dispose); h.ready();
+      const socket = h.sockets[0], old = h.last();
+      // Act
+      h.f.intervalPreset.value = 'custom';
+      const customShown = !isHiddenByAncestry(h.f.intervalSeconds);
+      h.f.intervalPreset.value = '60';
+      const presetHidesCustom = isHiddenByAncestry(h.f.intervalSeconds);
+      h.f.intervalPreset.value = 'custom';
+      if (reset === 'Stream' || reset === 'Run' || reset === 'Loop reopen') {
+        h.bind(initial, reset === 'Stream' ? RUN_ACTION_UUID : reset === 'Run' ? ONCE_ACTION_UUID : TIMER_ACTION_UUID);
+      } else {
+        const info = reset === 'invalid JSON' ? '{invalid' : JSON.stringify({
+          context: reset === 'missing context' ? '' : 'next-key',
+          action: reset === 'unknown action' ? 'unknown' : TIMER_ACTION_UUID, payload: { settings: initial },
+        });
+        h.connect(reset === 'invalid port' ? '0' : '12345', 'transport-pi', 'registerPropertyInspector', '{}', info);
+      }
+      h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: initial }, socket);
+      // Assert: stale callbacks cannot reveal controls belonging to a retired binding.
+      assert.equal(customShown, true); assert.equal(presetHidesCustom, true);
+      assert.equal(isHiddenByAncestry(h.f.actionOnPress), reset !== 'Loop reopen');
+      assert.equal(isHiddenByAncestry(h.f.intervalPreset), reset !== 'Loop reopen');
+      assert.equal(isHiddenByAncestry(h.f.intervalSeconds), true);
+      assert.equal(socket.closed, true);
     });
   }
 }
@@ -626,7 +662,7 @@ test('built Timer entry routes custom edits, suppresses synchronous hydration an
 const adapterCodes = await loadAdapterCode(['timer']);
 
 function backend(t, client, settings = initial) {
-  const time = clock(), launches = [], logs = [], sessions = [], states = [], managers = [];
+  const time = clock(), launches = [], logs = [], runs = [], display = [];
   let stored = structuredClone(settings), resolveRun;
   const writes = [], replies = [];
   const runtime = {
@@ -634,39 +670,27 @@ function backend(t, client, settings = initial) {
     device: { id: 'synthetic-device', name: 'Synthetic Deck', type: 999, isConnected: true },
     coordinates: { row: 0, column: 0 },
     async setSettings(value) { writes.push(structuredClone(value)); stored = structuredClone(value); },
-    async getSettings() { return structuredClone(stored); }, async setImage() {}, async setTitle() {},
+    async getSettings() { return structuredClone(stored); },
+    async setImage(value) { display.push(value); }, async setTitle() {},
   };
   const sdk = { logger: { info: value => logs.push(value), warn: value => logs.push(value) },
     ui: { async sendToPropertyInspector(payload) { replies.push(structuredClone(payload)); client.reply(payload); } } };
   const sdkModule = { default: sdk, SingletonAction: class {}, action: () => value => value };
   const registry = Object.fromEntries(['onDeviceDidConnect', 'onDeviceDidDisconnect', 'onSystemDidWakeUp']
     .map(name => [name, () => ({ dispose() {} })]));
-  // Captures return the real instances unchanged, for their public idle/state APIs.
-  function capture(module, factory, collection) {
-    return { ...module, [factory](dependencies) {
-      const actual = module[factory](dependencies); collection.push(actual); return actual;
-    } };
-  }
   const requireIsolated = createAdapterLoader(adapterCodes, {
     process: { env: {}, cwd: () => '/synthetic/cwd', platform: 'darwin' }, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
-    if (name === '../core/process-runner.mjs') return { startProcessRun(execution) {
+    if (name === '../core/process-runner.mjs') return { startProcessRun(execution, callbacks) {
       launches.push(structuredClone(execution));
       const done = new Promise(resolve => { resolveRun = resolve; });
-      return { done, async stop() { resolveRun({ status: 'stopped' }); return true; } };
+      const run = { callbacks, stops: 0, resolve: resolveRun }; runs.push(run);
+      return { done, async stop() { run.stops++; run.resolve({ status: 'stopped' }); return true; } };
     } };
-  }, observe(name, actual) {
-    if (name === '../core/timer-session.mjs') return capture(actual, 'createTimerSession', sessions);
-    if (name === '../core/timer-settings.mjs') return capture(actual, 'createTimerStateCoordinator', states);
-    if (name === '../core/availability.mjs') return capture(actual, 'createAvailabilityManager', managers);
-    return actual;
   } });
   const { TimerAction } = requireIsolated('./timer'), action = new TimerAction(registry, time);
-  const idle = async () => {
-    await Promise.all(managers.map(manager => manager.whenIdle()));
-    await Promise.all(states.map(state => state.whenIdle()));
-    await Promise.all(sessions.map(session => session.whenIdle()));
-  };
+  // Synthetic boundaries need no real I/O; drain runnable work without opening gates.
+  const idle = () => new Promise(resolve => setImmediate(resolve));
   const delivered = new WeakMap();
   async function deliver() {
     // Each socket gets its own bounded cursor. SDK replies can enqueue claim/edit;
@@ -682,13 +706,18 @@ function backend(t, client, settings = initial) {
   }
   t.after(async () => {
     await action.onWillDisappear({ action: runtime }); await idle();
-    for (const manager of managers) manager.dispose();
+    for (const run of runs) run.resolve({ status: 'stopped' });
+    await idle();
     client.dispose();
   });
-  return { runtime, action, time, launches, logs, writes, replies, sessions, idle, deliver,
+  return { runtime, action, time, launches, runs, display, logs, writes, replies, idle, deliver,
     appear: () => action.onWillAppear({ action: runtime, payload: { settings } }),
     async tap() { await action.onKeyDown({ action: runtime, payload: { settings } }); await action.onKeyUp({ action: runtime }); await idle(); },
-    async finish(result = { status: 'success' }) { resolveRun(result); await idle(); },
+    async finish(result = { status: 'success' }) {
+      if (result.error === 'Program exited unsuccessfully.') runs.at(-1).callbacks.onDiagnostic('PROCESS_EXITED_NONZERO');
+      resolveRun(result); await idle();
+    },
+    async advance(ms) { time.advance(ms); await idle(); },
   };
 }
 
@@ -698,20 +727,19 @@ for (const input of ['preset', 'custom']) {
     const h = harness(), b = backend(t, h, { ...initial, args: ['retained legacy'] });
     await b.appear(); h.bind(); h.open(); await b.deliver();
     await b.tap(); await b.finish(); b.time.advance(1000); await b.idle();
-    const before = b.sessions[0].getState().dueMs;
     // Act
     if (input === 'preset') h.f.intervalPreset.value = '10';
     else { h.f.intervalPreset.value = 'custom'; h.f.intervalSeconds.value = '00010'; h.time.tick(200); }
     const request = h.last(); await b.deliver();
-    const after = b.sessions[0].getState();
     // Assert: fake matched host reporting is not a durability or hardware claim.
     assert.deepEqual(request.changes, { intervalSeconds: 10 });
-    assert.equal(before, 60000); assert.equal(after.dueMs, 11000); assert.equal(after.enabled, true);
     assert.deepEqual(b.writes, [{ ...initial, args: ['retained legacy'], intervalSeconds: 10 }]);
     assert.equal(Object.hasOwn(b.writes[0], 'runRequested'), false); assert.equal(Object.hasOwn(b.writes[0], 'enabled'), false);
     assert.equal(b.replies.at(-1).status, 'saved'); assert.equal(h.f.status.textContent, '');
     assert.equal(b.launches.length, 1); assert.equal(Object.hasOwn(b.launches[0], 'intervalSeconds'), false);
     assert.equal(b.logs.some(value => value.includes('retained legacy')), false);
+    await b.advance(9999); assert.equal(b.launches.length, 1);
+    await b.advance(1); assert.equal(b.launches.length, 2);
   });
 }
 
@@ -728,8 +756,8 @@ test('real Timer adapter receives no invalid client edits; stale key claim canno
   await b.action.onSendToPlugin({ action: b.runtime, payload: { ...old, context: 'other-key', changes: { intervalSeconds: 17 }, type: 'canvas:edit' } });
   await b.idle();
   // Assert
-  assert.deepEqual(b.writes, []); assert.deepEqual(b.launches, []); assert.equal(b.sessions[0].getState().enabled, false);
-  assert.equal(b.sessions[0].getState().dueMs, undefined); assert.equal(invalidStatus, intervalError);
+  await b.advance(100000); assert.deepEqual(b.writes, []); assert.deepEqual(b.launches, []);
+  assert.equal(invalidStatus, intervalError);
   assert.equal(h.f.intervalPreset.value, '30'); assert.equal(h.f.intervalSeconds.value, '30'); assert.equal(h.f.status.textContent, '');
 });
 
@@ -989,16 +1017,16 @@ for (const built of [false, true]) for (const phase of ['disabled', 'running', '
     await b.appear(); h.bind(); h.open(); await b.deliver();
     if (phase !== 'disabled') await b.tap();
     if (phase === 'waiting') { await b.finish(); b.time.advance(1000); await b.idle(); }
-    const before = b.sessions[0].getState(), launches = b.launches.length;
+    const before = [...b.display], launches = b.launches.length;
     // Act
     h.f.actionOnPress.value = 'stop'; const request = h.last(); await b.deliver();
-    const after = b.sessions[0].getState(); await b.tap(); const tapped = b.sessions[0].getState();
+    const after = [...b.display]; await b.tap(); await b.advance(100000);
     // Assert
     assert.deepEqual(request.changes, { actionOnPress: 'stop' });
-    assert.equal(after.enabled, before.enabled); assert.equal(after.phase, before.phase); assert.equal(after.dueMs, before.dueMs);
+    assert.deepEqual(after, before);
     assert.equal(b.writes.length, 1); assert.deepEqual(b.writes[0], { ...initial, args: ['retained legacy'], actionOnPress: 'stop' });
     assert.equal(b.replies.at(-1).status, 'saved'); assert.equal(h.f.status.textContent, '');
-    assert.equal(tapped.enabled, phase === 'disabled');
+    assert.equal(b.runs[0]?.stops ?? 0, phase === 'running' ? 1 : 0);
     assert.equal(b.launches.length, launches + (phase === 'disabled' ? 1 : 0));
     assert.ok(b.launches.every(value => !Object.hasOwn(value, 'actionOnPress')));
     assert.equal(b.logs.some(value => value.includes('retained legacy')), false);
@@ -1006,17 +1034,34 @@ for (const built of [false, true]) for (const phase of ['disabled', 'running', '
   });
 }
 for (const built of [false, true]) {
+  for (const policy of ['stop', 'refresh']) {
+    test(`${built ? 'built' : 'source'} confirmed ${policy} edit preserves the waiting launch boundary`, { timeout: 3000 }, async t => {
+      // Arrange
+      const settings = { ...initial, actionOnPress: policy === 'stop' ? 'refresh' : 'stop' };
+      const h = harness({ built }), b = backend(t, h, settings);
+      await b.appear(); h.bind(settings); h.open(); await b.deliver(); await b.tap(); await b.finish(); await b.advance(1000);
+      const displayed = [...b.display];
+      // Act
+      h.f.actionOnPress.value = policy; await b.deliver(); await b.advance(58999);
+      // Assert: the edit neither launches early nor resets the established delay.
+      assert.equal(b.launches.length, 1); assert.equal(b.runs[0].stops, 0); assert.deepEqual(b.display, displayed);
+      assert.deepEqual(b.writes, [{ ...initial, actionOnPress: policy }]); assert.equal(h.f.status.textContent, '');
+      await b.advance(1); assert.equal(b.launches.length, 2); assert.deepEqual(b.display, displayed);
+    });
+  }
   test(`${built ? 'built' : 'source'} real Timer policy save preserves ordinary error and existing retry deadline`, { timeout: 3000 }, async t => {
     // Arrange
     const h = harness({ built }), b = backend(t, h); await b.appear(); h.bind(); h.open(); await b.deliver(); await b.tap();
-    await b.finish({ status: 'error', error: 'Program exited unsuccessfully.' }); const before = b.sessions[0].getState();
+    await b.finish({ status: 'error', error: 'Program exited unsuccessfully.' }); const before = [...b.display];
+    await b.advance(1000);
     // Act
-    h.f.actionOnPress.value = 'stop'; await b.deliver(); const after = b.sessions[0].getState();
+    h.f.actionOnPress.value = 'stop'; await b.deliver();
     // Assert
-    assert.equal(before.presentation, 'error'); assert.equal(before.enabled, true);
-    assert.equal(after.presentation, 'error'); assert.equal(after.enabled, true); assert.equal(after.dueMs, before.dueMs);
-    assert.equal(after.suspended, before.suspended); assert.equal(b.launches.length, 1);
+    assert.match(decodeURIComponent(before.at(-1)), />Error<\/text>/);
+    assert.deepEqual(b.display, before); assert.equal(b.launches.length, 1);
     assert.deepEqual(b.writes, [{ ...initial, actionOnPress: 'stop' }]); assert.equal(h.f.status.textContent, '');
+    await b.advance(58999); assert.equal(b.launches.length, 1);
+    await b.advance(1); assert.equal(b.launches.length, 2); assert.deepEqual(b.display, before);
   });
   test(`${built ? 'built' : 'source'} real Timer Refresh selection neither stops active child nor queues an active tap`, { timeout: 3000 }, async t => {
     // Arrange
@@ -1024,11 +1069,12 @@ for (const built of [false, true]) {
     await b.appear(); h.bind(settings); h.open(); await b.deliver(); await b.tap();
     // Act
     h.f.actionOnPress.value = 'refresh'; await b.deliver(); await b.tap();
-    const active = b.sessions[0].getState(); await b.finish(); const complete = b.sessions[0].getState();
+    const active = b.launches.length; await b.finish();
     // Assert
-    assert.equal(active.enabled, true); assert.equal(active.phase, 'running'); assert.equal(b.launches.length, 1);
-    assert.equal(complete.enabled, true); assert.equal(complete.dueMs, 60000);
+    assert.equal(active, 1); assert.equal(b.launches.length, 1); assert.equal(b.runs[0].stops, 0);
     assert.deepEqual(b.writes, [{ ...initial, actionOnPress: 'refresh' }]); assert.equal(h.f.status.textContent, '');
+    await b.advance(59999); assert.equal(b.launches.length, 1);
+    await b.advance(1); assert.equal(b.launches.length, 2);
   });
   test(`${built ? 'built' : 'source'} real Timer rejects invalid local press metadata without saving, enabling or launching`, { timeout: 3000 }, async t => {
     // Arrange
@@ -1036,8 +1082,8 @@ for (const built of [false, true]) {
     // Act
     h.f.actionOnPress.value = 'STOP'; h.time.tick(200); await b.deliver();
     // Assert
-    assert.deepEqual(b.writes, []); assert.deepEqual(b.launches, []); assert.equal(b.sessions[0].getState().enabled, false);
-    assert.equal(h.f.status.textContent, pressError); assert.equal(b.sessions[0].getState().dueMs, undefined);
+    await b.advance(100000); assert.deepEqual(b.writes, []); assert.deepEqual(b.launches, []);
+    assert.equal(h.f.status.textContent, pressError);
   });
 }
 

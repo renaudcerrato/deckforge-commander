@@ -505,7 +505,8 @@ test('disconnect and controller disposal prevent queued and subsequent edits', (
 test('built browser entry replaces vendor connection wrapper and opens only one mocked socket', () => {
   // Arrange
   const script = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8');
-  const fixture = createInspectorFixture(), fields = fixture.fields, sockets = [], timers = new Map(), events = new Map();
+  const fixture = createInspectorFixture(readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8'));
+  const fields = fixture.fields, sockets = [], timers = new Map(), events = new Map();
   let chained = 0, timerId = 0;
   const window = { connectElgatoStreamDeckSocket() { chained++; }, addEventListener(type, callback) { events.set(type, callback); } };
   const document = { readyState: 'complete', addEventListener() {}, getElementById: fixture.getElementById };

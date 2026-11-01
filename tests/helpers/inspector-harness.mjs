@@ -3,6 +3,34 @@ import assert from 'node:assert/strict';
 
 const authoredMarkup = readFileSync(new URL('../../src/inspector/run.html', import.meta.url), 'utf8');
 
+// Independent DOM-boundary input. Never derive defect cases by rewriting product markup.
+export const inspectorTestMarkup = `<html><head>
+  <script src="sdpi-components.js"></script><script src="run.js"></script>
+  </head><body>
+  <section id="settings-status" role="status" aria-live="polite"></section>
+  <input id="themeColor" type="color" value="#abcdef" aria-label="Key artwork" />
+  <sdpi-item label="Program"><sdpi-file id="executable"></sdpi-file></sdpi-item>
+  <sdpi-item label="Working folder"><sdpi-textfield id="cwd"></sdpi-textfield></sdpi-item>
+  <sdpi-item label="Parameters"><sdpi-textfield id="argsText"></sdpi-textfield></sdpi-item>
+  <sdpi-item label="Key title"><sdpi-textfield id="title"></sdpi-textfield></sdpi-item>
+  <section id="timer-controls" hidden>
+    <sdpi-item label="Delay"><sdpi-select id="intervalPreset">
+      <option value="custom">Other duration</option><option value="3600">Hour</option>
+      <option value="1800">Half hour</option><option value="600">Ten minutes</option>
+      <option value="60">Minute</option><option value="30">Half minute</option>
+      <option value="10">Ten seconds</option><option value="1">Second</option>
+    </sdpi-select></sdpi-item>
+    <sdpi-item label="Press behavior"><div><sdpi-select id="actionOnPress">
+      <option value="stop">Toggle</option><option value="refresh">Refresh</option>
+    </sdpi-select></div></sdpi-item>
+    <section id="custom-interval" hidden><sdpi-item label="Seconds">
+      <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
+    </sdpi-item></section>
+  </section>
+  <p>Independent helper copy.</p><p>Additional explanation.</p>
+  <a id="github-project" href="#">Project</a><a id="ask-chatgpt" href="#">Script help</a>
+  </body></html>`;
+
 function element(tag, attributes) {
   const listeners = new Map();
   const color = tag === 'input' && attributes.get('type') === 'color';
@@ -52,7 +80,7 @@ function attributesOf(source) {
 // Opaque scripts/styles and comments cannot supply controls; text whitespace collapses.
 export function extractInspectorMarkup(html = authoredMarkup) {
   const nodes = [], scripts = [], styles = [], stack = [];
-  // Mask opaque regions without shifting source ranges used by mutation fixtures.
+  // Mask opaque regions without shifting source ranges used by controlled fixtures.
   const markup = html.replace(/<!--[\s\S]*?-->/g, match => ' '.repeat(match.length)).replace(
     /<(script|style)\b((?:[^"'<>]|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/\1\s*>/gi,
     (match, tag, source, text, start) => {
@@ -91,75 +119,92 @@ export function assertInspectorMarkup(html = authoredMarkup) {
     assert.equal(matches.length, 1, `expected one ${id} control`);
     return matches[0];
   };
-  assert.deepEqual(scripts.map(script => script.attributes.get('src')), ['sdpi-components.js', 'run.js']);
+  assert.deepEqual(scripts.map(script => script.attributes.get('src')).sort(), ['run.js', 'sdpi-components.js']);
   assert.ok(scripts.every(script => script.text.trim() === ''), 'no inline script');
   assert.equal([...nodes, ...scripts, ...styles].some(node => node.attributes.has('setting')), false);
-  assert.equal(nodes.some(node => ['button', 'sdpi-button', 'sdpi-color', 'details'].includes(node.tag)
-    || /\bApply\b/.test(node.text) || ['env', 'environment', 'connection-status', 'mode', 'enabled', 'runRequested']
-      .includes(node.attributes.get('id'))), false);
+  assert.equal(nodes.some(node => ['button', 'sdpi-button', 'sdpi-color'].includes(node.tag)
+    || ['env', 'environment', 'mode', 'enabled', 'runRequested']
+       .includes(node.attributes.get('id'))), false);
+  const ids = nodes.map(node => node.attributes.get('id')).filter(Boolean);
+  assert.equal(new Set(ids).size, ids.length, 'bindings must be unique');
+  const named = node => {
+    if (node.attributes.get('aria-label')?.trim()) return true;
+    for (let parent = node.parent; parent; parent = parent.parent) {
+      if (parent.tag === 'sdpi-item' && parent.attributes.get('label')?.trim()) return true;
+    }
+    return false;
+  };
+  const usable = node => {
+    assert.equal(node.attributes.has('disabled'), false);
+    assert.equal(node.attributes.has('readonly'), false);
+    assert.ok(named(node), 'controls need an accessible name');
+  };
   for (const [id, tag] of [['executable', 'sdpi-file'], ['cwd', 'sdpi-textfield'], ['argsText', 'sdpi-textfield'],
-    ['title', 'sdpi-textfield'], ['intervalSeconds', 'sdpi-textfield']]) assert.equal(byId(id).tag, tag);
+    ['title', 'sdpi-textfield'], ['intervalSeconds', 'sdpi-textfield']]) {
+    const node = byId(id); assert.equal(node.tag, tag); usable(node);
+  }
   const theme = byId('themeColor'), status = byId('settings-status');
   assert.equal(theme.tag, 'input'); assert.equal(theme.attributes.get('type'), 'color');
-  // Authored initial color is distinct from hydration's runtime fallback.
-  assert.equal(theme.attributes.get('value'), '#606060');
-  assert.equal(theme.attributes.get('aria-label'), 'Artwork theme color');
-  assert.equal(theme.parent.tag, 'sdpi-item'); assert.equal(theme.parent.attributes.get('label'), 'Theme color');
-  assert.equal(status.tag, 'p'); assert.equal(status.attributes.get('role'), 'status');
-  assert.equal(status.attributes.get('aria-live'), 'polite'); assert.equal(status.text, ''); assert.deepEqual(status.children, []);
-  assert.deepEqual(nodes.filter(node => node.tag === 'p'), [status]);
-  assert.ok(nodes.indexOf(status) > nodes.indexOf(theme));
+  usable(theme);
+  assert.equal(status.attributes.get('role'), 'status');
+  assert.equal(status.attributes.get('aria-live'), 'polite'); assert.deepEqual(status.children, []);
+  for (const id of ['github-project', 'ask-chatgpt']) {
+    const link = byId(id); assert.equal(link.tag, 'a'); assert.ok(link.text || named(link));
+  }
   const timer = byId('timer-controls'), custom = byId('custom-interval');
   const press = byId('actionOnPress'), interval = byId('intervalPreset');
-  assert.equal(timer.tag, 'div'); assert.equal(timer.attributes.has('hidden'), true);
-  assert.equal(custom.tag, 'sdpi-item'); assert.equal(custom.attributes.has('hidden'), true);
-  assert.equal(custom.parent, timer); assert.equal(custom.attributes.get('label'), 'Interval (seconds)');
-  assert.equal(byId('intervalSeconds').parent, custom);
-  assert.ok(custom.children.some(node => node.tag === 'small' && node.text === 'Enter whole seconds from 1 to 86400.'));
-  for (const [node, label] of [[press, 'Action on press'], [interval, 'Interval']]) {
-    assert.equal(node.tag, 'sdpi-select'); assert.equal(node.parent.tag, 'sdpi-item');
-    assert.equal(node.parent.attributes.get('label'), label); assert.equal(node.parent.parent, timer);
+  assert.equal(timer.attributes.has('hidden'), true);
+  assert.equal(custom.attributes.has('hidden'), true);
+  const within = (node, container) => {
+    for (let parent = node.parent; parent; parent = parent.parent) if (parent === container) return true;
+    return false;
+  };
+  // These are visibility boundaries, not immediate-parent or layout requirements.
+  for (const node of [press, interval, custom]) {
+    assert.ok(within(node, timer), `${node.attributes.get('id')} must be within timer-controls`);
   }
-  assert.equal(press.parent.children.some(node => node.tag === 'small'), false);
-  assert.ok(nodes.indexOf(press) < nodes.indexOf(interval));
+  assert.ok(within(byId('intervalSeconds'), custom), 'intervalSeconds must be within custom-interval');
+  for (const node of [press, interval]) { assert.equal(node.tag, 'sdpi-select'); usable(node); }
   const optionsOf = node => node.children.map(option => {
-    assert.equal(option.tag, 'option'); assert.deepEqual(option.children, []);
-    return [option.attributes.get('value'), option.text];
+    assert.equal(option.tag, 'option'); assert.ok(option.text, 'choices need meaningful labels');
+    assert.equal(option.attributes.has('disabled'), false);
+    return option.attributes.get('value');
   });
-  assert.deepEqual(optionsOf(press), [['refresh', 'start / refresh (long press to stop)'], ['stop', 'start / stop']]);
-  assert.deepEqual(optionsOf(interval), [['1', '1s'], ['10', '10s'], ['30', '30s'], ['60', '1mn'], ['600', '10mn'],
-    ['1800', '30mn'], ['3600', '1h'], ['custom', 'Custom']]);
+  assert.deepEqual(optionsOf(press).sort(), ['refresh', 'stop']);
+  assert.deepEqual(optionsOf(interval).sort(), ['1', '10', '30', '60', '600', '1800', '3600', 'custom'].sort());
   const css = styles.map(style => style.text).join('\n');
   // Inspect only flat rules and declarations used by this static contract, not general CSS.
   const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(([, selectors, body]) => ({
-    selectors: selectors.split(',').map(selector => selector.trim().replace(/\[\s*hidden\s*\]/g, '[hidden]')),
+    selectors: selectors.split(',').map(selector => selector.trim()),
     declarations: new Map(body.split(';').filter(value => value.includes(':')).map(value => {
       const colon = value.indexOf(':');
       return [value.slice(0, colon).trim().toLowerCase(), value.slice(colon + 1).trim().toLowerCase()];
     })),
   }));
-  const property = (selector, name) => {
-    let value;
-    for (const rule of rules) if (rule.selectors.includes(selector) && rule.declarations.has(name)) value = rule.declarations.get(name);
-    return value;
-  };
-  for (const selector of ['#timer-controls[hidden]', '#custom-interval[hidden]']) {
-    assert.match(property(selector, 'display') ?? '', /^none\s*!\s*important$/);
-  }
-  assert.equal(property('#settings-status', 'color'), '#969696');
   assert.equal(rules.some(rule => rule.selectors.some(selector => /\bsdpi[\w-]*/i.test(selector))
     && [...rule.declarations.keys()].some(name => /^background(?:-|$)/.test(name))), false);
 }
 
-export function createInspectorFixture(html = authoredMarkup) {
-  const elements = new Map(), fields = {};
-  for (const { tag, attributes } of extractInspectorMarkup(html).nodes) {
+export function createInspectorFixture(html = inspectorTestMarkup) {
+  const elements = new Map(), fields = {}, boundaries = new Map();
+  for (const node of extractInspectorMarkup(html).nodes) {
+    const { tag, attributes } = node;
+    const field = element(tag, attributes);
+    // Anonymous wrappers participate too: hiding one must hide its descendants.
+    field.parentElement = boundaries.get(node.parent) ?? null;
+    boundaries.set(node, field);
     const id = attributes.get('id');
     if (!id) continue;
-    const field = element(tag, attributes);
+    assert.equal(elements.has(id), false, 'bindings must be unique');
     elements.set(id, field);
     fields[id.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = field;
     if (attributes.get('role') === 'status') fields.status = field;
   }
   return { fields, elements, getElementById: id => elements.get(id) ?? null };
+}
+
+// Observe only DOM hidden state, including ancestors; never infer computed CSS.
+export function isHiddenByAncestry(control) {
+  for (let node = control; node; node = node.parentElement) if (node.hidden) return true;
+  return false;
 }

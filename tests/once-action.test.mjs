@@ -49,7 +49,7 @@ function runtime(id = 'synthetic-once-key', initial = base, manifestId = ONCE_UU
   };
 }
 function harness(t, platform = 'posix') {
-  const time = clock(), launches = [], sessions = [], states = [], managers = [], logs = [], replies = [];
+  const time = clock(), launches = [], logs = [], replies = [];
   const decorated = new Map(), listeners = new Map(), tracked = [];
   const sdk = { info: { plugin: { uuid: 'git.renaudcerrato.deckforge', version: '0.1.0.0' },
     application: { version: '7.6', language: 'fr', platform: platform === 'win32' ? 'windows' : 'mac', platformVersion: '26' } },
@@ -75,35 +75,24 @@ function harness(t, platform = 'posix') {
       done.resolve({ status: 'stopped' }); return certain;
     } };
   } };
-  const capture = (module, factory, collection) => ({ ...module, [factory](dependencies) {
-    const actual = module[factory](dependencies); collection.push(actual); return actual;
-  } });
-  const factories = new Map([
-    ['once-session', ['createOnceSession', sessions]], ['timer-session', ['createTimerSession', sessions]],
-    ['action-session', ['createActionSession', sessions]], ['once-settings', ['createOnceStateCoordinator', states]],
-    ['timer-settings', ['createTimerStateCoordinator', states]], ['run-state', ['createRunStateCoordinator', states]],
-    ['availability', ['createAvailabilityManager', managers]],
-  ].map(([name, value]) => [`../core/${name}.mjs`, value]));
   const isolatedRequire = createAdapterLoader(codes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-  }, observe(name, actual) {
-    return factories.has(name) ? capture(actual, ...factories.get(name)) : actual;
   } });
   const { OnceAction } = isolatedRequire('./once'), { RunAction } = isolatedRequire('./run'), { TimerAction } = isolatedRequire('./timer');
   const action = new OnceAction(registry, time);
-  const idle = async () => {
-    await Promise.all(managers.map(manager => manager.whenIdle()));
-    await Promise.all(states.map(state => state.whenIdle()));
-    await Promise.all(sessions.map(session => session.whenIdle()));
-  };
+  // Allow all runnable promise work from SDK/process callbacks to progress. Held
+  // boundaries are awaited explicitly by their tests, not through private queues.
+  const idle = () => new Promise(resolve => setImmediate(resolve));
   t.after(async () => {
     for (const launch of launches) launch.stopGate?.resolve(true);
+    for (const [, r] of tracked) { r.device.isConnected = false; emit('disconnect', r.device); }
+    await idle();
     for (const [adapter, r] of tracked) await adapter.onWillDisappear({ action: r });
-    for (const session of sessions) await session.setConnected(false);
-    await idle(); for (const manager of managers) manager.dispose();
+    await idle(); listeners.clear();
   });
-  return { action, OnceAction, RunAction, TimerAction, decorated, registry, time, launches, sessions, states, logs, replies, idle, syntheticProcess,
+  function emit(name, device) { for (const listener of listeners.get(name) ?? []) listener(name === 'wake' ? undefined : { device }); }
+  return { action, OnceAction, RunAction, TimerAction, decorated, registry, time, launches, logs, replies, idle, syntheticProcess,
     async appear(r, adapter = action, settings) {
       if (!tracked.some(([a, b]) => a === adapter && b === r)) tracked.push([adapter, r]);
       await adapter.onWillAppear({ action: r, payload: { settings: settings ?? await r.getSettings() } }); await idle();
@@ -116,7 +105,7 @@ function harness(t, platform = 'posix') {
       if (result.status === 'success') launch.callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY');
       launch.done.resolve(result); await Promise.resolve(); await idle();
     },
-    emit(name, device) { for (const listener of listeners.get(name) ?? []) listener(name === 'wake' ? undefined : { device }); },
+    emit,
     send(r, type, requestId, extra = {}) { return action.onSendToPlugin({ action: r,
       payload: { type, context: r.id, inspectorId: 'synthetic-pi', requestId, ...extra } }); },
     async claim(r) { await this.send(r, 'canvas:hello', 1); await this.send(r, 'canvas:claim', 2, { token: replies.at(-1).token }); },
@@ -312,7 +301,6 @@ test('actual Run hard lines survive rejected schema and key-local confirmed redr
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), ['A', '', 'B']);
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), Array(3).fill('#abcdef'));
   assert.equal(record.value, 'A\n\nB'); assert.deepEqual(other.display, untouched); assert.deepEqual(other.writes, []);
-  assert.equal(h.sessions[0].getState().phase, 'stopped'); assert.equal(Object.hasOwn(h.sessions[0].getState(), 'dueMs'), false);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
 });
@@ -326,24 +314,26 @@ test('actual Run final hard-line SDK handoff drains before stopped and ignores m
   h.launches[0].callbacks.onUpdate(final); await entered.promise;
   h.launches[0].callbacks.onUpdate({ ...final, hardBreaks: true });
   const beforeCompletion = [...r.display];
-  const finishing = h.finish();
+  const finishing = h.finish(); let pressing;
   try {
-    // T7: let the queued terminal operation reach its drain, not just complete()'s first callback.
+    // Deliver completion while the final SDK handoff is still held.
     await h.launches[0].done.promise;
-    await new Promise(resolve => setImmediate(resolve));
+    await h.idle();
+    pressing = h.down(r);
+    await h.idle();
     // Assert while the image gate is closed: no premature terminal publication or replacement.
-    assert.equal(h.sessions[0].getState().phase, 'stopping');
     assert.deepEqual(r.display, beforeCompletion);
     assert.equal(h.launches.length, 1);
   } finally {
-    gate.resolve(); await finishing;
+    gate.resolve(); await Promise.all([finishing, pressing]); await h.up(r); await h.idle();
   }
   const retained = [...r.display];
   h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.advance(100000000);
   // Assert
-  assert.equal(h.sessions[0].getState().phase, 'stopped');
   assert.equal(images(r).at(-1), artwork); assert.deepEqual(r.display, retained); assert.deepEqual(r.writes, []);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
+  await h.tap(r);
+  assert.equal(h.launches.length, 2); assert.equal(images(r).at(-1), artwork);
 });
 test('actual Run caption redraw is key-local without restart or retry', options, async t => {
   // Arrange: renderer tests own the position/font/color combinations.
@@ -368,7 +358,6 @@ test('actual Run caption redraw is key-local without restart or retry', options,
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), ['Items', '42']);
   assert.match(rendered, /stroke="#abcdef"/);
   assert.equal(JSON.stringify(record), before); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
-  assert.equal(h.sessions[0].getState().phase, 'stopped'); assert.equal(Object.hasOwn(h.sessions[0].getState(), 'dueMs'), false);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
 });
@@ -383,7 +372,7 @@ test('actual Once decorator and manifest identify the third independent action w
   assert.equal(h.decorated.get(h.OnceAction), ONCE_UUID); assert.equal(manifest.Actions.length, 3);
   assert.equal(once.Name, 'Run'); assert.equal(once.Icon, 'imgs/actions/once/icon'); assert.equal(once.PropertyInspectorPath, 'ui/run.html');
   assert.deepEqual(once.Controllers, ['Keypad']); assert.deepEqual(once.States, [{ Image: 'imgs/actions/once/key', TitleAlignment: 'bottom' }]);
-  assert.deepEqual(h.launches, []); assert.deepEqual(h.sessions, []);
+  assert.deepEqual(h.launches, []);
 });
 test('actual Run short release launches exactly once with literal argv and all 16 immutable metadata fields', options, async t => {
   // Arrange
@@ -416,7 +405,6 @@ for (const at of [999, 1000]) for (const deliver of [false, true]) for (const bu
     // Assert
     assert.equal(before, Number(busy)); assert.equal(h.launches.length, busy || at === 999 ? 1 : 0);
     assert.equal(h.launches[0]?.stops ?? 0, busy && at === 1000 ? 1 : 0); assert.deepEqual(r.writes, []);
-    assert.equal(Object.hasOwn(h.sessions[0].getState(), 'enabled'), false); assert.equal(Object.hasOwn(h.sessions[0].getState(), 'dueMs'), false);
   });
 }
 for (const settings of [{}, { executable: '' }, { argsText: '/synthetic/report.py' }]) {
@@ -477,23 +465,26 @@ test('actual Run final SDK image drain completes before stopped outcome and igno
   h.launches[0].callbacks.onUpdate(final); await entered.promise;
   h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'invalid' });
   const beforeCompletion = [...r.display];
-  const finishing = h.finish();
+  const finishing = h.finish(); let pressing;
   try {
-    // T7: keep the image unresolved across a full event-loop boundary after completion delivery.
+    // Deliver completion while the final SDK handoff is still held.
     await h.launches[0].done.promise;
-    await new Promise(resolve => setImmediate(resolve));
-    // Assert before release so bypassing terminal drain cannot pass on an early stopping snapshot.
-    assert.equal(h.sessions[0].getState().phase, 'stopping');
+    await h.idle();
+    pressing = h.down(r);
+    await h.idle();
+    // Assert while the image gate is closed: no premature terminal publication or replacement.
     assert.deepEqual(r.display, beforeCompletion);
     assert.equal(h.launches.length, 1);
   } finally {
-    gate.resolve(); await finishing;
+    gate.resolve(); await Promise.all([finishing, pressing]); await h.up(r); await h.idle();
   }
   const retained = [...r.display];
   h.launches[0].callbacks.onUpdate(parseOutputUpdate('<svg>late</svg>')); await h.idle();
   // Assert
-  assert.equal(h.sessions[0].getState().phase, 'stopped');
   assert.equal(images(r).at(-1), final.image); assert.deepEqual(r.display, retained); assert.deepEqual(r.writes, []);
+  assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
+  await h.tap(r);
+  assert.equal(h.launches.length, 2); assert.equal(images(r).at(-1), final.image);
 });
 for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNAL']) {
   test(`actual Run ${diagnostic} uses unchanged Error bytes and retries only on manual tap`, options, async t => {
@@ -591,14 +582,13 @@ for (const [suffix, caption] of [['', '1.6%'], [';display:100%', '100%']]) {
     h.launches[0].callbacks.onUpdate({ ...record, options: { ...record.options, display: 'forged' } });
     const missing = { ...record.options }; delete missing.display;
     h.launches[0].callbacks.onUpdate({ ...record, options: missing }); await h.idle();
-    const afterRejected = images(r).at(-1), active = h.sessions[0].getState().phase;
+    const afterRejected = images(r).at(-1), activeStops = h.launches[0].stops;
     await h.finish(); await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef' } }); await h.advance(100000000);
     const rendered = svg(images(r).at(-1));
     // Assert
-    assert.equal(afterRejected, accepted); assert.equal(active, 'running');
+    assert.equal(afterRejected, accepted); assert.equal(activeStops, 0);
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), [caption]);
     assert.equal(/stroke-dasharray="([^"]*)"/.exec(rendered)[1], /stroke-dasharray="([^"]*)"/.exec(svg(accepted))[1]);
-    assert.equal(h.sessions[0].getState().phase, 'stopped'); assert.equal(Object.hasOwn(h.sessions[0].getState(), 'dueMs'), false);
     assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
@@ -628,7 +618,6 @@ for (const [suffix, expected] of [
     assert.match(rendered, /stroke="#abcdef" stroke-width="2"/);
     assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-    assert.equal(h.sessions[0].getState().phase, 'stopped');
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
   });
 }
@@ -670,7 +659,7 @@ for (const failure of ['cleanup', 'persistence']) {
     await h.tap(r); await h.send(r, 'canvas:edit', 4, { changes: { argsText: 'replacement' } });
     r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake');
-    await h.appear(r, h.action, h.states[0].getSettings()); await h.advance(100000);
+    await h.appear(r, h.action, r.slot.value); await h.advance(100000);
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(images(r).at(-1), createErrorArtwork(
       failure === 'cleanup' ? 'CLEANUP_BLOCKED' : 'STATE_SAVE_FAILED', failure === 'cleanup' ? undefined : '#abcdef'));
@@ -825,13 +814,18 @@ for (const [from, to] of [['Stream', 'Loop'], ['Loop', 'Run'], ['Run', 'Stream']
     const moved = movedWrapper(r, { ...base, title: to }, next.uuid);
     const appearing = next.adapter.onWillAppear({ action: moved, payload: { settings: moved.slot.value } });
     const pressing = next.tap(moved);
-    // A launch boundary is synchronous once reached; drain microtasks without real time.
-    for (let i = 0; i < 20; i++) await Promise.resolve();
+    // Observe actual owned-stop entry, then give all runnable replacement work
+    // an event-loop opportunity while the cleanup result remains withheld.
+    await launch.stopEntered.promise;
+    await h.idle();
     const pending = { launches: h.launches.length, stops: launch.stops };
     gate.resolve(true); await Promise.all([hiding, appearing, pressing]); await h.idle();
     // Assert
     assert.deepEqual(pending, { launches: 1, stops: 1 });
-    assert.ok(h.launches.length <= 2); assert.deepEqual(r.writes, []);
+    const afterRelease = h.launches.length;
+    if (afterRelease === 1) await next.tap(moved);
+    assert.equal(h.launches.length, 2); assert.equal(launch.stops, 1);
+    assert.equal(h.launches[1].env.ELGATO_ACTION_UUID, next.uuid); assert.deepEqual(r.writes, []);
   });
 }
 

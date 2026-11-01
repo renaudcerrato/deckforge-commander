@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { READY_SVG, SETUP_SVG, createLaunchArtwork, getReadyTitle, getExecutableExtension, formatLaunchCaption } from '../src/core/launch-artwork.mjs';
 import { createKeyLayout } from '../src/core/key-layout.mjs';
-import { svgElements, assertSvgElement, assertPaddedClip } from './helpers/svg-harness.mjs';
+import { svgElements, assertSvgElement, assertPaddedClip, assertKeyFrame, assertSetupWarning } from './helpers/svg-harness.mjs';
 const decode = uri => decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
-const captionOf = svg => /<text[^>]*clip-path="url\(#caption-clip\)"[^>]*>([^<]*)<\/text>/.exec(svg)?.[1];
+const captionOf = svg => svgElements(svg, 'text').find(text => text['clip-path'])?.text;
 
 // TITLE-1: custom text is literal; only the fallback interprets executable paths.
 for (const [title, expected] of [['a/b\\c.d', 'a/b\\c.d'], [' cafe\u0301\n& ', 'café &'],
@@ -21,7 +21,7 @@ for (const [title, expected] of [['a/b\\c.d', 'a/b\\c.d'], [' cafe\u0301\n& ', '
     // Assert
     assert.equal(resolved, expected); assert.equal(changed, expected === 'report' ? 'other' : expected);
     assert.equal(captionOf(rendered), expected.replace(/&/g, '&amp;'));
-    assert.match(rendered, />\.py<\/text>/); assert.equal(rendered.includes('/synthetic'), false);
+    assertSvgElement(rendered, 'text', { text: '.py' }, {}); assert.equal(rendered.includes('/synthetic'), false);
   });
 }
 test('TITLE-1 8192-unit title remains accepted and grapheme-fitted; larger text falls back', () => {
@@ -33,7 +33,8 @@ test('TITLE-1 8192-unit title remains accepted and grapheme-fitted; larger text 
   const oversized = getReadyTitle('/report.py', 'posix', title + 'é');
   // Assert
   assert.equal(resolved, title); assert.equal(oversized, 'report');
-  assert.match(captionOf(rendered), /^é+…$/); assert.match(rendered, /font-size="16"[^>]*clip-path=/);
+  assert.match(captionOf(rendered), /^é+…$/);
+  assert.equal(Number(svgElements(rendered, 'text').find(text => text['clip-path'])['font-size']), 16);
 });
 
 // S2: only runtime-platform separators select the built-in executable caption.
@@ -46,7 +47,7 @@ for (const executable of [String.raw`C:\folder\é & report.EXE`, 'C:/folder/é &
     const rendered = decode(createLaunchArtwork('ready', caption, undefined, undefined, extension));
     // Assert
     assert.equal(caption, 'é & report'); assert.equal(extension, '.exe');
-    assert.equal(captionOf(rendered), 'é &amp; report'); assert.match(rendered, />\.exe<\/text>/);
+    assert.equal(captionOf(rendered), 'é &amp; report'); assertSvgElement(rendered, 'text', { text: '.exe' }, {});
     assert.equal(getReadyTitle(input, 'posix'), 'DeckForge Commander'); assert.equal(getExecutableExtension(input, 'posix'), undefined);
   });
 }
@@ -132,7 +133,7 @@ for (const [extension, escaped] of [['.C<', '.c&lt;'], ['.&', '.&amp;'], ['.\"',
     // Act
     const actual = decode(createLaunchArtwork('ready', 'report', '#ABCDEF', undefined, input));
     // Assert
-    assert.ok(actual.includes(`font-size="16" fill="#abcdef">${escaped}</text>`));
+    assertSvgElement(actual, 'text', { text: escaped }, { 'font-size': 16, fill: '#abcdef' });
     assert.equal(/<c\b|\u202e|onload=/.test(actual), false);
     assert.equal(captionOf(actual), 'report');
   });
@@ -207,8 +208,8 @@ for (const footer of ['ready', 'exited', 'setup required']) {
     // Assert
     if (footer === 'setup required') {
       assert.equal(captionOf(svg), undefined);
-      assert.match(svg, /aria-label="Setup required"/);
-      assert.match(svg, /stroke="#abcdef"/);
+      assertSetupWarning(svg);
+      assertKeyFrame(svg, '#abcdef');
       assert.equal(svg.includes('report'), false);
     } else {
       assert.equal(svg, expected.replace('>ready</text>', `>${footer}</text>`));
@@ -253,7 +254,7 @@ for (const footer of ['ready', 'exited', 'loading...', 'setup required']) {
     // Assert
     if (footer === 'setup required') {
       assert.equal(captionOf(actual), undefined);
-      assert.match(actual, /aria-label="Setup required"/);
+      assertSetupWarning(actual);
     } else {
       assert.equal(actual, expected.replace('>ready</text>', `>${footer}</text>`));
     }
@@ -269,8 +270,10 @@ for (const caption of ['<x&"\'>', 'cafe\u0301', 'a\nb\rc\t', '\u202ea\ud800\ufff
     // Assert
     assert.equal(actual, expected.replace('>ready</text>', '>loading...</text>'));
     assert.equal(/<x|\u202e|\ud800|\uffff|[\r\t]/.test(actual), false);
-    assert.ok(Number(/font-size="([\d.]+)"[^>]*clip-path=/.exec(actual)?.[1]) >= 16);
-    assert.ok(Number(/font-size="([\d.]+)"[^>]*clip-path=/.exec(actual)?.[1]) <= 32);
+    const text = svgElements(actual, 'text').find(element => element['clip-path']);
+    const size = Number(text['font-size']);
+    assert.ok(size >= 16 && size <= 32);
+    assertPaddedClip(actual, text, { x: 16, y: 48, width: 112, height: 48 });
   });
 }
 
@@ -281,12 +284,10 @@ for (const kind of ['ready', 'waiting']) {
     // Act
     const svg = decode(createLaunchArtwork(kind, 'report', color));
     // Assert
-    assert.match(svg, /width="144" height="144" viewBox="0 0 144 144"/);
-    assert.ok(svg.includes('<rect width="144" height="144" fill="#000000"/>'));
-    assert.match(svg, /<rect x="8" y="8" width="128" height="128" rx="16" fill="none" stroke="#abcdef" stroke-width="3"/);
-    assert.match(svg, /font-size="16"[^>]*>Stream<\/text>/);
+    assertKeyFrame(svg, '#abcdef');
+    assertSvgElement(svg, 'text', { text: 'Stream' }, { x: 22, y: 32, 'font-size': 16, fill: '#abcdef' });
     assert.equal(/>Run<|>Loop<|>Error</.test(svg), false);
-    assert.match(svg, new RegExp(`y="124"[^>]*font-size="16"[^>]*>${kind === 'waiting' ? 'loading\\.\\.\\.' : 'ready'}<\\/text>`));
+    assertSvgElement(svg, 'text', { text: kind === 'waiting' ? 'loading...' : 'ready' }, { x: 72, y: 124, 'font-size': 16, fill: '#abcdef', 'text-anchor': 'middle' });
     assert.equal(/<path|<circle|<script|foreignObject|href=|onload=/.test(svg), false);
     assert.equal(captionOf(svg), 'report');
   });
@@ -300,7 +301,7 @@ test('waiting preserves the script caption and changes only the Ready footer', (
   // Assert
   assert.equal(a, b.replace('>ready</text>', '>loading...</text>'));
   assert.equal(captionOf(a), caption);
-  assert.match(a, /<clipPath id="caption-clip"><rect x="16" y="48" width="112" height="48"/);
+  assertPaddedClip(a, svgElements(a, 'text').find(text => text['clip-path']), { x: 16, y: 48, width: 112, height: 48 });
 });
 test('static default matches Setup exactly without changing identity or description', () => {
   // Arrange
@@ -314,14 +315,13 @@ test('static default matches Setup exactly without changing identity or descript
   assert.equal(svg, decode(createLaunchArtwork('ready', undefined, undefined, 'setup required')));
   assert.notEqual(svg, READY_SVG);
   assert.equal(captionOf(svg), undefined);
-  assert.match(svg, /aria-label="Setup required"/);
+  assertSetupWarning(svg);
   assert.equal(svg.includes('DeckForge'), false);
   assert.equal(manifest.Description, 'Script to canvas');
   assert.equal(manifest.UUID, 'git.renaudcerrato.deckforge');
   assert.equal(manifest.Name, 'DeckForge Commander');
   assert.equal(manifest.Author, 'Renaud Cerrato');
-  assert.ok(svg.endsWith('</svg>\n'));
-  assert.match(svg, /y="124"[^>]*>setup required<\/text>/);
+  assertSvgElement(svg, 'text', { text: 'setup required' }, { y: 124 });
 });
 test('configured Ready keeps its caption while Setup uses the warning icon', () => {
   // Arrange: static setup is not a new presentation kind or a configured default.
@@ -330,10 +330,10 @@ test('configured Ready keeps its caption while Setup uses the warning icon', () 
   const setup = decode(createLaunchArtwork('ready', undefined, undefined, 'setup required'));
   // Assert
   assert.equal(ready, READY_SVG);
-  assert.match(ready, /y="124"[^>]*>ready<\/text>/);
+  assertSvgElement(ready, 'text', { text: 'ready' }, { y: 124 });
   assert.equal(setup, SETUP_SVG);
   assert.equal(captionOf(setup), undefined);
-  assert.match(setup, /aria-label="Setup required"/);
+  assertSetupWarning(setup);
   assert.notEqual(setup, ready);
 });
 for (const [input, expected] of [['/program.py', 'program'], ['/private/report é😀.sh', 'report é😀'], ['/private/a\nb\rc\t.py', 'a b c'], ['/private/cafe\u0301.py', 'café'], ['/private/.config', '.config'], ['/private/report.tar.py', 'report.tar']]) {
@@ -357,14 +357,15 @@ for (const name of ['A'.repeat(300), '😀'.repeat(60), 'e\u0301'.repeat(100), '
     // Act
     const svg = decode(createLaunchArtwork('ready', label));
     const shown = captionOf(svg);
-    const size = Number(/<text[^>]*font-size="([\d.]+)"[^>]*clip-path=/.exec(svg)?.[1]);
+    const text = svgElements(svg, 'text').find(element => element['clip-path']);
+    const size = Number(text['font-size']);
     // Assert
     assert.equal(label, name.normalize('NFC'));
     assert.ok(shown.endsWith('…') && shown.length <= 128);
     assert.ok(size >= 16 && size <= 32);
     assert.equal(/\ud83d$/.test(shown.slice(0, -1)), false);
     if (name.startsWith('👨')) assert.equal(shown.slice(0, -1).split('👨‍👩‍👧‍👦').join(''), '');
-    assert.match(svg, /<rect x="16" y="48" width="112" height="48"/);
+    assertPaddedClip(svg, text, { x: 16, y: 48, width: 112, height: 48 });
   });
 }
 test('caption escapes markup and normalizes directional controls and malformed Unicode', () => {
@@ -393,7 +394,7 @@ for (const input of ['url(private)', '#abc', '#ffffff" onload="private', null]) 
     // Act
     const svg = decode(createLaunchArtwork('ready', 'program', color));
     // Assert
-    assert.ok(svg.includes('fill="#969696"'));
+    assertKeyFrame(svg, '#969696');
     assert.equal(/private|onload=/.test(svg), false);
   });
 }

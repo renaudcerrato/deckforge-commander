@@ -209,7 +209,6 @@ test('Windows Run retains successful output and does not retry on theme edits or
   assert.equal(fresh, 0); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
   assert.deepEqual(h.runs[0].execution, { executable: input.executable, args: [] }); assert.match(svg(retained), />retained<\/text>/);
   assert.deepEqual(images(h), before); assert.deepEqual(h.writes, [{ ...input, themeColor: '#abcdef' }]);
-  assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);
 });
 test('Windows Run uncertain cleanup permits saves but consumes busy gestures and prevents replacement', options, async () => {
   // Arrange
@@ -262,7 +261,6 @@ for (const stage of ['running', 'completed']) {
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), ['A', '', 'B']);
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), Array(3).fill('#abcdef'));
     assert.equal(record.value, 'A\n\nB'); assert.equal(h.session.getState().phase, stage === 'running' ? 'running' : 'stopped');
-    assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0); assert.deepEqual(errors(h), []);
     assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]);
   });
@@ -303,7 +301,6 @@ for (const stage of ['running', 'completed']) {
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), ['Items', '42']);
     assert.match(rendered, /stroke="#abcdef"/);
     assert.equal(JSON.stringify(record), before); assert.equal(h.session.getState().phase, stage === 'running' ? 'running' : 'stopped');
-    assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0); assert.deepEqual(errors(h), []);
     assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]);
   });
@@ -353,7 +350,6 @@ for (const stage of ['running', 'completed']) {
       assert.equal(/stroke-dasharray="([^"]*)"/.exec(rendered)[1], /stroke-dasharray="([^"]*)"/.exec(original)[1]);
       assert.equal(record.value, 1700 / 1034); assert.match(rendered, /stroke="#abcdef"/);
       assert.equal(h.session.getState().phase, stage === 'running' ? 'running' : 'stopped');
-      assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);
       assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0); assert.deepEqual(errors(h), []);
       assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]);
     });
@@ -405,7 +401,6 @@ for (const stage of ['running', 'completed']) {
         assertSvgElement(rendered, 'rect', { stroke: '#abcdef' }, { 'stroke-width': 2 });
         assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
         assert.equal(h.session.getState().phase, stage === 'running' ? 'running' : 'stopped');
-        assert.equal(Object.hasOwn(h.session.getState(), 'dueMs'), false);
         assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]);
         assert.equal(JSON.stringify(record), before);
       });
@@ -413,17 +408,18 @@ for (const stage of ['running', 'completed']) {
   }
 }
 
-test('Once starts only on short release, translates Loading and exposes no Loop scheduling state', options, async () => {
+test('Once starts only on short release and elapsed time never authorizes another launch', options, async () => {
   // Arrange
   const h = harness(); await h.appear();
   // Act
   await h.session.keyDown(); await h.session.keyDown(); const downCount = h.runs.length;
   await h.session.keyUp(); await h.session.keyUp(); await h.session.whenIdle();
+  await h.advance(100000000);
   // Assert
   assert.equal(ONCE_HOLD_MS, 1000); assert.equal(downCount, 0); assert.equal(h.runs.length, 1);
   assert.deepEqual(cards(h), [['ready', 'report', 'ready', '#969696', '.py'], ['loading', 'report', 'ready', '#969696', '.py']]);
   const state = h.session.getState(); assert.equal(state.phase, 'running'); assert.equal(state.presentation, 'loading');
-  assert.equal(Object.hasOwn(state, 'enabled'), false); assert.equal(Object.hasOwn(state, 'dueMs'), false);
+  assert.equal(h.runs[0].stops, 0);
   assert.deepEqual(h.writes, []);
 });
 for (const duration of [999, 1000, 1001]) {

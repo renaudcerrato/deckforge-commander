@@ -4,7 +4,9 @@
 
 Turn program output into live text, progress rings, and images. An open-source Stream Deck plugin for macOS and Windows.
 
-[Get started](#install-a-packaged-build) · [Examples](#examples) · [Protocol](#protocol) · [Build](#build-from-source)
+<p align="center">
+<a href="#install-a-packaged-build">Get started</a> · <a href="#examples">Examples</a> · <a href="#protocol">Protocol</a> · <a href="#build-from-source">Build</a>
+</p>
 
 <p align="center" width="100%">
 <img src="assets/hero.gif" width="520" alt="Animated Stream Deck Mini illustration showing four demos and native Loop and Run ready cards"/>
@@ -33,7 +35,7 @@ Try the [clocks, CPU, disk space, and counter demos](demos/README.md), or explor
 
 Choose how your program runs:
 
-<table>
+<table align="center">
 <thead><tr><th>Stream</th><th>Loop</th><th>Run</th></tr></thead>
 <tbody>
 <tr>

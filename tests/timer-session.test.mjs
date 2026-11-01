@@ -1863,10 +1863,56 @@ test('pending explicit default interval and cosmetic supersession preserve the o
   assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().persistenceBlocked, false);
 });
 
-// Resolved-promise turns flush callback continuations without advancing time or
-// resolving a deferred external boundary. There are no sleeps or real timers.
-async function flushCallbacks() {
-  for (let turn = 0; turn < 20; turn++) await Promise.resolve();
+// These scenarios hold a settings boundary closed after observing its entry.
+// One event-loop checkpoint drains all runnable promise work after timer delivery
+// or display release, without advancing the fake clock or confirming that save.
+function eventLoopCheckpoint() {
+  return new Promise(resolve => setImmediate(resolve));
+}
+
+// S2: persistence injection belongs at the public core boundary, not inside
+// an adapter's captured session. A newer Error invalidates each held handoff.
+for (const stage of ['setup', 'ready', 'producer']) {
+  test(`persistence failure invalidates held ${stage} handoff and permanently blocks replacement`, options, async () => {
+    // Arrange
+    const gate = deferred(), entered = deferred(); let hold = true;
+    const holdOnce = async () => { if (hold) { hold = false; entered.resolve(); await gate.promise; } };
+    const h = harness(stage === 'producer' ? { title: holdOnce } : { presentation: holdOnce });
+    let appearing;
+    if (stage === 'producer') {
+      await h.appear(); await h.tap();
+      h.runs[0].callbacks.onUpdate(image('obsolete')); await entered.promise;
+    } else {
+      appearing = h.appear(stage === 'setup' ? {} : base); await entered.promise;
+    }
+    const before = [...h.events];
+    // Act
+    const failing = h.session.persistenceFailed();
+    await eventLoopCheckpoint(); h.time.advance(100000); await eventLoopCheckpoint();
+    // Assert while held: no obsolete frame or replacement escapes the boundary.
+    const fixedError = ['error', 'Run state save failed.', 'STATE_SAVE_FAILED', '#969696'];
+    if (stage === 'producer') {
+      // The independent Error boundary may publish before the title gate opens.
+      assert.deepEqual(h.events.filter(event => event[0] !== 'error'), before);
+      for (const event of errors(h)) assert.deepEqual(event, fixedError);
+    } else assert.deepEqual(h.events, before);
+    assert.equal(h.runs.length, stage === 'producer' ? 1 : 0);
+    if (stage === 'producer') assert.equal(h.runs[0].stops, 1);
+    gate.resolve(); await Promise.all([appearing, failing]); await eventLoopCheckpoint(); await h.session.whenIdle();
+    assert.deepEqual(h.events.at(-1), fixedError);
+    if (stage === 'producer') {
+      h.runs[0].callbacks.onUpdate(image('stale'));
+      h.runs[0].callbacks.onError('Image protocol error.');
+    }
+    await h.tap(); await h.advance(100000);
+    // Assert after release: only the fixed Error may replace the held content.
+    assert.deepEqual(h.events.at(-1), fixedError);
+    assert.deepEqual(h.events.filter(event => event[0] !== 'error'), before);
+    for (const event of errors(h)) assert.deepEqual(event, fixedError);
+    assert.deepEqual(images(h), []); assert.deepEqual(cards(h), stage === 'producer' ? before.filter(event => ['ready', 'waiting'].includes(event[0])) : []);
+    if (stage === 'producer') assert.equal(h.runs[0].stops, 1);
+    assert.equal(h.runs.length, stage === 'producer' ? 1 : 0); assert.deepEqual(h.writes, []);
+  });
 }
 
 // Slice 1: recognize policy and phase at release; an ignored active Refresh
@@ -2025,6 +2071,7 @@ for (const interruption of ['hold', 'stop-tap']) {
     void h.session.keyDown();
     if (interruption === 'hold') h.time.advance(TIMER_HOLD_MS, false);
     const stopping = h.session.keyUp(); await h.runs[0].stopEntered.promise;
+    await eventLoopCheckpoint();
     const pending = h.session.getState(), count = h.runs.length;
     const readyPending = cards(h).filter(card => card[2] === 'ready').length;
     gate.resolve(); await Promise.all([editing, stopping]); await h.session.whenIdle(); await h.advance(100000);
@@ -2042,7 +2089,7 @@ test('overdue deadline during pending policy save cannot launch until latest sna
   await h.appear(); await h.tap(); await h.finish(); await h.advance(2000);
   // Act
   const editing = h.edit({ actionOnPress: 'stop' }); await entered.promise;
-  h.time.advance(4000); await flushCallbacks(); const count = h.runs.length, pending = h.session.getState();
+  h.time.advance(4000); await eventLoopCheckpoint(); const count = h.runs.length, pending = h.session.getState();
   gate.resolve(); await editing; await h.session.whenIdle();
   // Assert
   assert.equal(count, 1); assert.equal(pending.dueMs, 5000); assert.equal(pending.configurationPending, true);
@@ -2125,7 +2172,7 @@ test('pending policy edit during Loading must confirm latest complete snapshot b
   await h.appear(); void h.session.keyDown(); const launching = h.session.keyUp(); await entered.promise;
   // Act
   const editing = h.edit({ actionOnPress: 'stop' }); await saveEntered.promise;
-  loading.resolve(); await flushCallbacks(); const count = h.runs.length, pending = h.session.getState();
+  loading.resolve(); await eventLoopCheckpoint(); const count = h.runs.length, pending = h.session.getState();
   saved.resolve(); await Promise.all([launching, editing]); await h.session.whenIdle(); await h.tap();
   // Assert
   assert.equal(count, 0); assert.equal(pending.configurationPending, true); assert.equal(h.runs.length, 1);
@@ -2170,7 +2217,7 @@ for (const terminal of ['success', 'ordinary-error']) {
     // Act
     const completing = h.finish(terminal === 'success' ? success : { status: 'error', error: ordinaryError });
     await presentationEntered.promise; const cosmetic = h.edit({ themeColor: '#abcdef' }); await saveEntered.promise;
-    h.time.advance(3000); presented.resolve(); await flushCallbacks();
+    h.time.advance(3000); presented.resolve(); await eventLoopCheckpoint();
     const before = { state: h.session.getState(), runs: h.runs.length };
     saved.resolve(); await Promise.all([completing, cosmetic]); await h.session.whenIdle();
     const due = h.session.getState().dueMs;
@@ -2211,7 +2258,7 @@ for (const terminal of ['success', 'ordinary-error']) {
       if (interruption === 'execution') interrupted = h.edit({ executable: '/synthetic/new' });
       if (interruption === 'disconnect') interrupted = h.session.setConnected(false);
       if (interruption === 'new-generation') { void h.session.keyDown(); interrupted = h.session.keyUp(); }
-      presented.resolve(); await flushCallbacks();
+      presented.resolve(); await eventLoopCheckpoint();
       const pendingCount = h.runs.length; saved.resolve();
       await Promise.all([completing, cosmetic, interrupted]); await h.session.whenIdle();
       await h.session.setConnected(true); await h.appear(); await h.session.reconcileAvailability(); await h.advance(100000);
@@ -2238,7 +2285,7 @@ for (const superseding of ['theme', 'argv-migration', 'new-interval']) {
     const wake = h.session.reconcileAvailability();
     const latest = h.edit(superseding === 'theme' ? { themeColor: '#abcdef' }
       : superseding === 'argv-migration' ? { argsText: "'two words' literal" } : { intervalSeconds: 20 });
-    await flushCallbacks(); h.time.advance(3000);
+    await eventLoopCheckpoint(); h.time.advance(3000);
     const pending = { runs: h.runs.length, state: h.session.getState() };
     saved.resolve(); await Promise.all([interval, wake, latest]); await h.session.whenIdle();
     const seconds = superseding === 'new-interval' ? 20 : 10, due = h.session.getState().dueMs;
@@ -2327,7 +2374,7 @@ for (const terminal of ['success', 'ordinary-error']) {
       // Act
       const appearing = h.session.appear(h.coordinator.getSettings()); await presentationEntered.promise;
       const cosmetic = h.edit({ themeColor: '#abcdef' }); await saveEntered.promise;
-      h.time.advance(2000); presented.resolve(); await flushCallbacks();
+      h.time.advance(2000); presented.resolve(); await eventLoopCheckpoint();
       const pending = { runs: h.runs.length, state: h.session.getState() };
       saved.resolve(); await Promise.all([appearing, cosmetic]); await h.session.whenIdle();
       const restored = { runs: h.runs.length, due: h.session.getState().dueMs };
@@ -2368,7 +2415,7 @@ for (const terminal of ['success', 'ordinary-error']) {
       // Act
       const appearing = h.session.appear(h.coordinator.getSettings()); await presentationEntered.promise;
       const cosmetic = h.edit({ themeColor: '#abcdef' }); await saveEntered.promise;
-      h.time.advance(2000); presented.resolve(); await flushCallbacks();
+      h.time.advance(2000); presented.resolve(); await eventLoopCheckpoint();
       let interrupted;
       if (interruption === 'hold') {
         void h.session.keyDown(); h.time.advance(TIMER_HOLD_MS); interrupted = h.session.keyUp();
@@ -2409,7 +2456,7 @@ for (const terminal of ['success', 'ordinary-error']) {
     // Act
     const appearing = h.session.appear(h.coordinator.getSettings()); await presentationEntered.promise;
     const cosmetic = h.edit({ themeColor: '#abcdef' }); await saveEntered.promise;
-    h.time.advance(2000); presented.resolve(); await flushCallbacks(); const pendingCount = h.runs.length;
+    h.time.advance(2000); presented.resolve(); await eventLoopCheckpoint(); const pendingCount = h.runs.length;
     saved.resolve(); await Promise.all([appearing, cosmetic]); await h.session.whenIdle();
     await h.tap(); await h.session.reconcileAvailability(); await h.advance(100000);
     // Assert

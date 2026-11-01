@@ -86,7 +86,9 @@ for (const current of [VERSION, '0.1.0.0']) {
     const result = await planRelease(input);
     // Assert
     assert.deepEqual(result, { version: current, sha: SHA, release: current === VERSION });
-    assert.deepEqual(calls, [['show', `${BASE}:${MANIFEST}`], ['show', `${SHA}:${MANIFEST}`]]);
+    // Independent snapshot reads may occur in either order; exact tuples retain
+    // rejection of missing, duplicate, unexpected or misassociated arguments.
+    assert.deepEqual(calls.toSorted(), [['show', `${BASE}:${MANIFEST}`], ['show', `${SHA}:${MANIFEST}`]].toSorted());
   });
   test(`PR ${current} validates base/head without permitting release`, async () => {
     // Arrange
@@ -97,7 +99,7 @@ for (const current of [VERSION, '0.1.0.0']) {
     const result = await planRelease(input);
     // Assert
     assert.deepEqual(result, { version: current, sha: SHA, release: false });
-    assert.deepEqual(calls, [['show', `${BASE}:${MANIFEST}`], ['show', `${HEAD}:${MANIFEST}`]]);
+    assert.deepEqual(calls.toSorted(), [['show', `${BASE}:${MANIFEST}`], ['show', `${HEAD}:${MANIFEST}`]].toSorted());
   });
 }
 

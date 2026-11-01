@@ -38,7 +38,7 @@ function deferred() {
 // Delivery starts only after startProcessRun returns. stop acknowledges cleanup,
 // while close separately acknowledges reader/accepted-callback drain.
 function harness({ input = execution(), launchOptions, onUpdate, stop } = {}) {
-  const cleanup = deferred();
+  const cleanup = deferred(), stopEntered = deferred();
   const updates = [], errors = [], diagnostics = [], excerpts = [], details = [], submissions = [];
   let callbacks;
   let stopCalls = 0;
@@ -52,10 +52,10 @@ function harness({ input = execution(), launchOptions, onUpdate, stop } = {}) {
     startTransport(settings, deliveredCallbacks, env) {
       submissions.push({ execution: settings, env });
       callbacks = deliveredCallbacks;
-      return { stop() { stopCalls++; return stop ? stop(callbacks) : cleanup.promise; } };
+      return { stop() { stopCalls++; stopEntered.resolve(); return stop ? stop(callbacks) : cleanup.promise; } };
     },
   }, launchOptions);
-  return { run, callbacks, cleanup, updates, errors, diagnostics, excerpts, details, submissions,
+  return { run, callbacks, cleanup, stopEntered, updates, errors, diagnostics, excerpts, details, submissions,
     get stopCalls() { return stopCalls; } };
 }
 
@@ -70,9 +70,10 @@ function close(h, exit = success) {
   h.callbacks.onClose(exit);
 }
 
-async function microtaskCheckpoint() {
-  // Bounded deterministic promise checkpoint; no timers or real process probes.
-  for (let turn = 0; turn < 8; turn++) await Promise.resolve();
+function eventLoopCheckpoint() {
+  // Drain runnable promise continuations before checking noncompletion. Neither
+  // reader close nor the controlled cleanup promise can be released by this turn.
+  return new Promise(resolve => setImmediate(resolve));
 }
 
 test('PID-free transport delivers split UTF-8, CRLF and wire escapes through the shared parser', options, async () => {
@@ -127,11 +128,12 @@ for (const cleanupFirst of [false, true]) {
     // Act: natural cleanup must not turn into intentional stop or discard output.
     h.callbacks.onSpawn(); bytes(h, 'text:first\n');
     h.callbacks.onExit(success);
-    await microtaskCheckpoint();
+    await h.stopEntered.promise;
+    await eventLoopCheckpoint();
     const afterRoot = settled;
     bytes(h, 'text:final\n');
     if (cleanupFirst) h.cleanup.resolve(true); else close(h);
-    await microtaskCheckpoint();
+    await eventLoopCheckpoint();
     const afterOneGate = settled;
     if (cleanupFirst) close(h); else h.cleanup.resolve(true);
     const result = await h.run.done;
@@ -270,7 +272,8 @@ for (const spawned of [false, true]) {
     if (spawned) h.callbacks.onSpawn();
     h.callbacks.onError({ code: 'ENOENT', message: 'synthetic OS error', argv: ['excluded'], pid: 123 });
     close(h, { code: -1, terminated: false });
-    await microtaskCheckpoint();
+    await h.stopEntered.promise;
+    await eventLoopCheckpoint();
     const beforeCleanup = settled;
     h.cleanup.resolve(true);
     const result = await h.run.done;

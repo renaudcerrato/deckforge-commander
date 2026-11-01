@@ -20,7 +20,7 @@ function clock() {
 }
 // Objective: real bridge/controller and generated entry, with only DOM, transport and time faked.
 function harness({ built = false, loading = false } = {}) {
-  const fixture = createInspectorFixture(), f = fixture.fields;
+  const fixture = built ? createInspectorFixture(asset('run.html')) : createInspectorFixture(), f = fixture.fields;
   const time = clock(), sockets = [], errors = [], events = new Map();
   let bridge, controller, connect, dispose, chained = 0;
   class Socket {

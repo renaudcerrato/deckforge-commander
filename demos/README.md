@@ -69,11 +69,13 @@ Arguments:  '/absolute/path/to/my video.mp4' --ffmpeg '/absolute/path/to/ffmpeg'
 
 ## Clocks
 
-<img src="../assets/clock-preview.gif" width="200" alt="Cyan clock ticking once per second">
+<img src="../assets/clock-preview.gif" width="200" alt="Clock card with date, time, and weekday">
+
+Local time, date, and weekday using your system’s regional settings and the key’s theme color.
 
 ### [clock.sh](clock.sh) — macOS
 
-Cyan local time, updated every second. Uses POSIX `sh`, `date`, and `sleep`.
+No extra dependencies.
 
 ```text
 # Stream — tap the key to start or stop
@@ -83,7 +85,7 @@ Arguments:
 
 ### [clock.ps1](clock.ps1) — Windows
 
-Cyan local time, updated every second. Uses Windows PowerShell 5.1 on Windows 11 x64.
+Requires Windows PowerShell 5.1 on Windows 11 x64.
 
 ```text
 # Stream — tap the key to start or stop

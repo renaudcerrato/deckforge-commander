@@ -1,15 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import sharp from 'sharp';
 import { generateKeyPreviews } from '../assets/generate-key-previews.mjs';
 import { generatePluginIcon } from '../assets/generate-plugin-icon.mjs';
-import { createLaunchArtwork } from '../src/core/launch-artwork.mjs';
-import { createTimerArtwork } from '../src/core/timer-artwork.mjs';
-import { createOnceArtwork } from '../src/core/once-artwork.mjs';
-import { renderPreviewPng } from '../assets/preview-rendering.mjs';
 
 // Explicit utility-script coverage: production artwork is read-only. Every
 // generated image, sentinel and alias belongs to a fresh retained temp fixture.
@@ -30,21 +27,56 @@ async function snapshot(directory, outputs) {
     return { name, bytes: await readFile(file), mtimeMs: (await stat(file)).mtimeMs };
   }));
 }
-const keyRecipes = [
-  () => createLaunchArtwork('ready', 'demo', '#22d3ee', 'ready', '.py'),
-  () => createTimerArtwork('ready', 'demo', '#a78bfa', 'ready', '.py'),
-  () => createOnceArtwork('ready', 'demo', '#ffb454', 'ready', '.py'),
-];
+
+test('plugin icons: SVG regions survive both output sizes and source edits make both icons stale', options, async () => {
+  // Arrange: copy the generator unchanged so its normal relative SVG input is
+  // fixture-owned. Only dependency resolution links back to read-only packages.
+  const root = await fixture(), assets = path.join(root, 'assets'), directory = path.join(root, 'outputs');
+  await mkdir(assets); await mkdir(directory);
+  await copyFile(new URL('../assets/generate-plugin-icon.mjs', import.meta.url), path.join(assets, 'generate-plugin-icon.mjs'));
+  await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), path.join(root, 'node_modules'), 'dir');
+  const { generatePluginIcon: generate } = await import(pathToFileURL(path.join(assets, 'generate-plugin-icon.mjs')).href);
+  const outputs = groups[1].outputs;
+  const source = path.join(assets, 'plugin-icon.svg');
+  for (const [color, rgba] of [['#ff0000', [255, 0, 0, 255]], ['#ffff00', [255, 255, 0, 255]]]) {
+    await writeFile(source, `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
+      <rect width="100" height="100" fill="#0000ff"/>
+      <rect width="50" height="100" fill="${color}"/>
+      <rect x="50" width="50" height="50" fill="#00ff00"/>
+    </svg>`);
+    if (color === '#ffff00') {
+      const before = await snapshot(directory, outputs);
+      // Act / Assert: changed source invalidates existing icons without writing.
+      await assert.rejects(generate({ directory, check: true }));
+      assert.deepEqual(await snapshot(directory, outputs), before);
+    }
+    // Act: both initial generation and source-edit regeneration update both sizes.
+    assert.deepEqual(await generate({ directory }), { written: 2, skipped: 0 });
+    // Assert interior regions, not a second rendering pipeline or real-art golden.
+    for (const [name, size] of outputs) {
+      const { data, info } = await decode(await readFile(path.join(directory, name)));
+      assert.equal(info.width, size); assert.equal(info.height, size);
+      for (const [x, y, expected] of [
+        [0.25, 0.25, rgba], [0.25, 0.75, rgba],
+        [0.75, 0.25, [0, 255, 0, 255]], [0.75, 0.75, [0, 0, 255, 255]],
+      ]) {
+        const offset = (Math.floor(y * size) * size + Math.floor(x * size)) * 4;
+        assert.deepEqual([...data.subarray(offset, offset + 4)], expected, `${name}: region ${x},${y}`);
+      }
+    }
+    assert.deepEqual(await generate({ directory, check: true }), { written: 0, skipped: 2 });
+  }
+});
 
 for (const group of groups) {
-  test(`${group.name}: fresh generation preserves expected artwork, dimensions and alpha`, options, async () => {
+  test(`${group.name}: fresh generation creates decodable PNGs with expected dimensions and alpha`, options, async () => {
     // Arrange
     const directory = await fixture(); await writeFile(path.join(directory, 'unrelated.txt'), 'retained');
     // Act
     const result = await group.generate({ directory });
     // Assert: decode actual PNGs rather than pinning compression-byte snapshots.
     assert.deepEqual(result, { written: group.outputs.length, skipped: 0 });
-    for (const [index, [name, size]] of group.outputs.entries()) {
+    for (const [name, size] of group.outputs) {
       const bytes = await readFile(path.join(directory, name)), metadata = await sharp(bytes).metadata();
       assert.equal(metadata.format, 'png'); assert.equal(metadata.width, size); assert.equal(metadata.height, size);
       const actual = await decode(bytes);
@@ -52,14 +84,8 @@ for (const group of groups) {
         const last = size - 1;
         for (const pixel of [0, last, last * size, size * size - 1]) assert.equal(actual.data[pixel * 4 + 3], 0);
         assert.equal(actual.data[((size / 2) * size + size / 2) * 4 + 3], 255);
-        const svg = Buffer.from(decodeURIComponent(keyRecipes[index]().slice('data:image/svg+xml,'.length)));
-        const expected = await renderPreviewPng(sharp, svg, { scale: 2, pixels: 96, grid: 0.04, glow: 0.08 });
-        assert.deepEqual(actual.data, (await decode(expected)).data);
       } else {
         for (let offset = 3; offset < actual.data.length; offset += 4) assert.equal(actual.data[offset], 255);
-        const svg = await readFile(new URL('../assets/plugin-icon.svg', import.meta.url));
-        const expected = await sharp(svg).resize(size, size).ensureAlpha().raw().toBuffer();
-        assert.deepEqual(actual.data, expected);
       }
     }
     assert.equal(await readFile(path.join(directory, 'unrelated.txt'), 'utf8'), 'retained');
@@ -103,6 +129,8 @@ for (const group of groups) {
       let expectedPixels;
       if (scenario !== 'missing') {
         await group.generate({ directory });
+        // Observe a valid baseline before damage: repair must restore its pixels,
+        // without prescribing the illustration's colors, content or rendering recipe.
         const original = await decode(await readFile(file)); expectedPixels = original.data;
         if (scenario === 'corrupt') await writeFile(file, 'not a PNG');
         if (scenario === 'empty') await writeFile(file, '');

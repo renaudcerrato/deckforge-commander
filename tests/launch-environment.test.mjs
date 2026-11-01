@@ -244,10 +244,12 @@ for (const [label, make] of [
 // coordinators and metadata transformations below are the real project helpers.
 const adapterCodes = await loadAdapterCode(['run']);
 const registration = () => ({ plugin: { uuid: 'synthetic-plugin', version: '0.1.0.0' }, application: { version: '7.6', language: 'fr', platform: 'mac', platformVersion: '26' } });
+// All fake I/O resolves in microtasks unless explicitly gated. A check-phase turn
+// gives that work a progress opportunity without inspecting any core queue.
+const progress = () => new Promise(resolve => setImmediate(resolve));
 
 function adapterHarness() {
-  const launches = [], listeners = new Map(), sessions = [], states = [], replies = [], logs = [], registrations = [];
-  const launchCheckEntered = boundaryGate();
+  const launches = [], listeners = new Map(), replies = [], logs = [], registrations = [];
   const sdk = { info: registration(), logger: { info(value) { logs.push(value); }, warn(value) { logs.push(value); } },
     ui: { async sendToPropertyInspector(payload) { replies.push(structuredClone(payload)); } } };
   const sdkModule = { default: sdk, SingletonAction: class {}, action: () => value => value };
@@ -260,26 +262,16 @@ function adapterHarness() {
     callbacks.onDiagnostic('PROCESS_SPAWN_SUCCEEDED');
     return { done, async stop() { launch.stops++; resolve({ status: 'stopped' }); return true; } };
   } };
-  const syntheticProcess = { env: { ...stale(), PATH: '/synthetic/path' }, cwd: () => '/synthetic/cwd', platform: 'darwin' };
+  const syntheticProcess = { env: Object.freeze({ ...stale(), PATH: '/synthetic/path' }), cwd: () => '/synthetic/cwd', platform: 'darwin' };
   const isolatedRequire = createAdapterLoader(adapterCodes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-  }, observe(name, actual) {
-    if (name === '../core/action-session.mjs') return { ...actual, createActionSession(dependencies) {
-      const session = actual.createActionSession({ ...dependencies, confirmLaunchSettings(expected) {
-        launchCheckEntered.resolve(expected); return dependencies.confirmLaunchSettings(expected);
-      } }); sessions.push(session); return session;
-    } };
-    if (name === '../core/run-state.mjs') return { ...actual, createRunStateCoordinator(dependencies) {
-      const state = actual.createRunStateCoordinator(dependencies); states.push(state); return state;
-    } };
-    return actual;
-  } });
+   } });
   const exports = isolatedRequire('./run');
   const register = name => listener => { registrations.push(name); listeners.set(name, listener); return { dispose() {} }; };
   const action = new exports.RunAction({ onDeviceDidConnect: register('connect'), onDeviceDidDisconnect: register('disconnect'), onSystemDidWakeUp: register('wake') });
-  return { ...exports, action, sdk, launches, sessions, states, launchCheckEntered, replies, logs, registrations,
-    emit: (name, device) => listeners.get(name)?.({ device }) };
+  return { ...exports, action, sdk, launches, replies, logs, registrations,
+    async emit(name, device) { listeners.get(name)?.({ device }); await progress(); } };
 }
 
 function runtime(id = 'synthetic-key', initialSettings = { executable: '/synthetic/program', args: [], runRequested: true }) {
@@ -331,7 +323,7 @@ test('actual Stream theme edits isolate keys, preserve running snapshots and exp
   await startAdapter(h, first); await startAdapter(h, second); await claimInspector(h, first);
   const original = structuredClone(h.launches[0].snapshot), secondDisplay = [...second.display];
   // Act
-  await sendInspector(h, first, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } }); await h.sessions[0].whenIdle();
+  await sendInspector(h, first, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } });
   const runningCount = h.launches.length, runningStops = h.launches.map(launch => launch.stops);
   await h.action.onWillDisappear({ action: first }); await appear(h, first);
   // Assert
@@ -354,26 +346,25 @@ for (const failed of [false, true]) {
     r.setImage = async image => { await originalImage(image); if (artworkSvg(image).includes('>loading...</text>')) { loadingEntered.resolve(); await loading.promise; } };
     const starting = h.action.onKeyDown({ action: r, payload: { settings: initial } }); await loadingEntered.promise;
     // The explicit Start has local intent only; the theme edit is the first configuration write.
-    await h.states[0].whenIdle(); const started = await originalRead();
+    const started = await originalRead();
     r.getSettings = async () => { const snapshot = await originalRead(); readEntered.resolve(snapshot); return read.promise; };
     const editing = sendInspector(h, r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } });
     const snapshot = await readEntered.promise;
-    // Observe entry to the supplied boundary without replacing its actual implementation.
-    const session = h.sessions[0];
     // Act
-    loading.resolve(); const expected = await h.launchCheckEntered.promise;
+    loading.resolve(); await progress();
     const before = h.launches.length;
     await h.action.onDidReceiveSettings({ action: r, payload: { settings: started } });
     const afterRejectedHost = h.launches.length;
     read.resolve(failed ? started : Object.fromEntries(Object.entries(snapshot).reverse()));
-    await Promise.all([starting, editing]); await session.whenIdle();
+    await Promise.all([starting, editing]); await progress();
     // Assert: order-independent complete equality, not stale reports or legacy intent metadata.
     assert.equal(before, 0); assert.equal(afterRejectedHost, 0);
-    assert.equal(started.runRequested, false); assert.equal(expected.themeColor, '#abcdef'); assert.equal(expected.runRequested, false);
+    assert.equal(started.runRequested, false); assert.equal(snapshot.themeColor, '#abcdef'); assert.equal(snapshot.runRequested, false);
     assert.deepEqual(r.writes.map(value => value.runRequested), [false]);
     assert.equal(h.launches.length, failed ? 0 : 1);
-    if (failed) { assert.equal(session.getState().persistenceBlocked, true); assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED', '#abcdef')); }
-    else { assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, '#abcdef'); assert.equal(session.getState().persistenceBlocked, false); }
+    assert.equal(h.replies.at(-1).status, failed ? 'error' : 'saved');
+    if (failed) assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED', '#abcdef'));
+    else assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, '#abcdef');
   });
 }
 
@@ -387,7 +378,7 @@ async function pendingThemeLaunch(t) {
   const originalImage = r.setImage, originalRead = r.getSettings;
   r.setImage = async image => { await originalImage(image); if (artworkSvg(image).includes('>loading...</text>')) { loadingEntered.resolve(); await loading.promise; } };
   const starting = h.action.onKeyDown({ action: r, payload: { settings: initial } });
-  await loadingEntered.promise; await h.states[0].whenIdle();
+  await loadingEntered.promise;
   let holdRead = true;
   r.getSettings = async () => {
     const snapshot = await originalRead();
@@ -395,26 +386,26 @@ async function pendingThemeLaunch(t) {
     return snapshot;
   };
   const editing = sendInspector(h, r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } });
-  const snapshot = await readEntered.promise; loading.resolve(); await h.launchCheckEntered.promise;
+  const snapshot = await readEntered.promise; loading.resolve(); await progress();
   return { h, r, read, snapshot, starting, editing };
 }
 
-for (const loss of ['hide', 'disconnect', 'stop', 'execution', 'persistence']) {
+// Direct persistence injection at this boundary remains in action-session.test.mjs.
+for (const loss of ['hide', 'disconnect', 'stop', 'execution']) {
   test(`actual Stream ${loss} at the final authority wait prevents stale spawn without extra launch writes`, { timeout: 3000 }, async t => {
     // Arrange: local Started intent exists and Loading has finished; only theme readback remains pending.
     const { h, r, read, snapshot, starting, editing } = await pendingThemeLaunch(t);
     const before = h.launches.length;
     // Act
-    const transition = loss === 'hide' ? h.action.onWillDisappear({ action: r }) : loss === 'disconnect' ? h.sessions[0].setConnected(false)
+    const transition = loss === 'hide' ? h.action.onWillDisappear({ action: r }) : loss === 'disconnect' ? h.emit('disconnect', { ...r.device, isConnected: false })
       : loss === 'stop' ? h.action.onKeyDown({ action: r, payload: { settings: {} } })
-        : loss === 'execution' ? sendInspector(h, r, 'canvas:edit', 4, { changes: { executable: '/synthetic/replacement.sh' } })
-          : h.sessions[0].persistenceFailed();
-    read.resolve(snapshot); await Promise.all([starting, editing, transition]); await h.sessions[0].whenIdle(); await h.states[0].whenIdle();
+         : sendInspector(h, r, 'canvas:edit', 4, { changes: { executable: '/synthetic/replacement.sh' } });
+    await progress();
+    read.resolve(snapshot); await Promise.all([starting, editing, transition]); await progress();
     // Assert
     assert.equal(before, 0); assert.deepEqual(h.launches, []);
     assert.deepEqual(r.writes.map(value => value.runRequested), loss === 'execution' ? [false, false] : [false]);
-    if (loss === 'persistence') assert.equal(h.sessions[0].getState().persistenceBlocked, true);
-    else assert.equal(h.sessions[0].getState().persistenceBlocked, false);
+    assert.equal(h.replies.at(-1).status, 'saved');
   });
 }
 
@@ -427,12 +418,11 @@ for (const oldResult of ['match', 'mismatch', 'reject']) {
     // The real adapter stages configuration before its first save await.
     if (oldResult === 'reject') read.reject(Error('superseded synthetic read'));
     else read.resolve(oldResult === 'match' ? snapshot : { ...snapshot, themeColor: '#000000' });
-    await Promise.all([starting, editing, newer]); await h.sessions[0].whenIdle();
+    await Promise.all([starting, editing, newer]); await progress();
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, '#fedcba');
     assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes.map(value => value.runRequested), [false, false]);
     assert.deepEqual(r.writes.map(value => value.themeColor), ['#abcdef', '#fedcba']);
-    assert.equal(h.sessions[0].getState().persistenceBlocked, false); assert.equal(h.states[0].isBlocked(), false);
     assert.equal(h.replies.at(-1).status, 'saved');
   });
 }
@@ -446,7 +436,7 @@ test('actual Stream adapter keeps suffix badges independent and redraws a suffix
   const secondDisplay = [...second.display];
   // Act
   await sendInspector(h, first, 'canvas:edit', 3, { changes: { executable: '/synthetic/report.GZ' } });
-  await Promise.all(h.sessions.map(session => session.whenIdle()));
+  await progress();
   // Assert
   assert.match(artworkSvg(first.display.at(-1)[1]), /text-anchor="end"[^>]*>\.gz<\/text>.*>report<\/text>/);
   assert.match(artworkSvg(second.display.at(-1)[1]), /text-anchor="end"[^>]*>\.sh<\/text>/);
@@ -460,8 +450,8 @@ for (const output of [false, true]) {
     const h = adapterHarness(), r = runtime('synthetic-badge-run', { executable: '/synthetic/report.PY', argsText: 'other.sh', runRequested: true });
     t.after(() => h.action.onWillDisappear({ action: r })); await startAdapter(h, r);
     // Act
-    if (output) { h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,AAAA' }); await h.sessions[0].whenIdle(); }
-    h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' }); await h.sessions[0].whenIdle();
+    if (output) { h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,AAAA' }); await progress(); }
+    h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' }); await progress();
     const frames = r.display.filter(([kind]) => kind === 'image').map(([, value]) => value);
     // Assert
     assert.match(artworkSvg(frames[0]), />\.py<\/text>.*>report<\/text>.*>loading\.\.\.<\/text>/);
@@ -472,7 +462,7 @@ for (const output of [false, true]) {
   });
 }
 
-for (const loss of ['hide', 'disconnect', 'persistence']) {
+for (const loss of ['hide', 'disconnect']) {
   test(`actual Stream title-clear boundary cannot hand off stale badge after ${loss}`, { timeout: 3000 }, async t => {
     // Arrange
     const h = adapterHarness(), r = runtime('synthetic-held-badge', { executable: '/synthetic/report.py', argsText: '', runRequested: false });
@@ -482,12 +472,11 @@ for (const loss of ['hide', 'disconnect', 'persistence']) {
     const appearing = appear(h, r); await entered.promise;
     // Act
     const transition = loss === 'hide' ? h.action.onWillDisappear({ action: r })
-      : loss === 'disconnect' ? h.sessions[0].setConnected(false) : h.sessions[0].persistenceFailed();
-    gate.resolve(); await Promise.all([appearing, transition]); await h.sessions[0].whenIdle();
+      : h.emit('disconnect', { ...r.device, isConnected: false });
+    await progress(); gate.resolve(); await Promise.all([appearing, transition]); await progress();
     // Assert
     assert.equal(r.display.filter(([kind]) => kind === 'image').some(([, value]) => artworkSvg(value).includes('>.py</text>')), false);
     assert.deepEqual(h.launches, []);
-    if (loss === 'persistence') assert.match(artworkSvg(r.display.at(-1)[1]), />Error<\/text>.*>STATE<\/text>/);
   });
 }
 
@@ -501,12 +490,11 @@ for (const [index, input] of [{}, { executable: '', argsText: '' }, { args: ['li
     await appear(h, r);
     await h.action.onKeyDown({ action: r, payload: { settings: input } });
     await h.action.onKeyDown({ action: r, payload: { settings: { executable: '/synthetic/stale', argsText: '', runRequested: true } } });
-    await h.sessions[0].whenIdle();
+    await progress();
     // Assert
     assert.match(artworkSvg(r.display.at(-1)[1]), /aria-label="Setup required".*>setup required<\/text>/);
     assert.deepEqual(r.display.filter(([kind]) => kind === 'title'), [['title', '']]);
     assert.deepEqual(r.writes, []); assert.deepEqual(h.launches, []);
-    assert.equal(h.sessions[0].getState().runRequested, false); assert.equal(h.sessions[0].getState().phase, 'stopped');
   });
 }
 for (const input of [{ runRequested: 'malformed' }, { executable: 'relative', argsText: '' }]) {
@@ -515,31 +503,15 @@ for (const input of [{ runRequested: 'malformed' }, { executable: 'relative', ar
     const h = adapterHarness(), r = runtime('synthetic-invalid-setup', input);
     t.after(() => h.action.onWillDisappear({ action: r }));
     // Act
-    await appear(h, r); await h.sessions[0].whenIdle();
+    await appear(h, r); await progress();
     // Assert
-    assert.equal(h.sessions[0].getState().presentation, 'error');
+    assert.match(artworkSvg(r.display.at(-1)[1]), />Error<\/text>/);
     assert.equal(r.display.some(([kind, image]) => kind === 'image' && artworkSvg(image).includes('setup required')), false);
     assert.ok(r.display.filter(([kind]) => kind === 'title').every(([, title]) => title === ''));
     assert.deepEqual(h.launches, []);
     assert.equal(r.writes.length, 0);
   });
 }
-test('actual Run adapter rejects delayed Setup image after newer persistence Error', { timeout: 3000 }, async t => {
-  // Arrange
-  const h = adapterHarness(), r = runtime('synthetic-stale-setup', {}), entered = boundaryGate(), gate = boundaryGate();
-  t.after(() => h.action.onWillDisappear({ action: r }));
-  let delay = true;
-  r.setTitle = async title => { r.display.push(['title', title]); if (delay) { delay = false; entered.resolve(); await gate.promise; } };
-  // Act
-  const appearing = appear(h, r); await entered.promise;
-  const failing = h.sessions[0].persistenceFailed(); gate.resolve();
-  await Promise.all([appearing, failing]); await h.sessions[0].whenIdle();
-  // Assert
-  assert.equal(h.sessions[0].getState().presentation, 'error');
-  assert.equal(r.display.some(([kind, image]) => kind === 'image' && artworkSvg(image).includes('setup required')), false);
-  assert.ok(r.display.filter(([kind]) => kind === 'title').every(([, title]) => title === ''));
-  assert.deepEqual(h.launches, []); assert.deepEqual(r.writes, []);
-});
 test('actual Run adapter delayed Setup cannot overwrite newer confirmed Ready after PI configuration', { timeout: 3000 }, async t => {
   // Arrange
   const h = adapterHarness(), r = runtime('synthetic-stale-setup-ready', {}), entered = boundaryGate(), gate = boundaryGate();
@@ -549,12 +521,11 @@ test('actual Run adapter delayed Setup cannot overwrite newer confirmed Ready af
   // Act
   const appearing = appear(h, r); await entered.promise; await claimInspector(h, r);
   const editing = sendInspector(h, r, 'canvas:edit', 3, { changes: { executable: '/synthetic/report.py' } });
-  gate.resolve(); await Promise.all([appearing, editing]); await h.sessions[0].whenIdle();
+  gate.resolve(); await Promise.all([appearing, editing]); await progress();
   // Assert
   assert.equal(r.display.some(([kind, image]) => kind === 'image' && artworkSvg(image).includes('setup required')), false);
   assert.match(artworkSvg(r.display.at(-1)[1]), />report<\/text>.*>ready<\/text>/);
   assert.equal(h.replies.at(-1)?.status, 'saved'); assert.deepEqual(h.launches, []);
-  assert.equal(h.sessions[0].getState().runRequested, false);
   assert.deepEqual(await r.getSettings(), { executable: '/synthetic/report.py', argsText: '' });
 });
 
@@ -564,10 +535,10 @@ for (const output of [false, true]) {
     const h = adapterHarness(), r = runtime();
     t.after(() => h.action.onWillDisappear({ action: r }));
     await startAdapter(h, r);
-    if (output) { h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,AAAA' }); await h.sessions[0].whenIdle(); }
+    if (output) { h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,AAAA' }); await progress(); }
     // Act
     h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' });
-    await h.sessions[0].whenIdle();
+    await progress();
     const saved = await r.getSettings();
     await appear(h, r);
     // Assert
@@ -581,7 +552,6 @@ for (const output of [false, true]) {
     assert.deepEqual(r.writes, []);
     assert.deepEqual(saved, { executable: '/synthetic/program', args: [], runRequested: true });
     assert.equal(h.launches.length, 1);
-    assert.equal(h.sessions[0].getState().presentation, 'ready');
   });
 }
 
@@ -590,7 +560,7 @@ test('actual adapter fresh Stopped key uses ready while another key retains sess
   const h = adapterHarness(), r = runtime();
   t.after(async () => { await h.action.onWillDisappear({ action: r }); await h.action.onWillDisappear({ action: fresh }); });
   await startAdapter(h, r);
-  h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' }); await h.sessions[0].whenIdle();
+  h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' }); await progress();
   const fresh = runtime('synthetic-fresh', await r.getSettings());
   // Act
   await appear(h, fresh);
@@ -602,7 +572,8 @@ test('actual adapter fresh Stopped key uses ready while another key retains sess
   assert.equal(h.launches.length, 1);
 });
 
-for (const superseding of ['start', 'persistence error']) {
+// Core-only persistence supersession is covered by deferred exited publication tests.
+for (const superseding of ['start']) {
   test(`actual adapter rechecks title-clear guard so delayed exited SVG cannot replace newer ${superseding}`, { timeout: 3000 }, async t => {
     // Arrange
     const h = adapterHarness(), r = runtime(), gate = boundaryGate(), entered = boundaryGate();
@@ -612,16 +583,13 @@ for (const superseding of ['start', 'persistence error']) {
     r.setTitle = async title => { r.display.push(['title', title]); if (delay) { delay = false; entered.resolve(); await gate.promise; } };
     // Act
     h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); h.launches[0].resolve({ status: 'success' }); await entered.promise;
-    const transition = superseding === 'start'
-      ? h.action.onKeyDown({ action: r, payload: { settings: await r.getSettings() } })
-      : h.sessions[0].persistenceFailed();
-    gate.resolve(); await transition; await h.sessions[0].whenIdle();
+    const transition = h.action.onKeyDown({ action: r, payload: { settings: await r.getSettings() } });
+    gate.resolve(); await transition; await progress();
     // Assert
     const images = r.display.filter(item => item[0] === 'image').map(item => artworkSvg(item[1]));
     assert.equal(images.some(svg => />exited<\/text>/.test(svg)), false);
     assert.ok(r.display.filter(item => item[0] === 'title').every(item => item[1] === ''));
-    if (superseding === 'start') { assert.match(images.at(-1), />program<\/text>.*>loading\.\.\.<\/text>/); assert.equal(h.launches.length, 2); }
-    else { assert.match(images.at(-1), />Error<\/text>.*>STATE<\/text>/); assert.equal(h.launches.length, 1); }
+    assert.match(images.at(-1), />program<\/text>.*>loading\.\.\.<\/text>/); assert.equal(h.launches.length, 2);
   });
 }
 
@@ -633,13 +601,12 @@ for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNA
     await startAdapter(h, r);
     // Act
     h.launches[0].callbacks.onDiagnostic(diagnostic);
-    h.launches[0].resolve({ status: 'error', error: 'Program exited unsuccessfully.' }); await h.sessions[0].whenIdle();
+    h.launches[0].resolve({ status: 'error', error: 'Program exited unsuccessfully.' }); await progress();
     // Assert
     assert.equal(r.display.at(-1)[1], createErrorArtwork(diagnostic));
     assert.deepEqual(r.display.at(-2), ['title', '']);
     assert.equal(r.display.filter(item => item[0] === 'image').some(item => />exited<\/text>/.test(artworkSvg(item[1]))), false);
     assert.equal(h.launches.length, 1);
-    assert.equal(h.sessions[0].getState().runRequested, false);
   });
 }
 
@@ -765,7 +732,6 @@ for (const started of [false, true]) test(`extracted Stream adopts legacy ${star
   assert.deepEqual(r.writes, []);
   assert.deepEqual(await r.getSettings(), initial);
   assert.equal(h.launches.length, 0);
-  assert.equal(h.sessions[0].getState().runRequested, false);
   assert.match(artworkSvg(r.display.at(-1)[1]), />program<\/text>.*>ready<\/text>/);
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_ARG')), false);
 });
@@ -786,7 +752,6 @@ test('extracted Stream toggles local intent without writes and ignores late key 
   assert.deepEqual(h.launches[0].settings, { executable: initial.executable, args: initial.args, cwd: initial.cwd });
   assert.equal(h.launches.length, 1);
   assert.equal(h.launches[0].stops, 1);
-  assert.equal(h.sessions[0].getState().runRequested, false);
 });
 
 test('extracted Stream refuses launch when complete configuration readback does not match its write', adapterOptions, async t => {
@@ -800,12 +765,11 @@ test('extracted Stream refuses launch when complete configuration readback does 
   // Act
   await sendInspector(h, r, 'canvas:edit', 3, { changes: { argsText: 'changed' } });
   await h.action.onKeyDown({ action: r, payload: { settings: initial } });
-  await h.sessions[0].whenIdle();
+  await progress();
   await h.action.onKeyDown({ action: r, payload: { settings: initial } });
   // Assert
   assert.deepEqual(r.writes, [{ ...initial, argsText: 'changed' }]);
   assert.equal(h.launches.length, 0);
-  assert.equal(h.sessions[0].getState().persistenceBlocked, true);
   assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED'));
 });
 
@@ -819,13 +783,12 @@ for (const execution of [false, true]) test(`shared PI claimed ${execution ? 'ex
   const changes = execution ? { argsText: '"SYNTHETIC_PRIVATE_ARG"', cwd: '/synthetic/new-cwd' } : { themeColor: '#123456' };
   // Act
   await sendInspector(h, r, 'canvas:edit', 3, { changes });
-  await h.sessions[0].whenIdle();
+  await progress();
   // Assert: claim/hydration never writes or launches; only execution edits stop.
   assert.equal(hydrationWrites, 0);
   assert.deepEqual(r.writes, [{ ...initial, ...changes }]);
   assert.equal(h.launches.length, 1);
   assert.equal(h.launches[0].stops, execution ? 1 : 0);
-  assert.equal(h.sessions[0].getState().runRequested, !execution);
   assert.deepEqual(h.replies.at(-1), { status: 'saved', settings: r.writes[0], type: 'canvas:reply',
     context: r.id, inspectorId: 'synthetic-inspector', requestId: 3 });
   if (execution) assert.match(artworkSvg(r.display.at(-1)[1]), />program<\/text>.*>ready<\/text>/);
@@ -908,13 +871,12 @@ test('shared runtime drops a producer frame held at title clearing when the key 
   h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,AAAA' });
   await entered.promise;
   const hiding = h.action.onWillDisappear({ action: r });
-  gate.resolve(); await hiding; await h.sessions[0].whenIdle();
+  gate.resolve(); await hiding; await progress();
   h.launches[0].callbacks.onUpdate({ kind: 'image', image: 'data:image/png;base64,BBBB' });
-  await h.sessions[0].whenIdle();
+  await progress();
   // Assert: existing positive output tests cover handoff; hidden and late frames do not hand off.
   assert.equal(r.display.filter(([kind]) => kind === 'image').length, before);
   assert.equal(h.launches[0].stops, 1);
-  assert.equal(h.sessions[0].getState().visible, false);
   assert.deepEqual(r.writes, []);
 });
 
@@ -925,15 +887,12 @@ test('extracted Singleton Run registers hooks once and scopes disconnect/resume 
   t.after(async () => { await h.action.onWillDisappear({ action: first }); await h.action.onWillDisappear({ action: second }); });
   await startAdapter(h, first); await startAdapter(h, second); await appear(h, first);
   // Act
-  h.emit('disconnect', { id: 'synthetic-foreign-device', isConnected: false });
-  await Promise.all(h.sessions.map(session => session.whenIdle()));
+  await h.emit('disconnect', { id: 'synthetic-foreign-device', isConnected: false });
   const foreignStops = h.launches.map(launch => launch.stops);
-  first.device.isConnected = false; h.emit('disconnect', first.device);
-  await h.sessions[0].whenIdle();
+  first.device.isConnected = false; await h.emit('disconnect', first.device);
   first.device.name = 'synthetic-resumed'; delete first.device.size; first.coordinates = null;
   delete h.sdk.info.application.language;
-  first.device.isConnected = true; h.emit('connect', first.device); h.emit('connect', first.device); h.emit('wake');
-  await Promise.all(h.sessions.map(session => session.whenIdle()));
+  first.device.isConnected = true; await h.emit('connect', first.device); await h.emit('connect', first.device); await h.emit('wake');
   // Assert: fresh missing metadata has no stale fallback, other keys remain running.
   assert.deepEqual(h.registrations, ['connect', 'disconnect', 'wake']);
   assert.deepEqual(foreignStops, [0, 0]);

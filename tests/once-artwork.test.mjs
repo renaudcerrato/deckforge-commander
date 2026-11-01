@@ -5,9 +5,10 @@ import { ONCE_READY_SVG, ONCE_SETUP_SVG, createOnceArtwork } from '../src/core/o
 import { createOnceKeyLayout } from '../src/core/key-layout.mjs';
 import { createLaunchArtwork } from '../src/core/launch-artwork.mjs';
 import { createTimerArtwork } from '../src/core/timer-artwork.mjs';
+import { svgElements, assertBadgeAddition, assertKeyFrame, assertSetupWarning, assertPaddedClip } from './helpers/svg-harness.mjs';
 
 const decode = image => decodeURIComponent(image.slice('data:image/svg+xml,'.length));
-const caption = svg => /clip-path="url\(#caption-clip\)"[^>]*>([^<]*)<\/text>/.exec(svg)?.[1];
+const caption = svg => svgElements(svg, 'text').find(text => text['clip-path'])?.text;
 
 // Objective: Run changes only its header and fixed footer; shared logical geometry stays intact.
 for (const [kind, footer, expected] of [['ready', undefined, 'ready'], ['loading', 'success', 'loading...'],
@@ -23,10 +24,9 @@ for (const [kind, footer, expected] of [['ready', undefined, 'ready'], ['loading
     assert.equal(actual, stream.replace('>Stream</text>', '>Run</text>').replace('>ready</text>', `>${expected}</text>`));
     assert.equal(loop, stream.replace('>Stream</text>', '>Loop</text>'));
     assert.equal(actual, createOnceKeyLayout('report', '#ABCDEF', expected));
-    assert.match(actual, /width="144" height="144" viewBox="0 0 144 144"/);
-    assert.match(actual, /fill="#000000"/);
+    assertKeyFrame(actual, '#abcdef');
     assert.equal(caption(actual), expected === 'setup required' ? undefined : 'report');
-    if (expected === 'setup required') assert.match(actual, /aria-label="Setup required"/);
+    if (expected === 'setup required') assertSetupWarning(actual);
   });
 }
 test('Run static manifest Setup is exact including newline and distinct from configured Ready', () => {
@@ -40,21 +40,24 @@ test('Run static manifest Setup is exact including newline and distinct from con
   // Assert
   assert.equal(asset, ONCE_SETUP_SVG); assert.equal(configured, ONCE_READY_SVG);
   assert.equal(asset, decode(createOnceArtwork('ready', undefined, undefined, 'setup required')));
-  assert.notEqual(asset, configured); assert.ok(asset.endsWith('</svg>\n'));
+  assert.notEqual(asset, configured); assertKeyFrame(asset, '#969696');
   assert.equal(caption(asset), undefined);
-  assert.match(asset, /aria-label="Setup required"/);
+  assertSetupWarning(asset);
   assert.equal(asset.includes('DeckForge'), false);
 });
 const hostile = () => new Proxy({}, { get() { throw Error('Synthetic forbidden coercion'); } });
 for (const render of [createLaunchArtwork, createTimerArtwork, createOnceArtwork]) {
   test('Setup ignores hostile captions and extensions and shows only its warning', () => {
+    // Arrange
     let reads = 0;
     const input = new Proxy({}, { get() { reads++; throw Error('Unexpected access.'); } });
+    // Act
     const actual = render('ready', input, '#ABCDEF', 'setup required', input);
+    // Assert
     assert.equal(actual, render('ready', undefined, '#ABCDEF', 'setup required'));
     assert.equal(reads, 0);
     assert.equal(caption(decode(actual)), undefined);
-    assert.match(decode(actual), /aria-label="Setup required"/);
+    assertSetupWarning(decode(actual));
   });
 }
 for (const [name, input] of [['null', null], ['boxed', new String('success')], ['proxy', hostile()],
@@ -90,7 +93,7 @@ for (const [input, expected] of [['a/cafe\u0301', 'a/café'], ['<x&"\'>', '&lt;x
     outputs.push(decode(createOnceArtwork('loading', input)));
     // Assert
     assert.equal(caption(outputs[2]), undefined);
-    assert.match(outputs[2], /aria-label="Setup required"/);
+    assertSetupWarning(outputs[2]);
     assert.ok(outputs.filter((_, index) => index !== 2).every(svg => caption(svg) === expected));
     assert.ok(outputs.every(svg => !/<script|foreignObject|onload=/.test(svg)));
   });
@@ -102,17 +105,19 @@ test('Run long grapheme caption ellipsizes without splitting a family cluster', 
   const actual = decode(createOnceArtwork('ready', family.repeat(20)));
   // Assert
   const shown = caption(actual); assert.ok(shown.endsWith('…'));
-  assert.equal(shown.slice(0, -1).split(family).join(''), ''); assert.match(actual, /font-size="16"[^>]*clip-path=/);
+  assert.equal(shown.slice(0, -1).split(family).join(''), '');
+  const text = svgElements(actual, 'text').find(element => element['clip-path']);
+  assert.equal(Number(text['font-size']), 16);
+  assertPaddedClip(actual, text, { x: 16, y: 48, width: 112, height: 48 });
 });
 for (const [kind, footer] of [['ready', 'ready'], ['loading', 'success'], ['ready', 'success']]) {
   test(`Run ${kind}/${footer} adds only a normalized executable badge`, () => {
     // Arrange
     const expected = decode(createOnceArtwork(kind, 'report', '#ABCDEF', footer));
-    const badge = '<text x="124" y="32" text-anchor="end" font-family="Arial,sans-serif" font-size="16" fill="#abcdef">.py</text>';
     // Act
     const actual = decode(createOnceArtwork(kind, 'report', '#ABCDEF', footer, '.PY'));
     // Assert
-    assert.equal(actual, expected.replace('>Run</text>', `>Run</text>${badge}`));
+    assertBadgeAddition(expected, actual, '.py', '#abcdef');
   });
 }
 for (const input of ['py', '.tar.gz', '/synthetic.py', '.www', '.p\0y', '.'.padEnd(8193, 'x'), hostile(), new String('.py')]) {

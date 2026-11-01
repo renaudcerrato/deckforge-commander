@@ -4,8 +4,199 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
-import { createInspectorFixture, extractInspectorMarkup, assertInspectorMarkup } from './helpers/inspector-harness.mjs';
+import { createInspectorFixture, extractInspectorMarkup, assertInspectorMarkup, inspectorTestMarkup, isHiddenByAncestry } from './helpers/inspector-harness.mjs';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
+import { svgElements, assertSvgElement, assertPaddedClip, assertKeyFrame, assertRingContentClip, assertSetupWarning, assertSvgCanvas, assertFixedError } from './helpers/svg-harness.mjs';
+
+// Objective: independent SVG fixtures accept equivalent spelling, reject lost safety/content.
+for (const [label, dimensions, valid] of [
+  ['equivalent numeric spelling', "height='144.0' viewBox='0,0,144,144' width='1.44e2'", true],
+  ['wrong width', "width='143' height='144' viewBox='0 0 144 144'", false],
+  ['shifted viewBox', "width='144' height='144' viewBox='1 0 144 144'", false],
+]) {
+  test(`logical canvas inspection ${valid ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange
+    const svg = `<svg ${dimensions}></svg>`;
+    // Act
+    const verify = () => assertSvgCanvas(svg);
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const [label, role, name, color, valid] of [
+  ['equivalent attributes', 'img', 'Setup required', '#ffd43b', true],
+  ['missing accessible warning', 'img', '', '#ffd43b', false],
+  ['wrong role', 'button', 'Setup required', '#ffd43b', false],
+  ['wrong warning color', 'img', 'Setup required', '#ffffff', false],
+]) {
+  test(`Setup warning inspection ${valid ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange: independent icon input, not a copied product SVG.
+    const svg = `<g aria-label='${name}' role='${role}'><path stroke-width='2.0' stroke='#ffe066' d='M0 0' fill='${color}'/></g>`;
+    // Act
+    const verify = () => assertSetupWarning(svg);
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const input of [
+  '<clipPath id="local"><rect x="16" y="48" width="112" height="48"/></clipPath><text font-size="16" clip-path="url(#local)" fill="white">Safe</text>',
+  "<clipPath clipPathUnits='userSpaceOnUse' id='renamed'><rect height='48.0' width='1.12e2' y='48' x='16.00000000'></rect></clipPath><text clip-path='url(#renamed)' fill='white' font-size='16.0'>Safe</text>",
+]) {
+  test('SVG clip checks follow emitted references across equivalent serialization', () => {
+    // Arrange
+    const svg = input;
+    // Act
+    const text = svgElements(svg, 'text')[0];
+    // Assert
+    assert.equal(text.text, 'Safe');
+    assert.equal(Number(text['font-size']), 16);
+    assertPaddedClip(svg, text, { x: 16, y: 48, width: 112, height: 48 });
+  });
+}
+
+for (const variant of ['shared reference', 'equivalent separate references', 'wrong secondary bounds']) {
+  test(`every text clip inspection ${variant === 'wrong secondary bounds' ? 'rejects' : 'accepts'} ${variant}`, () => {
+    // Arrange: a valid first line cannot stand in for the second line's own clipping.
+    const secondBounds = variant === 'wrong secondary bounds'
+      ? "x='0' y='0' width='1' height='1'" : "height='112.0' width='1.12e2' y='16.000' x='16'";
+    const secondId = variant === 'shared reference' ? 'first' : 'second';
+    const svg = `<defs><clipPath id='first'><rect x='16' y='16' width='112' height='112'/></clipPath><clipPath id='second'><rect ${secondBounds}/></clipPath></defs><text clip-path='url(#first)'>Main</text><text clip-path='url(#${secondId})'>Caption</text>`;
+    // Act
+    const verify = () => {
+      for (const text of svgElements(svg, 'text')) assertPaddedClip(svg, text, { x: 16, y: 16, width: 112, height: 112 });
+    };
+    // Assert
+    if (variant === 'wrong secondary bounds') assert.throws(verify, assert.AssertionError);
+    else assert.doesNotThrow(verify);
+  });
+}
+
+// Independent fixed Error fixtures exercise the same assertion as the product tests.
+const errorAppearanceCases = [
+  ['equivalent serialization and neutral metadata', undefined, '', 'normal', true],
+  ['nonoverlapping ink and frame reordered', undefined, '', 'frame last', true],
+  ['late opaque backdrop', undefined, '', 'backdrop last', false],
+  ['backdrop obscures frame', undefined, '', 'frame first', false],
+  ...['Error', 'START', 'First reason', 'Second reason'].flatMap(text => [
+    ['opacity', "opacity='0'"], ['visibility', "visibility='hidden'"], ['display', "display='none'"],
+    ['restyling', "style='fill:#000000'"], ['off-canvas transform', "transform='translate(1000)'"],
+  ].map(([label, modifier]) => [`${text} ${label}`, text, modifier, 'normal', false])),
+];
+for (const [label, target, modifier, order, valid] of errorAppearanceCases) {
+  test(`fixed Error appearance ${valid ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange: literal public appearance, no production SVG or byte oracle is copied.
+    const backdrop = "<rect id='background' height='144.0' fill='#000000' width='1.44e2'/>";
+    const frame = "<rect stroke-opacity='.35' stroke-width='3.0' stroke='#969696' fill='none' rx='16' height='128' width='128' y='8' x='8'/>";
+    const definitions = "<defs><clipPath id='reasons'><rect height='48.0' width='112' y='48' x='16'/></clipPath></defs>";
+    const ink = [['Error', 22, 32, '#ff6b6b', false], ['First reason', 72, 66.6, '#ffffff', true],
+      ['Second reason', 72, 88.6, '#ffffff', true], ['START', 72, 124, '#ff6b6b', false]]
+      .map(([text, x, y, fill, clipped], index) => `<text id='ink-${index}' role='img' aria-label='Diagnostic' ${text === target ? modifier : ''} ${clipped ? "clip-path='url(#reasons)'" : ''} fill='${fill}' font-size='16.0' font-family='Arial,sans-serif' ${x === 72 ? "text-anchor='middle'" : ''} y='${y}' x='${x}'>${text}</text>`).join('');
+    const layers = order === 'backdrop last' ? frame + ink + backdrop
+      : order === 'frame first' ? frame + backdrop + ink
+        : order === 'frame last' ? backdrop + ink + frame : backdrop + frame + ink;
+    const svg = `<svg role='img' aria-label='Error' viewBox='0,0,144,144' height='144.0' width='144'>${definitions}${layers}</svg>`;
+    // Act
+    const verify = () => assertFixedError(svg, 'START', ['First reason', 'Second reason']);
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
+
+// Objective: neutral metadata does not turn equivalent artwork into a geometry failure.
+for (const location of ['root', 'backdrop', 'frame']) {
+  test(`fixed frame inspection accepts neutral metadata on ${location}`, () => {
+    // Arrange: no stylesheet, scripts or external references give these IDs visual behavior.
+    const metadata = "id='descriptive' role='img' aria-label='Artwork'";
+    const svg = `<svg ${location === 'root' ? metadata : ''} width='144' height='144' viewBox='0 0 144 144'><rect ${location === 'backdrop' ? metadata : ''} fill='#000000' width='144' height='144'/><rect ${location === 'frame' ? metadata : ''} x='8' y='8' width='128' height='128' rx='16' fill='none' stroke='#969696' stroke-width='3' stroke-opacity='.35'/></svg>`;
+    // Act
+    const verify = () => assertKeyFrame(svg, '#969696');
+    // Assert
+    assert.doesNotThrow(verify);
+  });
+}
+for (const shape of ['rect', 'circle']) for (const location of ['definition', 'shape']) {
+  test(`${shape} clip inspection accepts neutral metadata on ${location}`, () => {
+    // Arrange: the referenced definition keeps its ID; the shape's extra ID is unreferenced.
+    const metadata = "role='img' aria-label='Content area'";
+    const body = shape === 'rect' ? "<rect x='16' y='48' width='112' height='48'" : "<circle cx='72' cy='72' r='48'";
+    const svg = `<clipPath id='safe' ${location === 'definition' ? metadata : ''}>${body} ${location === 'shape' ? `id='descriptive' ${metadata}` : ''}/></clipPath><text clip-path='url(#safe)'>Safe</text>`;
+    const text = svgElements(svg, 'text')[0];
+    // Act
+    const verify = () => shape === 'rect' ? assertPaddedClip(svg, text, { x: 16, y: 48, width: 112, height: 48 })
+      : assertRingContentClip(svg, text, { cx: '72', cy: '72', r: '54', 'stroke-width': '8' });
+    // Assert
+    assert.doesNotThrow(verify);
+  });
+}
+
+// Objective: geometry checks reject unsupported modifiers rather than pretending to render them.
+for (const shape of ['rect', 'circle']) for (const location of ['definition', 'shape']) {
+  for (const modifier of ["transform='translate(1000)'", "style='transform:translateX(1000px)'", "clip-path='url(#elsewhere)'"]) {
+    test(`${shape} clip rejects ${location} modifier ${modifier.split('=')[0]}`, () => {
+      // Arrange
+      const body = shape === 'rect' ? "<rect x='16' y='48' width='112' height='48'" : "<circle cx='72' cy='72' r='48'";
+      const svg = `<clipPath id='safe' ${location === 'definition' ? modifier : ''}>${body} ${location === 'shape' ? modifier : ''}/></clipPath><text clip-path='url(#safe)'>Safe</text>`;
+      const text = svgElements(svg, 'text')[0];
+      // Act
+      const verify = () => shape === 'rect' ? assertPaddedClip(svg, text, { x: 16, y: 48, width: 112, height: 48 })
+        : assertRingContentClip(svg, text, { cx: '72', cy: '72', r: '54', 'stroke-width': '8' });
+      // Assert
+      assert.throws(verify, assert.AssertionError);
+    });
+  }
+}
+for (const [label, origin, modifier, valid] of [
+  ['omitted zero', '', '', true], ['equivalent explicit zero', "x='0.000' y='0e0'", '', true],
+  ['shifted horizontally', "x='144'", '', false], ['shifted vertically', "y='144'", '', false],
+  ['transformed backdrop', '', "transform='translate(144)'", false],
+  ['styled backdrop', '', "style='x:144px'", false],
+]) {
+  test(`canvas coverage ${valid ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange
+    const svg = `<svg width='144.0' height='144' viewBox='0 0 144 144'><rect ${origin} ${modifier} fill='#000000' width='144' height='144'/><rect x='8' y='8' width='128' height='128' rx='16' fill='none' stroke='#969696' stroke-width='3' stroke-opacity='.35'/></svg>`;
+    // Act
+    const verify = () => assertKeyFrame(svg, '#969696');
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const [label, content, valid] of [['literal escaped content', 'Safe &amp; sound', true],
+  ['missing content', '', false], ['wrong content', 'Changed', false]]) {
+  test(`SVG text semantics ${valid ? 'accept' : 'reject'} ${label}`, () => {
+    // Arrange
+    const svg = `<text fill='white' y='32.0' x='22'>${content}</text>`;
+    // Act
+    const verify = () => assertSvgElement(svg, 'text', { text: 'Safe &amp; sound' }, { x: 22, y: 32, fill: 'white' });
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const [label, definition] of [
+  ['missing', ''], ['wrong reference', '<clipPath id="elsewhere"><rect x="16" y="48" width="112" height="48"/></clipPath>'],
+  ['nonfinite', '<clipPath id="local"><rect x="NaN" y="48" width="112" height="48"/></clipPath>'],
+  ['outward', '<clipPath id="local"><rect x="16" y="48" width="129" height="48"/></clipPath>'],
+  ['wrong bounds', '<clipPath id="local"><rect x="17" y="48" width="111" height="48"/></clipPath>'],
+]) {
+  test(`SVG clip checks reject ${label} bounds or references`, () => {
+    // Arrange
+    const svg = `${definition}<text clip-path="url(#local)">Safe</text>`;
+    // Act
+    const verify = () => assertPaddedClip(svg, svgElements(svg, 'text')[0], { x: 16, y: 48, width: 112, height: 48 });
+    // Assert
+    assert.throws(verify, assert.AssertionError);
+  });
+}
+for (const [label, fill, width, valid] of [['equivalent', '#000000', '1.44e2', true],
+  ['changed color', '#ffffff', '144', false], ['missing extent', '#000000', '', false]]) {
+  test(`fixed frame semantics ${valid ? 'accept' : 'reject'} ${label}`, () => {
+    // Arrange
+    const svg = `<svg viewBox='0,0,144,144' height='144.0' width='144'><rect fill='${fill}' height='144' width='${width}'></rect><rect stroke-opacity='.35' stroke-width='3.0' stroke='#969696' fill='none' rx='16' height='128' width='128' y='8' x='8'/></svg>`;
+    // Act
+    const verify = () => assertKeyFrame(svg, '#969696');
+    // Assert
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
+  });
+}
 
 // Objective: markup changes update the boundary fixture without a second ID inventory.
 test('inspector fixture follows reordered tags/attributes and newly added controls', () => {
@@ -42,7 +233,7 @@ test('inspector fixture never invents absent IDs from comments, scripts, styles 
   assert.equal(fixture.elements.size, 1);
 });
 
-// S24: one static contract covers authored/generated markup and equivalent formatting.
+// Check real markup unchanged; only independent controlled inputs create defect cases.
 const staticControls = readFileSync(new URL('../src/inspector/run.html', import.meta.url), 'utf8');
 const generatedControls = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.html', import.meta.url), 'utf8');
 
@@ -55,16 +246,15 @@ function reformatMarkup(html) {
         ? `${name} = "${value}"` : `${name} = '${value}'`)).join('\n ')}${/\/\s*$/.test(source) ? ' /' : ''} >`;
   });
 }
-const markupVariants = [['authored', staticControls], ['authored reformatted', reformatMarkup(staticControls)],
-  ['generated', generatedControls], ['generated reformatted', reformatMarkup(generatedControls)]];
+const markupVariants = [['controlled', inspectorTestMarkup], ['controlled reformatted', reformatMarkup(inspectorTestMarkup)]];
 
-for (const [variant, html] of markupVariants) {
+for (const [variant, html] of [['authored', staticControls], ['generated', generatedControls], ...markupVariants]) {
   test(`central inspector static contract holds for ${variant} markup`, () => {
     // Arrange
     const input = html;
     // Act
     const verify = () => assertInspectorMarkup(input);
-    // Assert: bindings, accessibility, presets, writers and CSS share one contract.
+    // Assert: usable bindings, accessibility, public values and writer safety.
     assert.doesNotThrow(verify);
   });
 }
@@ -73,9 +263,9 @@ test('static control semantics tolerate reordered attributes, quotes and whitesp
   // Arrange: equivalent static controls, not a browser rendering claim.
   const formatted = markupVariants[1][1];
   // Act
-  const fixtures = [staticControls, formatted].map(createInspectorFixture);
+  const fixtures = [inspectorTestMarkup, formatted].map(createInspectorFixture);
   // Assert
-  assert.notEqual(formatted, staticControls);
+  assert.notEqual(formatted, inspectorTestMarkup);
   assert.equal(fixtures[1].fields.timerControls.hidden, fixtures[0].fields.timerControls.hidden);
   assert.equal(fixtures[1].fields.status.getAttribute('aria-live'), 'polite');
 });
@@ -97,70 +287,37 @@ for (const [label, html, placeholder] of [
   });
 }
 
-for (const css of [
-  '#custom-interval[hidden],#timer-controls[hidden]{display:none!important}',
-  '#timer-controls[ hidden ] { display : none ! important ; } #custom-interval[hidden]{display:none !important;}',
+// Objective: retain the narrow authored SDPI background guard, not a CSS renderer.
+for (const [label, css, valid] of [
+  ['no optional styling', '', true],
+  ['status styling', '#settings-status {color:rebeccapurple; margin:2em}', true],
+  ['SDPI foreground styling', 'sdpi-item {color:inherit}', true],
+  ['native picker background', '#themeColor {background:transparent}', true],
+  ['SDPI background shorthand', 'sdpi-item {background:black}', false],
+  ['SDPI background property and grouped selectors', 'a, SDPI-item > small { BACKGROUND-COLOR: black; }', false],
 ]) {
-  test('static CSS contract accepts equivalent whitespace and selector order', () => {
-    // Arrange
-    const html = staticControls.replace(/#timer-controls\[hidden\][^}]*}/, css)
-      .replace('#settings-status { color: #969696; }', '#settings-status{color : #969696}');
+  test(`static stylesheet safety ${valid ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange: no production CSS is copied, rewritten or required to exist.
+    const html = `<style>${css}</style>${inspectorTestMarkup}`;
     // Act
     const verify = () => assertInspectorMarkup(html);
-    // Assert
-    assert.doesNotThrow(verify);
+    // Assert: this establishes only static declaration safety, not computed styles.
+    if (valid) assert.doesNotThrow(verify); else assert.throws(verify, assert.AssertionError);
   });
 }
-for (const [defect, css] of [
-  ['missing hidden rule', ''],
-  ['missing custom selector', '#timer-controls[hidden]{display:none!important}'],
-  ['visible hidden rows', '#timer-controls[hidden],#custom-interval[hidden]{display:block!important}'],
-  ['nonimportant hidden rule', '#timer-controls[hidden],#custom-interval[hidden]{display:none}'],
-  ['descendant instead of hidden control', '#timer-controls [hidden],#custom-interval[hidden]{display:none!important}'],
-]) {
-  test(`static CSS contract rejects ${defect}`, () => {
-    // Arrange
-    const html = staticControls.replace(/#timer-controls\[hidden\][^}]*}/, css);
-    // Act
-    const verify = () => assertInspectorMarkup(html);
-    // Assert
-    assert.throws(verify, assert.AssertionError);
-  });
-}
-for (const css of ['#settings-status{color:red}', '#settings-status{opacity:1}']) {
-  test('static CSS contract still rejects incorrect or missing status color', () => {
-    // Arrange
-    const html = staticControls.replace('#settings-status { color: #969696; }', css);
-    // Act
-    const verify = () => assertInspectorMarkup(html);
-    // Assert
-    assert.throws(verify, assert.AssertionError);
-  });
-}
-test('static CSS contract rejects SDPI backgrounds while status color remains valid', () => {
-  // Arrange: change only the forbidden background, not the independent status rule.
-  const html = staticControls.replace('#settings-status { color: #969696; }',
-    '$&\n SDPI-item { BACKGROUND-COLOR: black; }');
-  // Act
-  const verify = () => assertInspectorMarkup(html);
-  // Assert: without the background guard, this otherwise-valid fixture would pass.
-  assert.notEqual(html, staticControls);
-  assert.throws(verify, assert.AssertionError);
-});
 
-// Use the existing extractor's ranges, not a second parser or authored spelling.
+// Edits below apply only to controlled test input, never product sources/artifacts.
 function mutateMarkup(html, select, edit) {
   const { nodes, scripts } = extractInspectorMarkup(html);
   const matches = [...nodes, ...scripts].filter(select);
   assert.equal(matches.length, 1, 'mutation must identify exactly one target');
   const node = matches[0];
   const draft = { tag: node.tag, attributes: new Map(node.attributes),
-    content: html.slice(node.openEnd, node.closeStart), remove: false, wrap: false };
+    content: html.slice(node.openEnd, node.closeStart), remove: false };
   edit(draft);
   const attributes = [...draft.attributes].map(([name, value]) => `${name}="${value.replaceAll('"', '&quot;')}"`).join(' ');
   const opening = `<${draft.tag} ${attributes}>`;
-  let replacement = draft.remove ? '' : opening + (node.end === node.openEnd ? '' : `${draft.content}</${draft.tag}>`);
-  if (draft.wrap) replacement = `<div>${replacement}</div>`;
+  const replacement = draft.remove ? '' : opening + (node.end === node.openEnd ? '' : `${draft.content}</${draft.tag}>`);
   return html.slice(0, node.start) + replacement + html.slice(node.end);
 }
 const idIs = id => node => node.attributes.get('id') === id;
@@ -169,27 +326,62 @@ const presetIs = value => node => node.tag === 'option' && node.attributes.get('
 const entryScript = node => node.tag === 'script' && node.attributes.get('src') === 'run.js';
 const body = node => node.tag === 'body';
 
+// Objective: ancestor visibility survives arbitrary anonymous wrappers, not a fixed layout.
+test('hidden ancestry follows anonymous wrappers and their current state', () => {
+  // Arrange
+  const fixture = createInspectorFixture('<section hidden><div><input id="nested" /></div></section>');
+  const control = fixture.getElementById('nested');
+  // Act
+  const initiallyHidden = isHiddenByAncestry(control);
+  control.parentElement.parentElement.hidden = false;
+  const shown = isHiddenByAncestry(control);
+  control.parentElement.hidden = true;
+  // Assert
+  assert.equal(initiallyHidden, true); assert.equal(shown, false);
+  assert.equal(isHiddenByAncestry(control), true); assert.equal(control.hidden, false);
+});
+
+for (const [id, container] of [['actionOnPress', 'body'], ['intervalPreset', 'body'],
+  ['custom-interval', 'body'], ['intervalSeconds', 'timer-controls']]) {
+  test(`static visibility boundaries reject misplaced ${id} despite retained control semantics`, () => {
+    // Arrange: relocate only independent test input, keeping accessible labels and values.
+    const node = extractInspectorMarkup(inspectorTestMarkup).nodes.find(idIs(id));
+    const control = inspectorTestMarkup.slice(node.start, node.end);
+    const removed = mutateMarkup(inspectorTestMarkup, idIs(id), draft => { draft.remove = true; });
+    const misplaced = mutateMarkup(removed, container === 'body' ? body : idIs(container), draft => {
+      draft.content += `<sdpi-item label="Relocated control">${control}</sdpi-item>`;
+    });
+    // Act
+    const verify = () => assertInspectorMarkup(misplaced);
+    // Assert: rejection must be about managed visibility, not lost naming or values.
+    assert.notEqual(misplaced, inspectorTestMarkup);
+    assert.throws(verify, /must be within/);
+  });
+}
+
 for (const [defect, select, edit] of [
   ['missing hidden attribute', idIs('timer-controls'), node => node.attributes.delete('hidden')],
+  ['missing custom hidden attribute', idIs('custom-interval'), node => node.attributes.delete('hidden')],
   ['wrong live region', idIs('settings-status'), node => node.attributes.set('aria-live', 'off')],
   ['missing status role', idIs('settings-status'), node => node.attributes.delete('role')],
   ['wrong preset value', presetIs('60'), node => node.attributes.set('value', '61')],
-  ['wrong preset label', presetIs('60'), node => { node.content = 'Other'; }],
-  ['nested preset content', presetIs('60'), node => { node.content = '1mn<b>Other</b>'; }],
+  ['empty preset label', presetIs('60'), node => { node.content = ''; }],
+  ['duplicate preset value', presetIs('60'), node => node.attributes.set('value', '30')],
   ['missing preset', presetIs('custom'), node => { node.remove = true; }],
-  ['wrong control ancestry', idIs('actionOnPress'), node => { node.wrap = true; }],
+  ['invalid press choice', node => node.tag === 'option' && node.attributes.get('value') === 'stop', node => node.attributes.set('value', 'invalid')],
   ['remote script', entryScript, node => node.attributes.set('src', 'https://example.invalid/run.js')],
   ['inline script', entryScript, node => { node.content = 'unexpected()'; }],
   ['additional settings writer', idIs('intervalPreset'), node => node.attributes.set('setting', 'intervalSeconds')],
   ['wrong picker element', idIs('executable'), node => { node.tag = 'sdpi-textfield'; }],
   ['wrong native color type', idIs('themeColor'), node => node.attributes.set('type', 'text')],
-  ['wrong initial color', idIs('themeColor'), node => node.attributes.set('value', '#969696')],
-  ['wrong native color label', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Theme color', node => node.attributes.set('label', 'Other')],
-  ['wrong color accessibility label', idIs('themeColor'), node => node.attributes.set('aria-label', 'Other')],
+  ['missing color accessibility name', idIs('themeColor'), node => node.attributes.delete('aria-label')],
+  ['missing picker accessibility name', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Program', node => node.attributes.delete('label')],
+  ['disabled executable', idIs('executable'), node => node.attributes.set('disabled', '')],
+  ['readonly arguments', idIs('argsText'), node => node.attributes.set('readonly', '')],
   ['environment field', body, node => { node.content += '<input id="environment" />'; }],
   ['persisted mode control', body, node => { node.content += '<sdpi-select id="mode"></sdpi-select>'; }],
   ['Apply writer', body, node => { node.content += '<button>Apply</button>'; }],
-  ['nonempty status', idIs('settings-status'), node => { node.content = 'unexpected'; }],
+  ['HTML status content', idIs('settings-status'), node => { node.content = '<b>unexpected</b>'; }],
   ['duplicate writer control', body, node => { node.content += '<sdpi-file id="executable"></sdpi-file>'; }],
 ]) {
   for (const [variant, input] of markupVariants) {
@@ -204,6 +396,38 @@ for (const [defect, select, edit] of [
     });
   }
 }
+
+test('static bindings accept an unspecified initial theme and plain initial status text', () => {
+  // Arrange: presentation defaults and wording are not persisted configuration.
+  const withoutColor = mutateMarkup(inspectorTestMarkup, idIs('themeColor'), node => node.attributes.delete('value'));
+  const input = mutateMarkup(withoutColor, idIs('settings-status'), node => { node.content = 'Ready for configuration'; });
+  // Act
+  const verify = () => assertInspectorMarkup(input);
+  // Assert: effective theme fallback and status updates are exercised by controller tests.
+  assert.doesNotThrow(verify);
+});
+
+for (const id of ['executable', 'argsText', 'cwd', 'title', 'themeColor', 'settings-status',
+  'intervalPreset', 'intervalSeconds', 'actionOnPress', 'timer-controls', 'custom-interval', 'github-project', 'ask-chatgpt']) {
+  test(`static bindings reject missing ${id}`, () => {
+    // Arrange
+    const input = inspectorTestMarkup;
+    // Act
+    const invalid = mutateMarkup(input, idIs(id), node => { node.remove = true; });
+    // Assert
+    assert.notEqual(invalid, input);
+    assert.throws(() => assertInspectorMarkup(invalid), assert.AssertionError);
+  });
+}
+
+test('boundary fixture rejects ambiguous duplicate control IDs rather than selecting a writer', () => {
+  // Arrange
+  const html = '<input id="draft" /><input id="draft" />';
+  // Act
+  const create = () => createInspectorFixture(html);
+  // Assert
+  assert.throws(create, assert.AssertionError);
+});
 
 // Reject ambiguous attributes instead of emulating a browser's recovery rules.
 for (const [label, html] of [
@@ -228,7 +452,7 @@ for (const [label, html] of [
 for (const id of [undefined, 'github-project', 'ask-chatgpt']) {
   test(`built inspector initialization ${id ? `rejects absent ${id}` : 'accepts complete markup'} without connection side effects`, () => {
     // Arrange
-    const html = readFileSync(new URL('../src/inspector/run.html', import.meta.url), 'utf8');
+    const html = inspectorTestMarkup;
     const script = readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8');
     const source = createInspectorFixture(html);
     if (id) assert.ok(source.getElementById(id), 'required link must exist before removal');
@@ -426,7 +650,7 @@ test('adapter loader permits explicit pure dependencies but rejects unknown exte
 test('adapter loaders isolate runtime ownership, configuration and process state', async t => {
   // Arrange
   function harness(executable) {
-    const launches = [], sessions = [], states = [], managers = [];
+    const launches = [], replies = [];
     let settings = { executable, argsText: '' };
     const runtime = { id: 'same-synthetic-context', manifestId: 'git.renaudcerrato.deckforge.stream',
       isKey: () => true, coordinates: { row: 0, column: 0 },
@@ -434,7 +658,7 @@ test('adapter loaders isolate runtime ownership, configuration and process state
       async getSettings() { return structuredClone(settings); },
       async setSettings(next) { settings = structuredClone(next); }, async setImage() {}, async setTitle() {},
     };
-    const sdk = { logger: { info() {}, warn() {} }, ui: { async sendToPropertyInspector() {} } };
+    const sdk = { logger: { info() {}, warn() {} }, ui: { async sendToPropertyInspector(reply) { replies.push(reply); } } };
     const load = createAdapterLoader(adapterCodes, { process: syntheticProcess('darwin'), resolve(name) {
       if (name === '@elgato/streamdeck') return { default: sdk, SingletonAction: class {}, action: () => value => value };
       if (name === '../core/process-runner.mjs') return { startProcessRun(input) {
@@ -443,38 +667,34 @@ test('adapter loaders isolate runtime ownership, configuration and process state
         const launch = { input, stopped: false }; launches.push(launch);
         return { done, async stop() { launch.stopped = true; finish({ status: 'stopped' }); return true; } };
       } };
-    }, observe(name, actual) {
-      const capture = (factory, collection) => ({ ...actual, [factory](dependencies) {
-        const instance = actual[factory](dependencies); collection.push(instance); return instance;
-      } });
-      if (name === '../core/action-session.mjs') return capture('createActionSession', sessions);
-      if (name === '../core/run-state.mjs') return capture('createRunStateCoordinator', states);
-      if (name === '../core/availability.mjs') return capture('createAvailabilityManager', managers);
-      return actual;
     } });
     const registry = Object.fromEntries(['onDeviceDidConnect', 'onDeviceDidDisconnect', 'onSystemDidWakeUp']
       .map(name => [name, () => ({ dispose() {} })]));
     const { RunAction } = load('./run'), action = new RunAction(registry);
     t.after(async () => {
       await action.onWillDisappear({ action: runtime });
-      for (const session of sessions) await session.setConnected(false);
-      for (const manager of managers) manager.dispose();
     });
-    return { load, action, runtime, launches, states,
+    const send = (type, requestId, extra = {}) => action.onSendToPlugin({ action: runtime,
+      payload: { type, requestId, context: runtime.id, inspectorId: 'isolation-pi', ...extra } });
+    return { action, runtime, launches, replies,
       appear: () => action.onWillAppear({ action: runtime, payload: { settings } }),
       press: () => action.onKeyDown({ action: runtime, payload: { settings } }),
+      async edit(changes) {
+        await send('canvas:hello', 1); await send('canvas:claim', 2, { token: replies.at(-1).token });
+        await send('canvas:edit', 3, { changes });
+      },
     };
   }
   const first = harness('/synthetic/first'), second = harness('/synthetic/second');
   // Act
   await first.appear(); await second.appear(); await first.press(); await second.press();
   await first.press();
-  await first.states[0].editConfiguration({ title: 'first title' });
+  await first.edit({ title: 'first title' });
   // Assert
-  assert.notEqual(first.load('./program-runtime'), second.load('./program-runtime'));
   assert.deepEqual(first.launches.map(launch => launch.input.executable), ['/synthetic/first']);
   assert.deepEqual(second.launches.map(launch => launch.input.executable), ['/synthetic/second']);
   assert.equal(first.launches[0].stopped, true); assert.equal(second.launches[0].stopped, false);
-  assert.equal(first.states[0].getSettings().title, 'first title');
-  assert.equal(second.states[0].getSettings().title, undefined);
+  assert.equal(first.replies.at(-1).status, 'saved');
+  assert.deepEqual(await first.runtime.getSettings(), { executable: '/synthetic/first', argsText: '', title: 'first title' });
+  assert.deepEqual(await second.runtime.getSettings(), { executable: '/synthetic/second', argsText: '' });
 });

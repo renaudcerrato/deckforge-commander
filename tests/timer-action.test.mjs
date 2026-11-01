@@ -69,7 +69,7 @@ function slotWrapper(r, settings) {
 }
 
 function harness(t) {
-  const time = clock(), launches = [], sessions = [], states = [], managers = [], logs = [], replies = [];
+  const time = clock(), launches = [], logs = [], replies = [];
   const registrations = [], listeners = new Map(), decorated = new Map(), tracked = [];
   const sdk = {
     info: { plugin: { uuid: 'git.renaudcerrato.deckforge', version: '0.1.0.0' },
@@ -102,27 +102,15 @@ function harness(t) {
   // Never inherit, log or print the user's process environment.
   const syntheticProcess = { env: { PATH: '/synthetic/path', ELGATO_KEY_COLUMN: 'STALE_SYNTHETIC',
     ELGATO_DEVICE_NAME: 'STALE_SYNTHETIC', ELGATO_ACTION_THEME_COLOR: 'STALE_SYNTHETIC', PRIVATE_ENV: 'SYNTHETIC_PRIVATE_ENV' }, cwd: () => '/synthetic/cwd', platform: 'darwin' };
-  const capture = (module, factory, collection) => ({ ...module, [factory](dependencies) {
-    const actual = module[factory](dependencies); collection.push(actual); return actual;
-  } });
   const isolatedRequire = createAdapterLoader(adapterCodes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return sdkModule;
     if (name === '../core/process-runner.mjs') return runner;
-  }, observe(name, actual) {
-    if (name === '../core/timer-session.mjs') return capture(actual, 'createTimerSession', sessions);
-    if (name === '../core/action-session.mjs') return capture(actual, 'createActionSession', sessions);
-    if (name === '../core/timer-settings.mjs') return capture(actual, 'createTimerStateCoordinator', states);
-    if (name === '../core/run-state.mjs') return capture(actual, 'createRunStateCoordinator', states);
-    if (name === '../core/availability.mjs') return capture(actual, 'createAvailabilityManager', managers);
-    return actual;
   } });
   const { TimerAction } = isolatedRequire('./timer'), { RunAction } = isolatedRequire('./run');
   const action = new TimerAction(registry, time);
-  const idle = async () => {
-    await Promise.all(managers.map(manager => manager.whenIdle()));
-    await Promise.all(states.map(state => state.whenIdle()));
-    await Promise.all(sessions.map(session => session.whenIdle()));
-  };
+  // With only synthetic I/O, one event-loop turn drains runnable promise work.
+  // Held boundaries stay held; no handler-settlement assertion substitutes for an outcome.
+  const idle = () => new Promise(resolve => setImmediate(resolve));
   const remember = (adapter, r) => {
     if (!tracked.some(item => item.adapter === adapter && item.r === r)) tracked.push({ adapter, r });
   };
@@ -135,11 +123,14 @@ function harness(t) {
     // Only synthetic process ownership and listener cleanup, no real services or files.
     for (const launch of launches) launch.stopGate?.resolve(true);
     for (const { adapter, r } of tracked) await adapter.onWillDisappear({ action: r });
-    for (const session of sessions) await session.setConnected(false);
+    for (const { r } of tracked) {
+      r.device.isConnected = false;
+      for (const listener of listeners.get('disconnect') ?? []) listener({ device: r.device });
+    }
     await idle();
-    for (const manager of managers) manager.dispose();
+    listeners.clear();
   });
-  return { action, TimerAction, RunAction, registry, time, launches, sessions, states, replies, logs, sdk, decorated,
+  return { action, TimerAction, RunAction, registry, time, launches, replies, logs, sdk, decorated,
     registrations, appear, idle,
     newRun: () => new RunAction(registry),
     emit(name, device) { for (const listener of listeners.get(name) ?? []) listener(name === 'wake' ? undefined : { device }); },
@@ -177,7 +168,7 @@ test('actual Loop hard lines survive rejected schema and confirmed key-local cos
   h.launches[0].callbacks.onUpdate({ ...record, hardBreaks: true });
   h.launches[0].callbacks.onUpdate({ ...record, options: { ...record.options, 'max-lines': 2 } }); await h.idle();
   const rejectedDisplay = images(r).at(-1); await h.finish();
-  const due = h.sessions[0].getState().dueMs;
+  await h.advance(1000);
   await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef' } }); await h.idle();
   const rendered = svg(images(r).at(-1));
   // Assert
@@ -185,9 +176,10 @@ test('actual Loop hard lines survive rejected schema and confirmed key-local cos
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), ['A', '', 'B']);
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), Array(3).fill('#abcdef'));
   assert.equal(record.value, 'A\n\nB'); assert.deepEqual(other.display, untouched); assert.deepEqual(other.writes, []);
-  assert.equal(h.sessions[0].getState().dueMs, due); assert.equal(h.sessions[0].getState().enabled, true);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+  await h.advance(3999); assert.equal(h.launches.length, 1);
+  await h.advance(1); assert.equal(h.launches.length, 2);
 });
 test('actual Loop final hard-line SDK handoff drains before deadline and rejects old-generation callbacks', options, async t => {
   // Arrange
@@ -205,18 +197,16 @@ test('actual Loop final hard-line SDK handoff drains before deadline and rejects
     await h.launches[0].done.promise;
     await new Promise(resolve => setImmediate(resolve));
     // Assert before release: neither completion nor a repeat deadline may precede final handoff.
-    const pending = h.sessions[0].getState();
-    assert.equal(pending.phase, 'stopping');
-    assert.equal(pending.dueMs, undefined);
+    h.time.advance(8000); await h.idle();
     assert.deepEqual(r.display, beforeCompletion);
     assert.equal(h.launches.length, 1);
   } finally {
-    gate.resolve(); await finishing;
+    gate.resolve(); await finishing; await h.idle();
   }
-  const retained = [...images(r)], due = h.sessions[0].getState().dueMs;
-  await h.advance(5000); h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.idle();
+  const retained = [...images(r)];
+  await h.advance(4999); assert.equal(h.launches.length, 1);
+  await h.advance(1); h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.idle();
   // Assert
-  assert.equal(due, 5000);
   assert.equal(retained.at(-1), artwork); assert.deepEqual(images(r), retained); assert.deepEqual(r.writes, []);
   assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
 });
@@ -241,20 +231,20 @@ for (const terminal of ['success', 'nonzero', 'signal']) {
     const h = harness(t), r = runtime('synthetic-loop-recurring-theme', { ...base, themeColor: '#123456' });
     const other = runtime('synthetic-loop-other-theme', { ...base, themeColor: '#654321' });
     await h.appear(r); await h.appear(other); await h.tap(r); await h.tap(other); await h.claim(r);
-    const original = structuredClone(h.launches[0].env), otherDisplay = [...other.display], runningDue = h.sessions[0].getState().dueMs;
+    const original = structuredClone(h.launches[0].env), otherDisplay = [...other.display];
     // Act: inline primitive ink never becomes configuration or a launch environment value.
     h.launches[0].callbacks.onUpdate(parseOutputUpdate('text:synthetic|color:red')); await h.idle();
     await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } }); await h.idle();
-    const afterEdit = { count: h.launches.length, stops: h.launches[0].stops, due: h.sessions[0].getState().dueMs };
+    const afterEdit = { count: h.launches.length, stops: h.launches[0].stops };
     if (terminal !== 'success') h.launches[0].callbacks.onDiagnostic(terminal === 'signal' ? 'PROCESS_TERMINATED_BY_SIGNAL' : 'PROCESS_EXITED_NONZERO');
     await h.finish(terminal === 'success' ? { status: 'success' } : { status: 'error', error: ordinaryError }, h.launches[0]);
-    const due = h.sessions[0].getState().dueMs;
+    await h.advance(1000);
     await h.send(r, 'canvas:edit', 4, { changes: { themeColor: '#FEDCBA' } }); await h.idle();
-    const afterWaitingEdit = { due: h.sessions[0].getState().dueMs, count: h.launches.length };
-    await h.advance(5000);
+    const afterWaitingEdit = h.launches.length;
+    await h.advance(3999); assert.equal(h.launches.length, 2); await h.advance(1);
     // Assert
-    assert.deepEqual(afterEdit, { count: 2, stops: 0, due: runningDue }); assert.deepEqual(h.launches[0].env, original);
-    assert.deepEqual(afterWaitingEdit, { due, count: 2 }); assert.equal(due, 5000);
+    assert.deepEqual(afterEdit, { count: 2, stops: 0 }); assert.deepEqual(h.launches[0].env, original);
+    assert.equal(afterWaitingEdit, 2);
     assert.equal(h.launches.length, 3); assert.equal(h.launches[2].env.ELGATO_ACTION_THEME_COLOR, '#fedcba');
     assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#654321'); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.deepEqual(r.writes.map(value => value.themeColor), ['#abcdef', '#fedcba']);
@@ -268,12 +258,10 @@ test('actual Loop fatal failure cannot acquire a new theme launch through cosmet
   const h = harness(t), r = runtime('synthetic-loop-fatal-theme', { ...base, themeColor: '#123456' });
   await h.appear(r); await h.tap(r); await h.claim(r);
   h.launches[0].callbacks.onError('Image protocol error.'); await h.finish({ status: 'error', error: 'Image protocol error.' });
-  const before = h.sessions[0].getState();
   // Act
   await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } }); await h.advance(10000);
   // Assert
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].env.ELGATO_ACTION_THEME_COLOR, '#123456');
-  assert.equal(h.sessions[0].getState().enabled, before.enabled); assert.equal(h.sessions[0].getState().dueMs, before.dueMs);
   assert.equal(images(r).at(-1), createErrorArtwork('IMAGE_PROTOCOL_ERROR', '#abcdef'));
 });
 test('actual Loop badges are per-key and suffix-only replacement does not enable scheduling', options, async t => {
@@ -286,7 +274,7 @@ test('actual Loop badges are per-key and suffix-only replacement does not enable
   // Assert
   assert.match(svg(images(first).at(-1)), />Loop<\/text>.*>\.gz<\/text>.*>report<\/text>.*>ready<\/text>/);
   assert.match(svg(images(second).at(-1)), />\.sh<\/text>/); assert.deepEqual(second.display, beforeSecond);
-  assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.sessions[0].getState().dueMs, undefined);
+  await h.advance(100000);
   assert.deepEqual(h.launches, []); assert.deepEqual(second.writes, []);
 });
 
@@ -294,15 +282,16 @@ test('actual Loop Loading and Success badges track theme without changing deadli
   // Arrange
   const h = harness(t), r = runtime('synthetic-loop-badge', { ...base, executable: '/synthetic/report.PY' });
   await h.appear(r); await h.tap(r); await h.finish(); await h.claim(r);
-  const due = h.sessions[0].getState().dueMs;
+  await h.advance(1000);
   // Act
   await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } }); await h.idle();
   // Assert
   assert.ok(images(r).some(image => />\.py<\/text>.*>loading\.\.\.<\/text>/.test(svg(image))));
   assert.match(svg(images(r).at(-1)), /text-anchor="end"[^>]*fill="#abcdef">\.py<\/text>.*>success<\/text>/);
-  assert.equal(h.sessions[0].getState().dueMs, due); assert.equal(h.sessions[0].getState().enabled, true);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, [{ ...base, executable: '/synthetic/report.PY', themeColor: '#abcdef' }]);
+  await h.advance(3999); assert.equal(h.launches.length, 1);
+  await h.advance(1); assert.equal(h.launches.length, 2);
 });
 
 for (const record of ['text:plain', 'progress:45', '<svg>opaque</svg>']) {
@@ -319,7 +308,7 @@ for (const record of ['text:plain', 'progress:45', '<svg>opaque</svg>']) {
   });
 }
 
-for (const loss of ['hide', 'disconnect', 'persistence']) {
+for (const loss of ['hide', 'disconnect']) {
   test(`actual Loop held title cannot hand off obsolete suffix artwork after ${loss}`, options, async t => {
     // Arrange
     const h = harness(t), r = runtime(), entered = deferred(), gate = deferred(); let hold = true;
@@ -327,11 +316,11 @@ for (const loss of ['hide', 'disconnect', 'persistence']) {
     const appearing = h.appear(r); await entered.promise;
     // Act
     const transition = loss === 'hide' ? h.action.onWillDisappear({ action: r })
-      : loss === 'disconnect' ? h.sessions[0].setConnected(false) : h.sessions[0].persistenceFailed();
+      : (r.device.isConnected = false, h.emit('disconnect', r.device));
+    await h.idle();
     gate.resolve(); await Promise.all([appearing, transition]); await h.idle();
     // Assert
     assert.equal(images(r).some(image => svg(image).includes('>.sh</text>')), false); assert.deepEqual(h.launches, []);
-    if (loss === 'persistence') assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
   });
 }
 
@@ -348,8 +337,6 @@ for (const at of [0, 999, 1000, 1001]) {
     assert.match(svg(images(r).at(-1)), /aria-label="Setup required".*>setup required<\/text>/);
     assert.deepEqual(r.display.filter(([kind]) => kind === 'title'), [['title', '']]);
     assert.deepEqual(r.writes, []); assert.deepEqual(h.launches, []);
-    assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.sessions[0].getState().dueMs, undefined);
-    assert.equal(h.sessions[0].getState().suspended, false);
   });
 }
 test('actual Loop Setup gesture remains consumed through confirmed PI executable selection; next tap launches', options, async t => {
@@ -358,12 +345,12 @@ test('actual Loop Setup gesture remains consumed through confirmed PI executable
   // Act
   await h.down(r, {}); await h.send(r, 'canvas:edit', 3, { changes: { executable: base.executable } });
   await h.advance(1000); await h.up(r); await h.up(r); await h.idle();
-  const before = h.launches.length, state = h.sessions[0].getState();
+  const before = h.launches.length;
   const ready = svg(images(r).at(-1)); await h.tap(r);
   // Assert
-  assert.equal(before, 0); assert.equal(state.enabled, false); assert.equal(state.dueMs, undefined);
+  assert.equal(before, 0);
   assert.match(ready, />program<\/text>.*>ready<\/text>/);
-  assert.equal(h.launches.length, 1); assert.equal(h.sessions[0].getState().enabled, true);
+  assert.equal(h.launches.length, 1);
   assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '' }]);
 });
 test('actual Loop empty executable PI edit leaves Setup unchanged without writes or recovery', options, async t => {
@@ -374,21 +361,6 @@ test('actual Loop empty executable PI edit leaves Setup unchanged without writes
   // Assert
   assert.equal(h.replies.at(-1)?.status, 'error'); assert.equal(h.replies.at(-1)?.diagnosticCode, 'INVALID_EXECUTABLE');
   assert.match(svg(images(r).at(-1)), />setup required<\/text>/);
-  assert.deepEqual(r.writes, []); assert.deepEqual(h.launches, []); assert.equal(h.sessions[0].getState().suspended, false);
-});
-test('actual Loop delayed Setup title clear cannot hand off artwork after newer persistence Error', options, async t => {
-  // Arrange
-  const h = harness(t), r = runtime('synthetic-loop-stale-setup', {}), entered = deferred(), gate = deferred();
-  let delay = true;
-  r.setTitle = async title => { r.display.push(['title', title]); if (delay) { delay = false; entered.resolve(); await gate.promise; } };
-  // Act
-  const appearing = h.appear(r); await entered.promise;
-  const failing = h.sessions[0].persistenceFailed(); gate.resolve();
-  await Promise.all([appearing, failing]); await h.idle();
-  // Assert
-  assert.equal(h.sessions[0].getState().presentation, 'error');
-  assert.equal(images(r).some(image => svg(image).includes('setup required')), false);
-  assert.ok(r.display.filter(([kind]) => kind === 'title').every(([, title]) => title === ''));
   assert.deepEqual(r.writes, []); assert.deepEqual(h.launches, []);
 });
 test('actual Loop delayed Setup cannot overwrite newer confirmed Ready after PI configuration', options, async t => {
@@ -403,7 +375,7 @@ test('actual Loop delayed Setup cannot overwrite newer confirmed Ready after PI 
   // Assert
   assert.equal(images(r).some(image => svg(image).includes('setup required')), false);
   assert.match(svg(images(r).at(-1)), />program<\/text>.*>ready<\/text>/);
-  assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.sessions[0].getState().dueMs, undefined);
+  await h.advance(100000);
   assert.deepEqual(h.launches, []); assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '' }]);
 });
 
@@ -419,21 +391,20 @@ for (const policy of [undefined, 'refresh', 'stop']) {
           await h.appear(r);
           if (stage !== 'disabled') await h.tap(r);
           if (stage === 'waiting') await h.finish();
-          const count = h.launches.length, due = h.sessions[0].getState().dueMs;
+          const count = h.launches.length;
           // Act
           await h.down(r); await h.down(r); await h.advance(at, deliver);
-          const beforeRelease = { count: h.launches.length, enabled: h.sessions[0].getState().enabled };
+          const beforeRelease = { count: h.launches.length, stops: h.launches[0]?.stops ?? 0 };
           await h.up(r); await h.up(r); await h.idle();
-          const recognized = h.sessions[0].getState(); await h.advance(100000);
+          await h.advance(100000);
           // Assert
           const held = at >= 1000;
           const enabled = !held && (stage === 'disabled' || policy !== 'stop');
           const starts = !held && (stage === 'disabled' || (stage === 'waiting' && policy !== 'stop'));
           assert.equal(beforeRelease.count, count);
-          assert.equal(beforeRelease.enabled, stage !== 'disabled' && !(held && deliver));
-          assert.equal(h.launches.length, count + Number(starts)); assert.equal(recognized.enabled, enabled);
+          assert.equal(beforeRelease.stops, Number(stage === 'running' && held && deliver));
+          assert.equal(h.launches.length, count + Number(starts));
           assert.equal(h.launches[0]?.stops ?? 0, stage === 'running' && !enabled ? 1 : 0);
-          assert.equal(recognized.dueMs, !held && stage === 'running' && policy !== 'stop' ? due : undefined);
           assert.deepEqual(r.writes, []);
         });
       }
@@ -451,15 +422,14 @@ for (const policy of [undefined, 'refresh', 'stop']) {
         r.setTitle = async title => { r.display.push(['title', title]); if (!heldTitle) { heldTitle = true; entered.resolve(); await gate.promise; } };
         void h.down(r); const launching = h.up(r); await entered.promise;
         // Act
-        const phase = h.sessions[0].getState().phase;
+        assert.equal(h.launches.length, 0);
         void h.down(r); h.time.advance(at, deliver);
         const recognized = h.up(r); gate.resolve();
         await Promise.all([launching, recognized]); await h.idle(); await h.up(r); await h.advance(100000);
         // Assert
         const enabled = at === 999 && policy !== 'stop';
-        assert.equal(phase, 'starting'); assert.equal(h.sessions[0].getState().enabled, enabled);
         assert.equal(h.launches.length, Number(enabled)); assert.ok(h.launches.every(launch => launch.stops === 0));
-        assert.equal(h.sessions[0].getState().dueMs, undefined); assert.deepEqual(r.writes, []);
+        assert.deepEqual(r.writes, []);
       });
     }
   }
@@ -498,7 +468,7 @@ test('manifest and actual decorators identify Stream/Loop/Run actions', options,
   assert.equal(manifest.Description, 'Script to canvas');
   assert.equal(manifest.Name, 'DeckForge Commander'); assert.equal(manifest.Author, 'Renaud Cerrato');
   assert.equal(h.decorated.get(h.TimerAction), TIMER_UUID); assert.equal(h.decorated.get(h.RunAction), RUN_UUID);
-  assert.equal(h.launches.length, 0); assert.equal(h.sessions.length, 0);
+  assert.equal(h.launches.length, 0);
 });
 
 test('fresh configured Timer defaults to disabled 60 seconds with Loop/name/ready artwork and no writes', options, async t => {
@@ -509,7 +479,7 @@ test('fresh configured Timer defaults to disabled 60 seconds with Loop/name/read
   // Assert
   assert.match(svg(images(r).at(-1)), />Loop<\/text>.*>program<\/text>.*>ready<\/text>/);
   assert.deepEqual(r.display[0], ['title', '']); assert.deepEqual(r.writes, []);
-  assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.launches.length, 0);
+  assert.equal(h.launches.length, 0);
   assert.equal(Object.hasOwn(await r.getSettings(), 'intervalSeconds'), false);
 });
 
@@ -521,7 +491,6 @@ for (const [field, value] of [['runRequested', true], ['executable', 'relative']
     await h.appear(r); await h.tap(r); await h.advance(100000);
     // Assert
     assert.match(svg(images(r).at(-1)), />Error<\/text>/);
-    assert.equal(h.sessions[0].getState().suspended, true);
     assert.equal(h.launches.length, 0); assert.deepEqual(r.writes, []);
   });
 }
@@ -557,7 +526,7 @@ test('accepted host settings remain authoritative through late host, appearance 
   await h.action.onDidReceiveSettings({ action: r, payload: { settings: foreign } });
   await h.appear(r, h.action, foreign); await h.down(r, foreign); await h.up(r); await h.idle();
   // Assert
-  assert.deepEqual(h.states[0].getSettings(), base); assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, []);
   assert.deepEqual(h.launches[0].settings, { executable: base.executable, args: [] });
   assert.equal(h.launches.length, 1);
 });
@@ -573,8 +542,7 @@ test('keys and new Singleton instances share neither enabled intent nor display/
   await h.appear(fresh, freshAdapter); await h.advance(5000);
   // Assert
   assert.deepEqual(second.display, untouched); assert.equal(h.launches.length, 2);
-  assert.equal(h.sessions[1].getState().enabled, false); assert.equal(h.sessions[2].getState().enabled, false);
-  assert.equal(h.sessions[2].getState().dueMs, undefined);
+  assert.ok(h.launches.every(launch => launch.env.ELGATO_ACTION_CONTEXT === first.id));
   assert.match(svg(images(fresh).at(-1)), />ready<\/text>/);
   assert.deepEqual(first.writes, []); assert.deepEqual(second.writes, []); assert.deepEqual(fresh.writes, []);
 });
@@ -587,11 +555,11 @@ for (const interval of [undefined, 5]) {
       ...(interval === undefined ? {} : { intervalSeconds: interval }) });
     await h.appear(r); await h.tap(r); await h.advance(12345);
     // Act
-    const during = h.launches.length; await h.finish(); const due = h.sessions[0].getState().dueMs;
+    const during = h.launches.length; await h.finish();
     const retained = [...r.display]; await h.advance((interval ?? 60) * 1000 - 1); const before = h.launches.length;
     await h.advance(1);
     // Assert
-    assert.equal(during, 1); assert.equal(due, 12345 + (interval ?? 60) * 1000);
+    assert.equal(during, 1);
     assert.equal(before, 1); assert.equal(h.launches.length, 2); assert.deepEqual(r.display, retained);
     assert.match(svg(images(r).at(-1)), />Loop<\/text>.*>program<\/text>.*>success<\/text>/);
     assert.deepEqual(r.writes, []);
@@ -609,7 +577,7 @@ for (const record of ['text:accepted', 'progress:45|label:Accepted', 'data:image
     // Assert
     assert.equal(shown, update.kind === 'image' ? update.image : createPrimitiveArtwork(update));
     assert.deepEqual(r.display, display); assert.deepEqual(r.display.at(-2), ['title', '']);
-    assert.equal(h.launches.length, 2); assert.equal(h.sessions[0].getState().presentation, 'streaming');
+    assert.equal(h.launches.length, 2);
     assert.deepEqual(r.writes, []);
   });
 }
@@ -622,7 +590,8 @@ test('malformed producer callback cannot suppress success or replace accepted SD
   h.launches[0].callbacks.onUpdate(parseOutputUpdate('progress:nope')); await h.finish();
   // Assert
   assert.equal(images(r).length, 3); assert.match(svg(images(r).at(-1)), />success<\/text>/);
-  assert.equal(h.sessions[0].getState().phase, 'waiting'); assert.equal(h.sessions[0].getState().suspended, false);
+  await h.advance(4999); assert.equal(h.launches.length, 1);
+  await h.advance(1); assert.equal(h.launches.length, 2);
 });
 
 for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNAL']) {
@@ -636,7 +605,7 @@ for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNA
     // Assert
     assert.equal(before, 1); assert.equal(h.launches.length, 2); assert.deepEqual(r.display, retained);
     assert.equal(images(r).at(-1), createErrorArtwork(diagnostic));
-    assert.deepEqual(r.display.at(-2), ['title', '']); assert.equal(h.sessions[0].getState().suspended, false);
+    assert.deepEqual(r.display.at(-2), ['title', '']);
     assert.deepEqual(r.writes, []);
   });
 }
@@ -658,11 +627,10 @@ for (const fatal of ['launch', 'protocol', 'display']) {
       } else h.launches[0].callbacks.onError('Image protocol error.');
       await h.finish({ status: 'error', error: fatal === 'launch' ? 'Program launch failed.' : 'Image protocol error.' });
     }
-    await h.advance(100000); const blocked = h.sessions[0].getState(), count = h.launches.length;
+    await h.advance(100000); const count = h.launches.length;
     await h.tap(r);
     // Assert
-    assert.equal(count, 1); assert.equal(blocked.suspended, true); assert.equal(h.launches.length, 2);
-    assert.equal(h.sessions[0].getState().suspended, false);
+    assert.equal(count, 1); assert.equal(h.launches.length, 2);
     assert.equal(h.launches[0].stops, fatal === 'display' ? 1 : 0);
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_EXCEPTION') || value.includes('SYNTHETIC_PRIVATE_OUTPUT')), false);
     assert.deepEqual(r.writes, []);
@@ -678,7 +646,7 @@ for (const delivery of [false, true]) {
     await h.up(r); await h.up(r); await h.idle(); await h.advance(100000);
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
-    assert.equal(h.sessions[0].getState().enabled, false); assert.match(svg(images(r).at(-1)), />ready<\/text>/);
+    assert.match(svg(images(r).at(-1)), />ready<\/text>/);
     assert.deepEqual(r.writes, []);
   });
 }
@@ -689,7 +657,7 @@ test('disabled hold and key-up-only cannot manufacture an initial refresh', opti
   // Act
   await h.up(r); await h.down(r); await h.advance(TIMER_HOLD_MS); await h.up(r); await h.idle();
   // Assert
-  assert.equal(h.launches.length, 0); assert.equal(h.sessions[0].getState().enabled, false);
+  await h.advance(100000); assert.equal(h.launches.length, 0);
   assert.ok(images(r).every(image => />ready<\/text>/.test(svg(image)))); assert.deepEqual(r.writes, []);
 });
 
@@ -700,11 +668,11 @@ for (const loss of ['hide', 'disconnect']) {
     // Act
     if (loss === 'hide') await h.action.onWillDisappear({ action: r });
     else { r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle(); }
-    await h.advance(TIMER_HOLD_MS); await h.up(r); await h.idle(); const before = h.sessions[0].getState();
+    await h.advance(TIMER_HOLD_MS); await h.up(r); await h.idle(); const before = [...r.display];
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.appear(r); await h.up(r); await h.idle();
     // Assert
-    assert.equal(before.visible, loss !== 'hide'); assert.equal(before.connected, loss !== 'disconnect');
-    assert.equal(h.launches.length, 0); assert.equal(h.sessions[0].getState().enabled, false);
+    assert.ok(before.every(([kind, value]) => kind !== 'image' || />ready<\/text>/.test(svg(value))));
+    await h.advance(100000); assert.equal(h.launches.length, 0);
     assert.deepEqual(r.writes, []);
   });
 }
@@ -715,14 +683,16 @@ test('running tap stops once, rejects stale callbacks and cannot overlap a held 
   const old = h.launches[0], gate = deferred(); old.stopGate = gate;
   // Act
   await h.down(r); const stopping = h.up(r); await old.stopEntered.promise;
-  const extraDown = h.down(r), extraUp = h.up(r), before = h.launches.length;
+  const extraDown = h.down(r), extraUp = h.up(r);
+  await h.idle(); const before = h.launches.length;
+  assert.equal(before, 1); assert.equal(old.stops, 1);
   gate.resolve(true); await Promise.all([stopping, extraDown, extraUp]); await h.idle();
   const settled = [...r.display]; old.callbacks.onUpdate(parseOutputUpdate('text:stale'));
   old.callbacks.onError('Image protocol error.'); old.callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED'); await h.idle();
   const unchanged = [...r.display]; await h.tap(r);
   // Assert
   assert.equal(before, 1); assert.equal(old.stops, 1); assert.deepEqual(unchanged, settled);
-  assert.equal(h.launches.length, 2); assert.equal(h.sessions[0].getState().protocolBlocked, false);
+  assert.equal(h.launches.length, 2);
   assert.deepEqual(r.writes, []);
 });
 
@@ -736,7 +706,6 @@ test('cleanup uncertainty remains permanent across taps, edits, appearance and r
   r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.appear(r); await h.advance(100000);
   // Assert
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
-  assert.equal(h.sessions[0].getState().cleanupBlocked, true);
   assert.equal(images(r).at(-1), createErrorArtwork('CLEANUP_BLOCKED'));
 });
 
@@ -791,14 +760,14 @@ test('waiting interval edit resets full period only after matching host readback
   r.getSettings = async () => { entered.resolve(); await gate.promise; return read(); };
   // Act
   const editing = h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10 } }); await entered.promise;
-  h.time.advance(3000); const pending = h.sessions[0].getState(), count = h.launches.length;
-  gate.resolve(); await editing; await h.idle(); const due = h.sessions[0].getState().dueMs;
+  h.time.advance(3000); await h.idle(); const count = h.launches.length;
+  assert.equal(count, 1); assert.equal(h.replies.at(-1).requestId, 2);
+  gate.resolve(); await editing; await h.idle();
   await h.advance(9999); const before = h.launches.length; await h.advance(1);
   // Assert
-  assert.equal(count, 1); assert.equal(pending.configurationPending, true); assert.equal(pending.dueMs, undefined);
-  assert.equal(due, 15000); assert.equal(before, 1); assert.equal(h.launches.length, 2);
+  assert.equal(count, 1); assert.equal(before, 1); assert.equal(h.launches.length, 2);
   assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }]);
-  assert.equal(h.replies.at(-1).status, 'saved'); assert.equal(h.sessions[0].getState().enabled, true);
+  assert.equal(h.replies.at(-1).status, 'saved');
 });
 
 test('running interval edit does not interrupt owner and uses new interval at completion', options, async t => {
@@ -808,8 +777,9 @@ test('running interval edit does not interrupt owner and uses new interval at co
   await h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10 } }); await h.advance(7000); await h.finish();
   // Assert
   assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
-  assert.equal(h.sessions[0].getState().dueMs, 17000); assert.equal(h.sessions[0].getState().enabled, true);
   assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }]);
+  await h.advance(9999); assert.equal(h.launches.length, 1);
+  await h.advance(1); assert.equal(h.launches.length, 2);
 });
 
 test('newest interval/theme snapshot gates launch while older read rejection is superseded', options, async t => {
@@ -825,13 +795,13 @@ test('newest interval/theme snapshot gates launch while older read rejection is 
   const older = h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10 } }); await oldEntered.promise;
   const newer = h.send(r, 'canvas:edit', 4, { changes: { themeColor: '#abcdef' } });
   oldRead.reject(new Error('SYNTHETIC_PRIVATE_OLD_READ')); await latestEntered.promise;
-  h.time.advance(7000); const pending = h.sessions[0].getState(), count = h.launches.length;
+  h.time.advance(7000); await h.idle(); const count = h.launches.length;
+  assert.equal(count, 1); assert.notEqual(h.replies.at(-1).requestId, 4);
   latestRead.resolve(); await Promise.all([older, newer]); await h.idle();
-  const confirmed = h.sessions[0].getState(); await h.advance(10000);
+  await h.advance(9999); assert.equal(h.launches.length, 1); await h.advance(1);
   // Assert
-  assert.equal(count, 1); assert.equal(pending.configurationPending, true);
-  assert.equal(confirmed.persistenceBlocked, false); assert.equal(confirmed.dueMs, 17000);
-  assert.equal(h.launches.length, 2); assert.equal(h.states[0].isBlocked(), false);
+  assert.equal(count, 1); assert.equal(h.launches.length, 2);
+  assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#abcdef');
   assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }, { ...base, intervalSeconds: 10, themeColor: '#abcdef' }]);
   assert.equal(h.replies.at(-1).requestId, 4); assert.equal(h.replies.at(-1).status, 'saved');
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_OLD_READ')), false);
@@ -847,12 +817,13 @@ test('pending execution edit stops owner but cannot show Ready or launch before 
   // Act
   const editing = h.send(r, 'canvas:edit', 3, { changes: { argsText: 'SYNTHETIC_PRIVATE_ARG', cwd: '/synthetic/new-cwd' } });
   await entered.promise; await h.launches[0].stopEntered.promise;
-  const pending = { state: h.sessions[0].getState(), count: h.launches.length,
+  await h.idle();
+  const pending = { count: h.launches.length,
     ready: images(r).filter(image => />ready<\/text>/.test(svg(image))).length };
   gate.resolve(); await editing; await h.idle(); await h.advance(100000);
   // Assert
-  assert.equal(pending.state.configurationPending, true); assert.equal(pending.count, 1); assert.equal(pending.ready, readyCount);
-  assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1); assert.equal(h.sessions[0].getState().enabled, false);
+  assert.equal(pending.count, 1); assert.equal(pending.ready, readyCount);
+  assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
   assert.match(svg(images(r).at(-1)), />ready<\/text>/);
   assert.deepEqual(r.writes, [{ ...initial, argsText: 'SYNTHETIC_PRIVATE_ARG', cwd: '/synthetic/new-cwd' }]);
   assert.ok(r.writes.every(value => !Object.hasOwn(value, 'enabled') && !Object.hasOwn(value, 'runRequested')));
@@ -864,16 +835,17 @@ for (const explicit of [false, true]) {
     // Arrange
     const h = harness(t), r = runtime(); await h.appear(r); await h.claim(r); await h.tap(r);
     const update = parseOutputUpdate(`progress:45|label:Hi;${explicit ? 'value-color:red;label-color:blue' : 'value-color:accent;label-color:accent'}`);
-    h.launches[0].callbacks.onUpdate(update); await h.idle(); await h.finish(); const due = h.sessions[0].getState().dueMs;
+    h.launches[0].callbacks.onUpdate(update); await h.idle(); await h.finish(); await h.advance(1000);
     // Act
     await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef' } }); await h.idle();
     // Assert
     const rendered = svg(images(r).at(-1)); assert.ok(rendered.includes('#abcdef'));
     if (explicit) { assert.ok(rendered.includes('fill="#ff0000"')); assert.ok(rendered.includes('fill="#0000ff"')); }
     else assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), ['#abcdef', '#abcdef']);
-    assert.equal(h.sessions[0].getState().dueMs, due); assert.equal(h.sessions[0].getState().enabled, true);
     assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    await h.advance(3999); assert.equal(h.launches.length, 1);
+    await h.advance(1); assert.equal(h.launches.length, 2);
   });
 }
 
@@ -884,8 +856,7 @@ test('cosmetic and interval edits preserve a fatal protocol error instead of ena
   // Act
   await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef', intervalSeconds: 10 } }); await h.advance(100000);
   // Assert
-  assert.equal(h.launches.length, 1); assert.equal(h.sessions[0].getState().protocolBlocked, true);
-  assert.equal(h.sessions[0].getState().suspended, true);
+  assert.equal(h.launches.length, 1);
   assert.equal(images(r).at(-1), createErrorArtwork('IMAGE_PROTOCOL_ERROR', '#abcdef'));
 });
 
@@ -898,9 +869,10 @@ test('complete matching storage tolerates property order without an authority or
   // Act
   await h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10, themeColor: '#abcdef' } }); await h.tap(r); await h.finish();
   // Assert
-  assert.equal(h.states[0].isBlocked(), false); assert.equal(h.sessions[0].getState().persistenceBlocked, false);
-  assert.equal(h.sessions[0].getState().dueMs, 10000); assert.equal(h.launches.length, 1);
+  assert.equal(h.launches.length, 1); assert.equal(h.replies.at(-1).status, 'saved');
   assert.deepEqual(r.writes, [{ ...initial, intervalSeconds: 10, themeColor: '#abcdef' }]);
+  await h.advance(9999); assert.equal(h.launches.length, 1);
+  await h.advance(1); assert.equal(h.launches.length, 2);
 });
 
 for (const failure of ['write', 'read', 'mismatch']) {
@@ -916,7 +888,6 @@ for (const failure of ['write', 'read', 'mismatch']) {
     r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.appear(r, h.action, base); await h.advance(100000);
     // Assert
-    assert.equal(h.states[0].isBlocked(), true); assert.equal(h.sessions[0].getState().persistenceBlocked, true);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1); assert.equal(r.writes.length, 1);
     assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
     assert.equal(h.replies.at(-1).status, 'error'); assert.equal(h.replies.at(-1).diagnosticCode, 'STATE_SAVE_FAILED');
@@ -964,7 +935,9 @@ for (const terminal of ['success', 'ordinary', 'protocol']) {
     assert.deepEqual(hiddenDone, hiddenDisplay); assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
     assert.equal(images(r).at(-1), terminal === 'success' ? createPrimitiveArtwork(update)
       : createErrorArtwork(terminal === 'protocol' ? 'IMAGE_PROTOCOL_ERROR' : 'PROCESS_EXITED_NONZERO'));
-    assert.equal(h.sessions[0].getState().suspended, terminal === 'protocol'); assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, []);
+    await h.advance(3999); assert.equal(h.launches.length, 1);
+    await h.advance(1); assert.equal(h.launches.length, terminal === 'protocol' ? 1 : 2);
   });
 }
 
@@ -979,7 +952,7 @@ test('hidden running output restores latest frame without stopping or restarting
   // Assert
   assert.deepEqual(before, hidden); assert.equal(images(r).at(-1), createPrimitiveArtwork(update));
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-  assert.equal(h.sessions[0].getState().phase, 'running');
+  await h.advance(100000); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
 });
 
 for (const hidden of [false, true]) {
@@ -991,11 +964,9 @@ for (const hidden of [false, true]) {
     h.emit('disconnect', { id: 'synthetic-foreign-device', isConnected: false }); await h.idle(); const foreignStops = h.launches[0].stops;
     r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('connect', r.device); h.emit('wake'); await h.idle();
-    const before = h.sessions[0].getState(); await h.appear(r); await h.advance(100000);
+    await h.appear(r); await h.advance(100000);
     // Assert
     assert.equal(foreignStops, 0); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-    assert.equal(before.visible, !hidden); assert.equal(before.enabled, false);
-    assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.sessions[0].getState().dueMs, undefined);
     assert.match(svg(images(r).at(-1)), />ready<\/text>/); assert.deepEqual(r.writes, []);
     assert.deepEqual(h.registrations, ['connect', 'disconnect', 'wake']);
   });
@@ -1016,7 +987,7 @@ test('real Run and Timer adapters retain separate intent/hide policies and all e
   // Assert
   assert.deepEqual(hiddenStops, [0, 1]); assert.equal(h.launches.length, 4);
   assert.equal(h.launches[0].env.ELGATO_ACTION_UUID, TIMER_UUID); assert.equal(h.launches[1].env.ELGATO_ACTION_UUID, RUN_UUID);
-  assert.equal(h.sessions[0].getState().enabled, false); assert.equal(h.sessions[1].getState().runRequested, true);
+  assert.equal(h.launches[2].env.ELGATO_ACTION_UUID, RUN_UUID); assert.equal(h.launches[3].env.ELGATO_ACTION_UUID, RUN_UUID);
   assert.deepEqual(timer.writes, []); assert.deepEqual(run.writes, []);
   assert.deepEqual(h.registrations, ['connect', 'disconnect', 'wake', 'connect', 'disconnect', 'wake']);
 });
@@ -1040,11 +1011,13 @@ for (const invalidate of ['hide', 'stop', 'disconnect']) {
     assert.equal(h.launches.length, 0);
     assert.ok(images(r).slice(before).every(image => !/>loading\.\.\.<\/text>/.test(svg(image))));
     assert.ok(r.display.filter(([kind]) => kind === 'title').every(([, title]) => title === ''));
-    assert.equal(h.sessions[0].getState().enabled, invalidate === 'hide'); assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, []);
+    await h.appear(r); await h.advance(100000);
+    assert.equal(h.launches.length, invalidate === 'hide' ? 1 : 0);
   });
 }
 
-for (const invalidate of ['hide', 'stop', 'persistence']) {
+for (const invalidate of ['hide', 'stop']) {
   test(`producer held at native-title clear cannot hand off after ${invalidate}`, options, async t => {
     // Arrange
     const h = harness(t), r = runtime('synthetic-title', { ...base, ...(invalidate === 'stop' ? { actionOnPress: 'stop' } : {}) }); await h.appear(r); await h.tap(r);
@@ -1056,16 +1029,11 @@ for (const invalidate of ['hide', 'stop', 'persistence']) {
     let transition;
     if (invalidate === 'hide') transition = h.action.onWillDisappear({ action: r });
     if (invalidate === 'stop') { void h.down(r); transition = h.up(r); }
-    if (invalidate === 'persistence') transition = h.sessions[0].persistenceFailed();
     gate.resolve(); await transition; await h.idle();
     // Assert
     assert.equal(images(r).includes(createPrimitiveArtwork(stale)), false);
     if (invalidate === 'hide') { assert.equal(images(r).length, before); assert.equal(h.launches[0].stops, 0); }
     else assert.equal(h.launches[0].stops, 1);
-    if (invalidate === 'persistence') {
-      assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
-      assert.equal(h.sessions[0].getState().persistenceBlocked, true);
-    }
     assert.equal(h.launches.length, 1);
   });
 }
@@ -1082,7 +1050,6 @@ test('invalidated in-flight image failure after hiding cannot clear an existing 
   gate.reject(new Error('SYNTHETIC_PRIVATE_LATE_DISPLAY')); await hiding; await h.idle(); r.setImage = original;
   await h.finish({ status: 'error', error: 'Image protocol error.' }); await h.appear(r); await h.advance(100000);
   // Assert
-  assert.equal(h.sessions[0].getState().protocolBlocked, true); assert.equal(h.sessions[0].getState().suspended, true);
   assert.equal(images(r).at(-1), createErrorArtwork('IMAGE_PROTOCOL_ERROR')); assert.equal(h.launches.length, 1);
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_LATE_DISPLAY')), false);
 });
@@ -1106,7 +1073,7 @@ for (const position of ['above', 'below']) for (const [suffix, colors] of [['', 
     const missing = { ...record.options }; delete missing['label-color'];
     h.launches[0].callbacks.onUpdate({ ...record, options: missing }); await h.idle();
     const afterRejected = images(r).at(-1); await h.finish();
-    const due = h.sessions[0].getState().dueMs;
+    await h.advance(1000);
     await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef' } }); await h.idle();
     const rendered = svg(images(r).at(-1));
     // Assert
@@ -1114,10 +1081,11 @@ for (const position of ['above', 'below']) for (const [suffix, colors] of [['', 
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), position === 'above' ? ['Items', '42'] : ['42', 'Items']);
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), position === 'above' ? [...colors].reverse() : colors);
     assert.match(rendered, /font-size="48"/); assert.match(rendered, /font-size="14.25"/); assert.match(rendered, /stroke="#abcdef"/);
-    assert.equal(JSON.stringify(record), before); assert.equal(h.sessions[0].getState().dueMs, due);
-    assert.equal(h.sessions[0].getState().enabled, true); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
+    assert.equal(JSON.stringify(record), before); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    await h.advance(3999); assert.equal(h.launches.length, 1);
+    await h.advance(1); assert.equal(h.launches.length, 2);
   });
 }
 for (const [suffix, caption] of [['', '1.6%'], [';display:17 done', '17 done']]) {
@@ -1133,17 +1101,18 @@ for (const [suffix, caption] of [['', '1.6%'], [';display:17 done', '17 done']])
     const missing = { ...record.options }; delete missing.display;
     h.launches[0].callbacks.onUpdate({ ...record, options: missing }); await h.idle();
     const afterRejected = images(r).at(-1); await h.finish();
-    const due = h.sessions[0].getState().dueMs;
+    await h.advance(1000);
     await h.send(r, 'canvas:edit', 3, { changes: { themeColor: '#abcdef' } }); await h.idle();
     const rendered = svg(images(r).at(-1));
     // Assert
     assert.equal(afterRejected, accepted);
     assert.deepEqual([...rendered.matchAll(/<text\b[^>]*>([^<]*)<\/text>/g)].map(match => match[1]), [caption]);
     assert.equal(/stroke-dasharray="([^"]*)"/.exec(rendered)[1], /stroke-dasharray="([^"]*)"/.exec(svg(accepted))[1]);
-    assert.equal(h.sessions[0].getState().dueMs, due); assert.equal(h.sessions[0].getState().enabled, true);
     assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    await h.advance(3999); assert.equal(h.launches.length, 1);
+    await h.advance(1); assert.equal(h.launches.length, 2);
   });
 }
 
@@ -1155,10 +1124,9 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     const initial = { ...base, ...(policy === undefined ? {} : { actionOnPress: policy }) };
     const h = harness(t), r = runtime('synthetic-policy', initial); await h.appear(r);
     // Act
-    await h.tap(r); const display = [...r.display]; await h.tap(r); const state = h.sessions[0].getState();
+    await h.tap(r); const display = [...r.display]; await h.tap(r); await h.advance(100000);
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, policy === 'stop' ? 1 : 0);
-    assert.equal(state.enabled, policy !== 'stop');
     if (policy !== 'stop') assert.deepEqual(r.display, display);
     assert.deepEqual(h.launches[0].settings, { executable: base.executable, args: [] });
     assert.deepEqual(await r.getSettings(), initial); assert.deepEqual(r.writes, []);
@@ -1171,8 +1139,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     // Act
     await h.tap(r); await h.advance(100000);
     // Assert
-    assert.equal(h.launches.length, policy === 'stop' ? 1 : 2); assert.equal(h.sessions[0].getState().enabled, policy !== 'stop');
-    assert.equal(h.sessions[0].getState().dueMs, undefined); assert.ok(h.launches.every(launch => launch.stops === 0));
+    assert.equal(h.launches.length, policy === 'stop' ? 1 : 2); assert.ok(h.launches.every(launch => launch.stops === 0));
     assert.deepEqual(r.writes, []);
   });
 
@@ -1185,7 +1152,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     await h.advance(TIMER_HOLD_MS); await h.up(r); await h.up(r); await h.idle(); await h.advance(100000);
     // Assert
     assert.equal(before, 0); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-    assert.equal(h.sessions[0].getState().enabled, false); assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, []);
   });
 }
 
@@ -1196,9 +1163,9 @@ for (const policy of [undefined, 'refresh']) {
     await h.appear(r); await h.tap(r);
     // Act
     await h.tap(r); await h.advance(7000); await h.finish(); const count = h.launches.length;
-    const due = h.sessions[0].getState().dueMs; await h.advance(4999); const before = h.launches.length; await h.advance(1);
+    await h.advance(4999); const before = h.launches.length; await h.advance(1);
     // Assert
-    assert.equal(count, 1); assert.equal(due, 12000); assert.equal(before, 1); assert.equal(h.launches.length, 2);
+    assert.equal(count, 1); assert.equal(before, 1); assert.equal(h.launches.length, 2);
     assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes, []);
   });
 }
@@ -1212,16 +1179,20 @@ for (const stage of ['disabled', 'waiting', 'running', 'hidden', 'suspended']) {
     if (stage === 'waiting' || stage === 'hidden') { await h.finish(); await h.advance(1000); }
     if (stage === 'hidden') await h.action.onWillDisappear({ action: r });
     if (stage === 'suspended') { h.launches[0].callbacks.onError('Image protocol error.'); await h.finish({ status: 'error', error: 'Image protocol error.' }); }
-    const before = h.sessions[0].getState(), count = h.launches.length;
+    const shown = [...r.display], count = h.launches.length;
     // Act
     await h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await h.idle();
-    const after = h.sessions[0].getState();
     await h.send(r, 'canvas:edit', 4, { changes: { actionOnPress: 'stop' } }); await h.idle();
     // Assert
-    assert.deepEqual(after, before); assert.equal(h.launches.length, count); assert.ok(h.launches.every(launch => launch.stops === 0));
+    assert.deepEqual(r.display, shown); assert.equal(h.launches.length, count); assert.ok(h.launches.every(launch => launch.stops === 0));
     assert.deepEqual(r.writes, [{ ...initial, actionOnPress: 'stop' }]);
-    assert.deepEqual(h.states[0].getSettings(), r.writes[0]); assert.equal(h.replies.at(-1).status, 'saved');
+    assert.deepEqual(h.replies.at(-1).settings, r.writes[0]); assert.equal(h.replies.at(-1).status, 'saved');
     if (stage === 'suspended') assert.equal(images(r).at(-1), createErrorArtwork('IMAGE_PROTOCOL_ERROR'));
+    if (stage === 'hidden') await h.appear(r);
+    if (stage === 'waiting' || stage === 'hidden') {
+      await h.advance(3999); assert.equal(h.launches.length, count);
+      await h.advance(1); assert.equal(h.launches.length, count + 1);
+    } else { await h.advance(100000); assert.equal(h.launches.length, count); }
   });
 }
 
@@ -1233,7 +1204,7 @@ test('backend accepts policy with unknown complete JSON but does not erase it or
   await h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await h.idle();
   // Assert
   assert.deepEqual(r.writes, [{ ...initial, actionOnPress: 'stop' }]); assert.equal(h.replies.at(-1).status, 'saved');
-  assert.equal(h.launches.length, 0); assert.equal(h.sessions[0].getState().enabled, false);
+  await h.advance(100000); assert.equal(h.launches.length, 0);
 });
 
 test('actual Run backend rejects Timer policy while its ordinary key toggle remains unchanged', options, async t => {
@@ -1261,7 +1232,7 @@ test('backend policy received between key-down and key-up controls recognized ac
   // Act
   await h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await h.up(r); await h.idle();
   // Assert
-  assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1); assert.equal(h.sessions[0].getState().enabled, false);
+  await h.advance(100000); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
   assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
 });
 
@@ -1275,8 +1246,8 @@ for (const failure of ['write', 'read', 'mismatch']) {
     // Act
     await h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await h.idle(); await h.tap(r); await h.advance(100000);
     // Assert
-    assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1); assert.equal(h.states[0].isBlocked(), true);
-    assert.equal(h.sessions[0].getState().persistenceBlocked, true); assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
+    assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
+    assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
     assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_POLICY_PRIVATE')), false);
   });
@@ -1289,10 +1260,12 @@ test('backend pending policy confirmation preserves due time and blocks overdue 
   r.getSettings = async () => { entered.resolve(); await gate.promise; return read(); };
   // Act
   const editing = h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await entered.promise;
-  h.time.advance(4000); const count = h.launches.length, pending = h.sessions[0].getState();
+  h.time.advance(2999); await h.idle(); assert.equal(h.launches.length, 1);
+  h.time.advance(1); await h.idle(); const count = h.launches.length;
+  assert.equal(count, 1); assert.equal(h.replies.at(-1).requestId, 2);
   gate.resolve(); await editing; await h.idle();
   // Assert
-  assert.equal(count, 1); assert.equal(pending.configurationPending, true); assert.equal(pending.dueMs, 5000);
+  assert.equal(count, 1);
   assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
 });
@@ -1305,14 +1278,15 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     r.setTitle = async title => { r.display.push(['title', title]); if (!held) { held = true; entered.resolve(); await gate.promise; } };
     void h.down(r); const launching = h.up(r); await entered.promise;
     // Act
-    const phase = h.sessions[0].getState().phase;
+    assert.equal(h.launches.length, 0);
     void h.down(r); const recognized = h.up(r); gate.resolve();
     await Promise.all([launching, recognized]); await h.idle(); const count = h.launches.length;
     if (policy !== 'stop') await h.finish();
     const afterCompletion = h.launches.length; await h.advance(4999); const before = h.launches.length;
     // Assert
-    assert.equal(phase, 'starting'); assert.equal(count, policy === 'stop' ? 0 : 1);
-    assert.equal(afterCompletion, count); assert.equal(before, count); assert.equal(h.sessions[0].getState().enabled, policy !== 'stop');
+    assert.equal(count, policy === 'stop' ? 0 : 1);
+    assert.equal(afterCompletion, count); assert.equal(before, count);
+    await h.advance(1); assert.equal(h.launches.length, policy === 'stop' ? 0 : 2);
     assert.deepEqual(r.writes, []);
   });
 }
@@ -1321,9 +1295,9 @@ test('adapter release after owned completion uses waiting state rather than the 
   // Arrange
   const h = harness(t), r = runtime(); await h.appear(r); await h.tap(r); await h.down(r);
   // Act
-  await h.finish(); const phase = h.sessions[0].getState().phase; await h.up(r); await h.idle();
+  await h.finish(); const completed = images(r).at(-1); await h.up(r); await h.idle();
   // Assert
-  assert.equal(phase, 'waiting'); assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
+  assert.match(svg(completed), />success<\/text>/); assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
   assert.deepEqual(r.writes, []);
 });
 
@@ -1337,13 +1311,15 @@ for (const oldResult of ['mismatch', 'reject']) {
     const older = h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await entered.promise;
     const newer = h.send(r, 'canvas:edit', 4, { changes: { actionOnPress: 'refresh', intervalSeconds: 10, themeColor: '#abcdef' } });
     if (oldResult === 'reject') old.reject(new Error('SYNTHETIC_PRIVATE_POLICY_READ')); else old.resolve(base);
-    await Promise.all([older, newer]); await h.idle(); const state = h.sessions[0].getState();
+    await Promise.all([older, newer]); await h.idle();
     // Assert
-    assert.equal(h.states[0].isBlocked(), false); assert.equal(state.persistenceBlocked, false);
-    assert.equal(state.enabled, true); assert.equal(state.dueMs, 12000); assert.equal(h.launches.length, 1);
+    assert.equal(h.launches.length, 1);
     assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }, { ...base, actionOnPress: 'refresh', intervalSeconds: 10, themeColor: '#abcdef' }]);
     assert.equal(h.replies.at(-1).requestId, 4); assert.equal(h.replies.at(-1).status, 'saved');
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_POLICY_READ')), false);
+    await h.advance(9999); assert.equal(h.launches.length, 1);
+    await h.advance(1); assert.equal(h.launches.length, 2);
+    assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#abcdef');
   });
 }
 
@@ -1356,13 +1332,14 @@ test('adapter hold during pending policy save safely stops but waits for confirm
   // Act
   const editing = h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await entered.promise;
   void h.down(r); h.time.advance(TIMER_HOLD_MS, false); const stopping = h.up(r); await h.launches[0].stopEntered.promise;
-  const pending = h.sessions[0].getState(), count = h.launches.length;
+  await h.idle(); const count = h.launches.length;
   const readyPending = images(r).filter(image => />ready<\/text>/.test(svg(image))).length;
   gate.resolve(); await Promise.all([editing, stopping]); await h.idle(); await h.advance(100000);
   // Assert
-  assert.equal(pending.configurationPending, true); assert.equal(pending.enabled, false); assert.equal(count, 1);
+  assert.equal(count, 1);
   assert.equal(readyPending, ready); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-  assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]); assert.equal(h.sessions[0].getState().dueMs, undefined);
+  assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
+  assert.match(svg(images(r).at(-1)), />ready<\/text>/);
 });
 
 test('move-integrity Loop theme-only swapped owner loses old deadline output and protocol error without saves', options, async t => {

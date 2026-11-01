@@ -2132,6 +2132,22 @@ test('late success Ready publication cannot paint after a newer semantic Start',
   assert.equal(h.runs.length, 2);
 });
 
+test('persistence error invalidates pending Setup publication without granting execution', options, async () => {
+  // Arrange: persistence injection belongs to this public core interface, not an adapter factory spy.
+  const gate = deferred(), entered = deferred(), rendered = [];
+  const h = harness({ async onPresentation(kind, caption, current, color, footer) {
+    entered.resolve(); await gate.promise;
+    if (current()) rendered.push(footer);
+  } });
+  const appearing = h.session.appear({}); await entered.promise;
+  // Act
+  const failing = h.session.persistenceFailed(); gate.resolve();
+  await Promise.all([appearing, failing]); await h.session.whenIdle();
+  // Assert: normal Setup publication has separate positive coverage.
+  assert.deepEqual(rendered, []); assert.deepEqual(h.runs, []);
+  assert.deepEqual(h.diagnostics, ['STATE_SAVE_FAILED']);
+});
+
 test('persistence error invalidates pending Waiting caption/image publication and prevents launch', options, async () => {
   // Arrange
   const gate = deferred(), entered = deferred(), rendered = [];

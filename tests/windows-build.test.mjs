@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { rollup } from 'rollup';
 import { buildToolchainPaths } from '../scripts/bootstrap-toolchain.mjs';
 import { buildWindowsTests } from '../scripts/build-windows-tests.mjs';
@@ -49,7 +50,13 @@ fs.copyFileSync('.task/native/win32-x64/transport.node', '${plugin}/bin/${native
   await put(root, 'node_modules/.bin/package.json', '{"type":"module"}');
   await put(root, 'node_modules/.bin/streamdeck', `#!${process.execPath}
 import assert from 'node:assert/strict'; import { readFile, writeFile } from 'node:fs/promises';
-assert.deepEqual(process.argv.slice(2), ['pack', '${candidate}', '--output', 'dist', '--no-update-check', '--force']);
+import { parseArgs } from 'node:util';
+const parsed = parseArgs({ args: process.argv.slice(2), strict: true, allowPositionals: true, tokens: true,
+  options: { output: { type: 'string' }, 'no-update-check': { type: 'boolean' }, force: { type: 'boolean' } } });
+assert.deepEqual(parsed.positionals, ['pack', '${candidate}']);
+assert.deepEqual({ ...parsed.values }, { output: 'dist', 'no-update-check': true, force: true });
+const optionNames = parsed.tokens.filter(token => token.kind === 'option').map(token => token.name);
+assert.equal(optionNames.length, new Set(optionNames).size, 'Options must not be duplicated');
 assert.equal(await readFile('${candidate}/LICENSE', 'utf8'), 'Synthetic license');
 ${outcome === 'CLI failure' ? 'process.exitCode=7;' : outcome === 'missing installer' ? '// Intentionally emit no installer.' : `await writeFile('${installer}', ${JSON.stringify(outcome === 'empty installer' ? '' : 'synthetic installer')});`}
 `);
@@ -153,30 +160,52 @@ for (const scenario of ['missing required UI', 'linked stage', 'file stage root'
     if (scenario === 'file stage root') assert.equal(await readFile(path.join(f.root, candidate), 'utf8'), 'retained stage root');
   });
 }
-async function generateAssets(root, configurationIndex = 0) {
+function assertControlledEntry(code) {
+  const messages = [];
+  // Only the synthetic entry is evaluated; no host process or module loader is provided.
+  runInNewContext(code, { console: { log: message => messages.push(message) } }, { timeout: 1000 });
+  assert.deepEqual(messages, ['controlled entry']);
+}
+test('controlled entry behavior accepts equivalent string escapes', () => {
+  assertControlledEntry('console.log("controlled entry");');
+  assertControlledEntry(String.raw`console.log('controlled\x20entry');`);
+});
+async function generateAssets(root, destination) {
   await put(root, 'rollup.config.mjs', await readFile(path.join(repository, 'rollup.config.mjs')));
   const { default: configurations } = await import(pathToFileURL(path.join(root, 'rollup.config.mjs')).href);
-  const configuration = configurations[configurationIndex];
-  const plugins = configuration.plugins.filter(item => item && ['emit-windows-native-assets', 'emit-module-package-file', 'emit-inspector-html'].includes(item.name));
-  const bundle = await rollup({ input: 'fixture', plugins: [
-    { name: 'fixture-entry', resolveId: id => id === 'fixture' ? id : null, load: id => id === 'fixture' ? 'export const fixture = true;' : null }, ...plugins] });
-  try { return (await bundle.generate({ file: configuration.output.file, format: 'es' })).output.filter(item => item.type === 'asset'); }
+  const matches = configurations.filter(configuration => configuration.output.file === destination);
+  assert.equal(matches.length, 1, `One configured bundle must target ${destination}`);
+  const [configuration] = matches;
+  // Replace only the authored entry boundary; exercise every configured plugin
+  // and output option, without writing any generated repository destinations.
+  const entry = '\0controlled-entry.mjs';
+  const bundle = await rollup({ ...configuration, plugins: [
+    { name: 'fixture-entry', resolveId: id => id === configuration.input ? entry : null,
+      load: id => id === entry ? 'console.log("controlled entry");' : null }, ...configuration.plugins] });
+  try {
+    const { output } = await bundle.generate(configuration.output);
+    return new Map(output.map(item => [path.resolve(root, path.dirname(destination), item.fileName),
+      item.type === 'asset' ? item.source : item.code]));
+  }
   finally { await bundle.close(); }
 }
 test('Rollup emits transport bytes and ES module metadata', options, async () => {
   // Arrange
   const f = await nativeFixture();
   // Act
-  const assets = new Map((await generateAssets(f.root)).map(asset => [asset.fileName, asset.source]));
+  const files = await generateAssets(f.root, `${plugin}/bin/plugin.js`);
   // Assert
-  assert.deepEqual([...assets.keys()].sort(), [nativeName, 'package.json'].sort());
-  assert.deepEqual(Buffer.from(assets.get(nativeName)), f.binary); assert.equal(JSON.parse(assets.get('package.json')).type, 'module');
+  assert.deepEqual([...files.keys()].sort(), ['plugin.js', nativeName, 'package.json'].map(name => path.join(f.root, plugin, 'bin', name)).sort());
+  assert.deepEqual(Buffer.from(files.get(path.join(f.root, plugin, 'bin', nativeName))), f.binary);
+  assert.equal(JSON.parse(files.get(path.join(f.root, plugin, 'bin/package.json'))).type, 'module');
+  assertControlledEntry(files.get(path.join(f.root, plugin, 'bin/plugin.js')));
 });
 test('Rollup refuses a missing transport', options, async () => {
   // Arrange
   const root = await newRoot();
+  await put(root, `${plugin}/bin/${nativeName}`, 'stale transport');
   // Act / Assert
-  await assert.rejects(generateAssets(root), /ENOENT/);
+  await assert.rejects(generateAssets(root, `${plugin}/bin/plugin.js`), /ENOENT/);
 });
 test('Rollup emits authored inspector HTML bytes unchanged next to the inspector bundle', options, async () => {
   // Arrange: generate the authored markup, not a stale shipped destination.
@@ -184,17 +213,18 @@ test('Rollup emits authored inspector HTML bytes unchanged next to the inspector
   await put(root, 'src/inspector/run.html', source);
   await put(root, `${plugin}/ui/run.html`, 'stale inspector HTML');
   // Act
-  const assets = await generateAssets(root, 1);
+  const files = await generateAssets(root, `${plugin}/ui/run.js`);
   // Assert: run.html is relative to the configured inspector output directory.
-  assert.deepEqual(assets.map(asset => asset.fileName), ['run.html']);
-  assert.deepEqual(Buffer.from(assets[0].source), source);
+  assert.deepEqual([...files.keys()].sort(), ['run.html', 'run.js'].map(name => path.join(root, plugin, 'ui', name)).sort());
+  assert.deepEqual(Buffer.from(files.get(path.join(root, plugin, 'ui/run.html'))), source);
+  assertControlledEntry(files.get(path.join(root, plugin, 'ui/run.js')));
 });
 test('Rollup rejects missing authored inspector HTML despite a stale destination', options, async () => {
   // Arrange: retain a stale destination without creating the authored source.
   const root = await newRoot();
   await put(root, `${plugin}/ui/run.html`, 'stale inspector HTML');
   // Act / Assert: stale output must never make generation succeed.
-  await assert.rejects(generateAssets(root, 1), /ENOENT/);
+  await assert.rejects(generateAssets(root, `${plugin}/ui/run.js`), /ENOENT/);
 });
 test('test kit contains only driver, producer and transport and supports rebuild', options, async () => {
   // Arrange

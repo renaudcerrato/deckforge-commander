@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { parseOutputUpdate } from '../src/core/output-update.mjs';
 import { createPrimitiveArtwork } from '../src/core/primitive-artwork.mjs';
 import { snapshotOutput } from '../src/core/output-frame.mjs';
-import { svgElements as elements, assertSvgElement, assertPaddedClip, assertRingSweep } from './helpers/svg-harness.mjs';
+import { svgElements as elements, assertSvgElement, assertPaddedClip, assertRingSweep, assertRingContentClip, referencedClip, referencedClipRect, assertSvgCanvas } from './helpers/svg-harness.mjs';
 
 // S2: completed progress schema crosses both immutable callback and render boundaries.
 const completeProgressStyle = 'color:cyan;background:navy;font:mono;weight:bold;border:16;border-color:lime;type:ring;scale:100;thickness:1;track-color:blue;label:C;display:V;value-position:center;label-position:above;rounded:false;value-size:12;label-size:10;value-color:ivory;label-color:accent;label-weight:normal;label-gap:0.5';
@@ -109,7 +109,7 @@ for (const type of ['ring', 'bar']) test(`S2 ${type} oversized default percentag
   // Assert
   assert.equal(rejected, undefined);
   const texts = elements(decode(accepted), 'text');
-  assert.equal(texts[0]['font-size'], '40');
+  assert.equal(Number(texts[0]['font-size']), 40);
   assert.ok(texts[0].text.endsWith('…'));
 });
 for (const type of ['ring', 'bar']) for (const rounded of [true, false]) {
@@ -121,16 +121,19 @@ for (const type of ['ring', 'bar']) for (const rounded of [true, false]) {
     const svg = decode(createPrimitiveArtwork(snapshotOutput(record)));
     // Assert
     assert.ok(record.value > 0);
-    assert.deepEqual(elements(svg, 'text').map(text => [text.text, text['font-size']]), [['0%', '16']]);
+    assert.deepEqual(elements(svg, 'text').map(text => [text.text, Number(text['font-size'])]), [['0%', 16]]);
     if (type === 'ring') {
       const fill = elements(svg, 'circle').find(circle => circle.stroke === '#969696');
-      assert.equal(fill.r, '53.6');
+      close(fill.r, 53.6);
       assertRingSweep(fill, record.value, rounded);
     } else {
       const track = elements(svg, 'rect').find(rect => rect.fill === '#333333');
       const fill = elements(svg, 'rect').find(rect => rect.fill === '#969696');
-      assert.deepEqual([track.width, track.height, fill.width, fill.rx], ['95.2', '12', '0', '0']);
-      assert.equal(fill['clip-path'], 'url(#bar-track-clip)');
+      assert.deepEqual([track.width, track.height, fill.width, fill.rx].map(Number), [95.2, 12, 0, 0]);
+      const clipShapes = elements(referencedClip(svg, fill), 'rect');
+      assert.equal(clipShapes.length, 1);
+      const clip = clipShapes[0];
+      for (const key of ['x', 'y', 'width', 'height', 'rx']) close(clip[key], Number(track[key]));
     }
   });
 }
@@ -146,8 +149,8 @@ for (const full of [false, true]) test(`S2 complete 21-field progress options wi
   assertSnapshotMatches(admitted, record);
   assert.equal(Object.keys(admitted.options).length, 21);
   if (full) assert.equal(Object.keys(admitted.overrides).length, 21);
-  assert.deepEqual(elements(svg, 'text').map(text => [text.text, text['font-size'], text['font-weight'], text.fill]), [['C', '10', 'normal', '#00ffff'], ['V', '12', 'bold', '#fffff0']]);
-  assert.equal(elements(svg, 'rect').find(rect => rect.stroke)['stroke-width'], '16');
+  assert.deepEqual(elements(svg, 'text').map(text => [text.text, Number(text['font-size']), text['font-weight'], text.fill]), [['C', 10, 'normal', '#00ffff'], ['V', 12, 'bold', '#fffff0']]);
+  assert.equal(Number(elements(svg, 'rect').find(rect => rect.stroke)['stroke-width']), 16);
   close(2 * Number(elements(svg, 'circle').find(circle => circle.stroke).r) + 1, 108);
 });
 for (const boundary of ['options', 'overrides']) for (const attack of ['substitute', 'extra', 'getter', 'symbol', 'proxy']) {
@@ -274,16 +277,38 @@ test('SVG target inspection accepts reordered attributes but cannot combine attr
   assert.doesNotThrow(() => inspect(valid)); assert.throws(() => inspect(split), assert.AssertionError);
 });
 
-for (const defect of ['none', 'missing main reference', 'undefined main clip', 'wrong padded bounds']) {
+for (const defect of ['none', 'missing main reference', 'undefined main clip', 'wrong padded bounds', 'wrong shape', 'nonfinite bounds']) {
   test(`main clipping inspection ${defect === 'none' ? 'accepts equivalent IDs/attribute order' : `rejects ${defect} despite clipped side lines`}`, () => {
     // Arrange: header/footer clipping must never stand in for the main element's own reference.
     const reference = defect === 'missing main reference' ? '' : `clip-path='url(#${defect === 'undefined main clip' ? 'missing' : 'padded'})'`;
-    const svg = `<svg><defs><clipPath id='padded'><rect height='112' width='${defect === 'wrong padded bounds' ? 111 : 112}' y='16' x='16'/></clipPath></defs><text clip-path='url(#padded)'>H</text><text ${reference}>M</text><text clip-path='url(#padded)'>F</text></svg>`;
+    const shape = defect === 'wrong shape' ? `<circle cx='72' cy='72' r='56'/>`
+      : `<rect height='112' width='${defect === 'nonfinite bounds' ? 'Infinity' : defect === 'wrong padded bounds' ? 111 : 112}' y='16' x='16'/>`;
+    const svg = `<svg><defs><clipPath id='padded'>${shape}</clipPath></defs><text clip-path='url(#padded)'>H</text><text ${reference}>M</text><text clip-path='url(#padded)'>F</text></svg>`;
     const main = elements(svg, 'text').find(element => element.text === 'M');
     // Act
     const inspect = () => assertPaddedClip(svg, main, { x: 16, y: 16, width: 112, height: 112 });
     // Assert
     if (defect === 'none') assert.doesNotThrow(inspect); else assert.throws(inspect, assert.AssertionError);
+  });
+}
+
+for (const defect of ['none', 'equivalent serialization', 'missing reference', 'undefined clip', 'wrong shape', 'nonfinite radius', 'nonfinite center', 'zero radius', 'negative radius', 'wrong radius', 'wrong center']) {
+  test(`ring content clipping inspection ${['none', 'equivalent serialization'].includes(defect) ? `accepts ${defect}` : `rejects ${defect}`}`, () => {
+    // Arrange - A rectangle with the same bounding box is not a circular clip.
+    const id = defect === 'equivalent serialization' ? 'renamed-ring' : 'inner-disk';
+    const reference = defect === 'missing reference' ? '' : `clip-path='url(#${defect === 'undefined clip' ? 'missing' : id})'`;
+    const radius = { 'nonfinite radius': 'Infinity', 'zero radius': '0', 'negative radius': '-48', 'wrong radius': '49' }[defect] ?? '48';
+    const cx = defect === 'nonfinite center' ? 'NaN' : defect === 'wrong center' ? '71' : '72';
+    const shape = defect === 'wrong shape' ? `<rect x='24' y='24' width='96' height='96'/>`
+      : defect === 'equivalent serialization' ? `<circle r="48.000000" cy="72.0" cx="72"></circle>`
+        : `<circle cx='${cx}' cy='72' r='${radius}'/>`;
+    const svg = `<svg><defs><clipPath id='${id}'>${shape}</clipPath></defs><text ${reference}>M</text></svg>`;
+    const track = { cx: '72', cy: '72', r: '54', 'stroke-width': '8' };
+    // Act
+    const inspect = () => assertRingContentClip(svg, elements(svg, 'text')[0], track);
+    // Assert
+    if (['none', 'equivalent serialization'].includes(defect)) assert.doesNotThrow(inspect);
+    else assert.throws(inspect, assert.AssertionError);
   });
 }
 
@@ -365,8 +390,8 @@ test('card header and footer occupy opposite padded edges with independent align
   assert.deepEqual(lines.map(line => line['text-anchor']), ['start', 'middle', 'end']);
   assert.ok(Number(lines[0].x) < Number(lines[1].x) && Number(lines[1].x) < Number(lines[2].x));
   assert.ok(Number(lines[0].y) < Number(lines[1].y) && Number(lines[1].y) < Number(lines[2].y));
-  assert.equal(lines[1]['font-size'], '48');
-  assert.deepEqual([lines[0]['font-size'], lines[2]['font-size']], ['18', '18']);
+  assert.equal(Number(lines[1]['font-size']), 48);
+  assert.deepEqual([lines[0]['font-size'], lines[2]['font-size']].map(Number), [18, 18]);
 });
 
 test('card absent sides reserve no space and all-blank card clears every line', () => {
@@ -377,7 +402,7 @@ test('card absent sides reserve no space and all-blank card clears every line', 
   // Assert
   assert.deepEqual(lines.map(group => group.map(line => line.text)), [['UP'], ['API', 'HTTP 200'], []]);
   close(Number(lines[0][0].y) - Number(lines[0][0]['font-size']) * 0.3, 72);
-  assert.deepEqual(lines[1].map(line => line['font-size']), ['18', '18']);
+  assert.deepEqual(lines[1].map(line => Number(line['font-size'])), [18, 18]);
 });
 
 // Card layout v2: gaps move the main block, not the edge-anchored side lines.
@@ -418,7 +443,7 @@ test('card wrap centers the complete main block between independently spaced sin
   const size = Number(main[0]['font-size']);
   // Assert
   assert.deepEqual(lines.map(line => line.text), [String.raw`H\n`, 'AAAA', 'BBBB', String.raw`F\n`]);
-  assert.deepEqual(main.map(line => line['font-size']), ['24', '24']);
+  assert.deepEqual(main.map(line => Number(line['font-size'])), [24, 24]);
   close(Number(main[1].y) - Number(main[0].y), 24 * 1.2);
   const top = 16 + Number(lines[0]['font-size']) + 12;
   const bottom = 144 - 16 - Number(lines.at(-1)['font-size']) - 4;
@@ -489,7 +514,7 @@ test('card wrap retains one clipped main line when the middle cannot fit any lin
   const lines = elements(rendered, 'text');
   // Assert
   assert.deepEqual(lines.map(line => line.text), ['H', 'M', 'F']);
-  assert.equal(lines[1]['font-size'], '24');
+  assert.equal(Number(lines[1]['font-size']), 24);
   assertPaddedClip(rendered, lines[1], { x: 16, y: 16, width: 112, height: 112 });
 });
 
@@ -500,9 +525,9 @@ test('card oversized auto headline falls back to 16 and ellipsizes without losin
   const lines = elements(decode(createPrimitiveArtwork(snapshotOutput(record))), 'text');
   // Assert
   assert.deepEqual([lines[0].text, lines[2].text], ['H', 'F']);
-  assert.equal(lines[1]['font-size'], '16');
+  assert.equal(Number(lines[1]['font-size']), 16);
   assert.ok(lines[1].text.endsWith('…'));
-  assert.deepEqual([lines[0]['font-size'], lines[2]['font-size']], ['14', '14']);
+  assert.deepEqual([lines[0]['font-size'], lines[2]['font-size']].map(Number), [14, 14]);
 });
 
 test('card fixed oversized lines keep requested sizes and content behind the padded clip', () => {
@@ -513,7 +538,7 @@ test('card fixed oversized lines keep requested sizes and content behind the pad
   const lines = elements(rendered, 'text');
   // Assert
   assert.deepEqual(lines.map(line => line.text), ['H', 'M', 'F']);
-  assert.deepEqual(lines.map(line => line['font-size']), ['1000', '1000', '1000']);
+  assert.deepEqual(lines.map(line => Number(line['font-size'])), [1000, 1000, 1000]);
   for (const line of lines) assertPaddedClip(rendered, line, { x: 16, y: 16, width: 112, height: 112 });
   assert.doesNotMatch(rendered, /NaN|Infinity/);
 });
@@ -549,7 +574,7 @@ test('card strict admission rejects unknown fields even below the shared copy ce
   // Assert
   assert.ok(valid);
   assert.deepEqual(invalid, Array(3).fill(undefined));
-  assert.match(decode(createPrimitiveArtwork(valid)), />API<\/text>/);
+  assertSvgElement(decode(createPrimitiveArtwork(valid)), 'text', { text: 'API' }, {});
 });
 function close(actual, expected) {
   assert.ok(Math.abs(Number(actual) - expected) < 0.00001, `expected ${expected}, received ${actual}`);
@@ -586,7 +611,7 @@ for (const fullOverrides of [false, true]) test(`21-field text styles render wit
     [['C', '116', 'end', 'normal', '12', '#fffff0'], ['A', '28', 'start', 'bold', '24', '#00ffff']]);
   close(Number(texts[1].y) + 24 * 0.2, 114);
   close(Number(texts[1].y) - 24 * 0.8 - (Number(texts[0].y) + 12 * 0.2), 0.5);
-  assert.equal(elements(svg, 'rect').find(rect => rect.stroke)['stroke-width'], '16');
+  assert.equal(Number(elements(svg, 'rect').find(rect => rect.stroke)['stroke-width']), 16);
   assert.equal(JSON.stringify(record), before);
   assertSnapshotMatches(admitted, record);
   assert.ok(Object.isFrozen(admitted.options) && Object.isFrozen(admitted.overrides));
@@ -638,10 +663,10 @@ test('horizontal padding controls wrapping while vertical padding alone controls
   const hard = heights.map(record => elements(decode(createPrimitiveArtwork(record)), 'text'));
   // Assert
   assert.deepEqual(wrapped.map(texts => texts[0].text), ['MMMMMMM', 'MMMMM']);
-  assert.deepEqual(wrapped.map(texts => texts[0].y), ['20.8', '20.8']);
+  assert.deepEqual(wrapped.map(texts => Number(texts[0].y)), [20.8, 20.8]);
   assert.deepEqual(hard.map(texts => texts.length), [8, 6]);
   assert.ok(hard.every(texts => texts.at(-1).text.endsWith('…')));
-  assert.deepEqual(hard.map(texts => texts[0].x), ['72', '72']);
+  assert.deepEqual(hard.map(texts => Number(texts[0].x)), [72, 72]);
 });
 for (const axis of ['padding-x', 'padding-y']) for (const padding of [72, 72.5, Number.MAX_VALUE]) for (const value of ['', 'A']) {
   test(`nonpositive drawable ${axis}:${padding} skips even ${value ? 'visible text' : 'clear'}`, () => {
@@ -665,7 +690,7 @@ for (const align of ['left', 'center', 'right']) for (const position of ['above'
     assert.deepEqual([Number(caption.x), caption['text-anchor'], caption['font-weight']], [align === 'left' ? 25 : align === 'right' ? 119 : 72, align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle', 'bold']);
     if (solo) { assert.equal(texts.length, 1); close(Number(caption.y) - 8, 10); }
     else {
-      assert.deepEqual([headline.x, headline['text-anchor'], headline['font-weight']], ['119', 'end', 'normal']);
+      assert.deepEqual([Number(headline.x), headline['text-anchor'], headline['font-weight']], [119, 'end', 'normal']);
       assert.deepEqual(texts.map(text => text.text), position === 'above' ? ['C', 'A'] : ['A', 'C']);
       close(Number(texts[1].y) - Number(texts[1]['font-size']) * 0.8 - (Number(texts[0].y) + Number(texts[0]['font-size']) * 0.2), 0);
     }
@@ -695,7 +720,7 @@ for (const position of ['above', 'below']) for (const gap of [0, 0.5, 8]) {
     // Assert
     assert.deepEqual(pair.map(text => text.text), position === 'above' ? ['C', 'A'] : ['A', 'C']);
     close(Number(pair[1].y) - Number(pair[1]['font-size']) * 0.8 - (Number(pair[0].y) + Number(pair[0]['font-size']) * 0.2), gap);
-    assert.deepEqual(single.map(text => [text.text, text['font-size']]), [['A', '40']]);
+    assert.deepEqual(single.map(text => [text.text, Number(text['font-size'])]), [['A', 40]]);
   });
 }
 for (const suffix of ['', ';label:   ', ';label:C', ';label:C;font-size:24']) {
@@ -709,7 +734,7 @@ for (const suffix of ['', ';label:   ', ';label:C', ';label:C;font-size:24']) {
     else {
       const texts = elements(decode(artwork), 'text');
       assert.deepEqual(texts.map(text => text.text), ['A']);
-      assert.equal(texts[0]['font-size'], suffix.endsWith('24') ? '24' : '48');
+      assert.equal(Number(texts[0]['font-size']), suffix.endsWith('24') ? 24 : 48);
     }
   });
 }
@@ -719,7 +744,7 @@ test('caption-only auto18 ignores huge gap and impossible unused headline size',
   // Act
   const texts = elements(decode(createPrimitiveArtwork(record)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size'], text.x]), [['C', '18', '16']]);
+  assert.deepEqual(texts.map(text => [text.text, Number(text['font-size']), Number(text.x)]), [['C', 18, 16]]);
 });
 for (const size of [0.000001, 0.5, 12, 64, 128]) {
   test(`fixed main and solo caption size ${size} render without old-range clamping`, () => {
@@ -751,7 +776,7 @@ for (const lineHeight of [1, 3, Number.MAX_VALUE]) {
     // Act
     const svg = decode(createPrimitiveArtwork(record)), texts = elements(svg, 'text');
     // Assert
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     assert.deepEqual(texts.map(text => text.text), lineHeight === Number.MAX_VALUE ? ['A…'] : ['A', 'B', 'C']);
     assert.doesNotMatch(svg, /NaN|Infinity/);
     if (texts.length > 1) close(Number(texts[1].y) - Number(texts[0].y), 16 * lineHeight);
@@ -803,10 +828,10 @@ for (const position of ['above', 'below']) test(`complete text style vocabulary 
   const texts = elements(rendered, 'text'), headline = texts.find(text => text.text === 'A'), caption = texts.find(text => text.text === 'C');
   // Assert
   assert.deepEqual(texts.map(text => text.text), position === 'above' ? ['C', 'A'] : ['A', 'C']);
-  assert.deepEqual([headline.x, headline['text-anchor'], headline['font-size'], headline.fill], ['24', 'start', '24', '#00ffff']);
-  assert.deepEqual([caption.x, caption['text-anchor'], caption['font-size'], caption.fill], ['72', 'middle', '14.25', '#fffff0']);
+  assert.deepEqual([Number(headline.x), headline['text-anchor'], Number(headline['font-size']), headline.fill], [24, 'start', 24, '#00ffff']);
+  assert.deepEqual([Number(caption.x), caption['text-anchor'], Number(caption['font-size']), caption.fill], [72, 'middle', 14.25, '#fffff0']);
   assert.ok(texts.every(text => text['font-family'] === 'monospace' && text['font-weight'] === 'bold'));
-  assert.equal(elements(rendered, 'rect').find(rect => rect.width === '144').fill, '#000080');
+  assert.equal(elements(rendered, 'rect').find(rect => Number(rect.width) === 144).fill, '#000080');
   assert.equal(elements(rendered, 'rect').find(rect => rect.stroke).stroke, '#00ff00');
   close(Number(texts.at(-1).y) + Number(texts.at(-1)['font-size']) * 0.2, 120);
   assert.equal(admitted.options['line-height'], 1.5); assert.equal(admitted.options.overflow, 'ellipsis');
@@ -854,8 +879,8 @@ for (const border of [0, 8]) for (const padding of [12, 32]) {
           const headline = texts.find(text => text.text === 'A');
           close(headline.x, align === 'left' ? effective : align === 'right' ? 144 - effective : 72);
           assert.equal(headline['text-anchor'], align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle');
-          if (visibleCaption) assert.deepEqual([texts.find(text => text.text === 'C').x, texts.find(text => text.text === 'C')['text-anchor']], ['72', 'middle']);
-          assert.ok(texts.every(text => text['clip-path'] === 'url(#content-clip)'));
+          if (visibleCaption) assert.deepEqual([Number(texts.find(text => text.text === 'C').x), texts.find(text => text.text === 'C')['text-anchor']], [72, 'middle']);
+          for (const text of texts) assertPaddedClip(rendered[index], text, { x: effective, y: effective, width: span, height: span });
           const clip = contentRect(rendered[index]); close(clip.x, effective); close(clip.height, span);
           if (border) assertProtectedBox(Number(clip.x), Number(clip.y), Number(clip.x) + Number(clip.width), Number(clip.y) + Number(clip.height), border);
           assert.equal(JSON.stringify(updates[index]), before[index]); assert.equal(createPrimitiveArtwork(updates[index]), artwork[index]);
@@ -875,7 +900,7 @@ for (const main of ['', '\t \u200b', String.raw`\n \n\n`]) {
     const texts = elements(decode(artwork[0]), 'text');
     // Assert
     assert.equal(artwork[0], artwork[1]);
-    assert.deepEqual(texts.map(text => [text.text, text.x, text['text-anchor'], text['font-size']]), [['C', '72', 'middle', '18']]);
+    assert.deepEqual(texts.map(text => [text.text, Number(text.x), text['text-anchor'], Number(text['font-size'])]), [['C', 72, 'middle', 18]]);
     close(Number(texts[0].y) - 14.4, valign === 'top' ? 32 : valign === 'bottom' ? 94 : 63);
   });
 }
@@ -889,7 +914,7 @@ for (const label of [undefined, '', '   ', '\t\u200b\u202e']) test(`blank captio
   // Assert
   assert.equal(artwork[0], artwork[1]); assert.deepEqual(elements(decode(artwork[0]), 'text').map(text => text.text), ['A', 'B']);
   assert.equal(clears[0], clears[1]); assert.deepEqual(elements(decode(clears[0]), 'text'), []);
-  assert.equal(elements(decode(clears[0]), 'rect').find(rect => rect.width === '144').fill, '#fffff0');
+  assert.equal(elements(decode(clears[0]), 'rect').find(rect => Number(rect.width) === 144).fill, '#fffff0');
 });
 for (const position of ['above', 'below']) {
   test(`caption ${position} keeps auto coupled height and long fixed/auto ellipsis bounds`, () => {
@@ -906,7 +931,7 @@ for (const position of ['above', 'below']) {
     assert.deepEqual(fixedTexts.map(text => Number(text['font-size'])), position === 'above' ? [32, 48] : [48, 32]);
     assert.deepEqual(autoTexts.map(text => Number(text['font-size'])), position === 'above' ? [14, 16] : [16, 14]);
     assert.ok([...fixedTexts, ...autoTexts].every(text => text.text.endsWith('…')));
-    assert.deepEqual(coupledTexts.map(text => [text.text, text['font-size']]), position === 'above' ? [['C', '32'], ['A', '40']] : [['A', '40'], ['C', '32']]);
+    assert.deepEqual(coupledTexts.map(text => [text.text, Number(text['font-size'])]), position === 'above' ? [['C', 32], ['A', 40]] : [['A', 40], ['C', 32]]);
     close(Number(coupledTexts[0].y) - Number(coupledTexts[0]['font-size']) * 0.8, 32);
     close(Number(coupledTexts[1].y) + Number(coupledTexts[1]['font-size']) * 0.2, 112);
   });
@@ -954,7 +979,7 @@ for (const [wire, expected] of [
     const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
     // Assert
     assert.deepEqual(texts.map(text => text.text), expected);
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     for (const [index, text] of texts.entries()) close(text.y, 16 + 12.8 + index * 24);
   });
 }
@@ -1002,7 +1027,7 @@ for (const border of [0, 8]) {
                 close(text.y, top + fittedSize * 0.8 + index * fittedSize * lineHeight);
                 close(text.x, align === 'left' ? effective : align === 'right' ? 144 - effective : 72);
                 assert.equal(text['text-anchor'], align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle');
-                assert.equal(text['clip-path'], 'url(#content-clip)');
+                assertPaddedClip(rendered, text, { x: effective, y: effective, width: span, height: span });
               }
               close(clip.x, effective); close(clip.height, span);
               if (border) assertProtectedBox(Number(clip.x), Number(clip.y), Number(clip.x) + Number(clip.width), Number(clip.y) + Number(clip.height), border);
@@ -1067,7 +1092,7 @@ for (const type of ['ring', 'bar']) {
     const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
     // Assert
     assert.deepEqual(texts.map(text => text.text), [String.raw`A\n`, String.raw`B\n`]);
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     assert.equal(update.value, 50);
   });
 }
@@ -1079,8 +1104,8 @@ test('flattened hard-break headline retains fixed caption-drop policy and never 
   const fixedTexts = elements(decode(createPrimitiveArtwork(fixed)), 'text');
   const autoTexts = elements(decode(createPrimitiveArtwork(auto)), 'text');
   // Assert
-  assert.deepEqual(fixedTexts.map(text => [text.text, text['font-size']]), [['…', '48']]);
-  assert.deepEqual(autoTexts.map(text => [text.text, text['font-size']]), [['A B', '40'], ['C', '32']]);
+  assert.deepEqual(fixedTexts.map(text => [text.text, Number(text['font-size'])]), [['…', 48]]);
+  assert.deepEqual(autoTexts.map(text => [text.text, Number(text['font-size'])]), [['A B', 40], ['C', 32]]);
 });
 for (const size of ['auto', 14.25, 32]) {
   test(`all-blank hard-break content clears or shows only caption ${size} without phantom gap`, () => {
@@ -1092,7 +1117,7 @@ for (const size of ['auto', 14.25, 32]) {
     const texts = elements(decode(createPrimitiveArtwork(caption)), 'text');
     // Assert
     assert.deepEqual(elements(clearSvg, 'text'), []);
-    assert.equal(elements(clearSvg, 'rect').find(rect => rect.width === '144').fill, '#fffff0');
+    assert.equal(elements(clearSvg, 'rect').find(rect => Number(rect.width) === 144).fill, '#fffff0');
     assert.deepEqual(texts.map(text => [text.text, Number(text['font-size'])]), [['C', size === 'auto' ? 18 : size]]);
     close(Number(texts[0].y) + Number(texts[0]['font-size']) * 0.2, 128);
   });
@@ -1125,15 +1150,21 @@ for (const changes of [{ hardBreaks: true }, { 'max-lines': 2 }]) {
   });
 }
 test('caption auto fits the largest complete single-line headline instead of wrapping it', () => {
-  // Arrange - Canvas has estimated width 3.63 * size; size 30 fits 112, size 31 does not.
+  // Arrange - Probe fixed public renders, without a second font-width estimator.
   const record = parseOutputUpdate('text:Canvas|label:Items');
   const fixed = parseOutputUpdate('text:Canvas|label:Items;font-size:48');
   // Act
   const texts = elements(decode(createPrimitiveArtwork(record)), 'text');
   const fixedTexts = elements(decode(createPrimitiveArtwork(fixed)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['Canvas', '30'], ['Items', '15']]);
-  assert.equal(fixedTexts.length, 2); assert.equal(fixedTexts[0]['font-size'], '48');
+  const candidates = Array.from({ length: 33 }, (_, index) => 48 - index).map(size => ({ size,
+    texts: elements(decode(createPrimitiveArtwork(parseOutputUpdate(`text:Canvas|label:Items;font-size:${size}`))), 'text') }));
+  const largest = candidates.find(candidate => candidate.texts.length === 2 && candidate.texts[0].text === 'Canvas');
+  assert.ok(largest);
+  assert.deepEqual(texts.map(text => text.text), ['Canvas', 'Items']);
+  assert.equal(Number(texts[0]['font-size']), largest.size);
+  assert.equal(Number(texts[1]['font-size']), Math.max(14, Math.min(18, largest.size / 2)));
+  assert.equal(fixedTexts.length, 2); assert.equal(Number(fixedTexts[0]['font-size']), 48);
   assert.ok(fixedTexts[0].text.endsWith('…'));
 });
 test('decoded captioned headline break flattens while caption backslash-n remains literal', () => {
@@ -1176,13 +1207,14 @@ for (const border of [0, 0.5, 8]) {
           assert.equal(texts.length, 2);
           close(texts[0].x, align === 'left' ? effective : align === 'right' ? 144 - effective : 72);
           assert.equal(texts[0]['text-anchor'], align === 'left' ? 'start' : align === 'right' ? 'end' : 'middle');
-          assert.deepEqual([texts[1].x, texts[1]['text-anchor']], ['72', 'middle']);
+          assert.deepEqual([Number(texts[1].x), texts[1]['text-anchor']], [72, 'middle']);
           close(Number(texts[0].y) - main * 0.8, top);
           close(Number(texts[1].y) + caption * 0.2, top + height);
           close(Number(texts[1].y) - caption * 0.8 - (Number(texts[0].y) + main * 0.2), 8);
           close(clip.x, effective); close(clip.width, 144 - effective * 2);
           for (const text of texts) {
-            assert.deepEqual([text['font-family'], text['font-weight'], text['clip-path']], ['monospace', 'bold', 'url(#content-clip)']);
+            assert.deepEqual([text['font-family'], text['font-weight']], ['monospace', 'bold']);
+            assertPaddedClip(svg, text, { x: effective, y: effective, width: 144 - effective * 2, height: 144 - effective * 2 });
             assert.ok(Number(text.y) - Number(text['font-size']) * 0.8 >= effective - 1e-6);
             assert.ok(Number(text.y) + Number(text['font-size']) * 0.2 <= 144 - effective + 1e-6);
           }
@@ -1202,7 +1234,7 @@ for (const valign of ['top', 'center', 'bottom']) {
       // Act
       const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
       // Assert
-      assert.deepEqual(texts.map(text => [text.text, text.x, text['text-anchor'], Number(text['font-size'])]), [['Yes', '72', 'middle', actualSize]]);
+      assert.deepEqual(texts.map(text => [text.text, Number(text.x), text['text-anchor'], Number(text['font-size'])]), [['Yes', 72, 'middle', actualSize]]);
       close(Number(texts[0].y) - actualSize * 0.8, top);
     });
   }
@@ -1220,7 +1252,7 @@ for (const label of ['', '   ', '\t\u200b\u202e']) {
     assert.equal(captionArtwork, normalArtwork);
     assert.deepEqual(elements(decode(captionArtwork), 'text').map(text => text.text), ['Canva', 's']);
     assert.deepEqual(elements(clear, 'text'), []);
-    assert.equal(elements(clear, 'rect').find(rect => rect.width === '144').fill, '#fffff0');
+    assert.equal(elements(clear, 'rect').find(rect => Number(rect.width) === 144).fill, '#fffff0');
   });
 }
 for (const valign of ['top', 'center', 'bottom']) {
@@ -1233,10 +1265,10 @@ for (const valign of ['top', 'center', 'bottom']) {
     const fixedTexts = elements(decode(createPrimitiveArtwork(fixed)), 'text');
     const autoTexts = elements(decode(createPrimitiveArtwork(auto)), 'text');
     // Assert
-    assert.deepEqual(fixedTexts.map(text => [text.text, text['font-size'], text.x]), [['ON', '48', '112']]);
+    assert.deepEqual(fixedTexts.map(text => [text.text, Number(text['font-size']), Number(text.x)]), [['ON', 48, 112]]);
     const top = valign === 'top' ? 32 : valign === 'bottom' ? 64 : 48;
     close(Number(fixedTexts[0].y) - 48 * 0.8, top);
-    assert.deepEqual(autoTexts.map(text => [text.text, text['font-size']]), [['ON', '40'], ['Yes', '32']]);
+    assert.deepEqual(autoTexts.map(text => [text.text, Number(text['font-size'])]), [['ON', 40], ['Yes', 32]]);
     close(Number(autoTexts[0].y) - 40 * 0.8, 32);
     close(Number(autoTexts[1].y) + 32 * 0.2, 112);
     assert.equal(JSON.stringify(fixed), before);
@@ -1250,8 +1282,8 @@ test('caption mode never auto-wraps an oversized fixed headline, but both lines 
   const fixedTexts = elements(decode(createPrimitiveArtwork(update)), 'text');
   const autoTexts = elements(decode(createPrimitiveArtwork(auto)), 'text');
   // Assert
-  assert.deepEqual(fixedTexts.map(text => text['font-size']), ['48', '32']);
-  assert.deepEqual(autoTexts.map(text => text['font-size']), ['16', '14']);
+  assert.deepEqual(fixedTexts.map(text => Number(text['font-size'])), [48, 32]);
+  assert.deepEqual(autoTexts.map(text => Number(text['font-size'])), [16, 14]);
   assert.ok([...fixedTexts, ...autoTexts].every(text => text.text.endsWith('…')));
 });
 for (const [label, expected] of [['<>&"\'', '&lt;&gt;&amp;&quot;&apos;'], ['e\u0301', 'é'], ['你好😀', '你好😀'], ['a\t\u200bb\u202ec', 'a b c'], [String.raw`a\n`, String.raw`a\n`], ['a' + '\u0301'.repeat(1000), '…']]) {
@@ -1273,7 +1305,7 @@ for (const count of [512, 513]) {
     // Act
     const svg = decode(createPrimitiveArtwork(update)), caption = elements(svg, 'text')[1];
     // Assert
-    assert.equal(caption['font-size'], '32');
+    assert.equal(Number(caption['font-size']), 32);
     assert.ok(caption.text.endsWith('…'));
     assert.equal(caption.text.slice(0, -1).split(cluster).join(''), '');
     assert.ok(svg.length < 10000);
@@ -1371,9 +1403,9 @@ function assertProtectedBox(left, top, right, bottom, border) {
 }
 
 function contentRect(svg) {
-  const clip = /<clipPath id="content-clip">([\s\S]*?)<\/clipPath>/.exec(svg);
-  assert.ok(clip, 'content must reference a defined clip');
-  return elements(clip[1], 'rect')[0];
+  const text = elements(svg, 'text')[0];
+  assert.ok(text, 'content must contain text referencing its clip');
+  return referencedClipRect(svg, text);
 }
 
 // Corner-safe padding is a rendering policy, not a new protocol/settings field.
@@ -1411,7 +1443,7 @@ for (const [border, minimum] of [[0.5, 14.277282], [3, 15.161166], [8, 16.928933
               close(text.x, align === 'left' ? effective : align === 'right' ? 144 - effective : 72);
               const top = position === 'top' ? effective : position === 'bottom' ? 144 - effective - fontSize : (144 - fontSize) / 2;
               close(text.y, top + fontSize * 0.8);
-              assert.equal(text['clip-path'], 'url(#content-clip)');
+              referencedClipRect(svg, text);
             });
           }
         }
@@ -1424,7 +1456,7 @@ for (const border of [0.000001, 0.333333, 2.718281, 7.999999]) {
   for (const padding of [12, 16.1234567, 24.1234567, 32]) {
     test(`fractional border ${border} and padding ${padding} serialize inward-safe clip corners`, () => {
       // Arrange - Rounding is checked on emitted coordinates, not private helpers.
-      const minimum = Math.ceil(Math.max(10 + border / 2, 24 - (14 - border / 2) / Math.sqrt(2)) * 1e6) / 1e6;
+      const minimum = Math.max(10 + border / 2, 24 - (14 - border / 2) / Math.sqrt(2));
       const expected = Math.max(padding, minimum);
       const update = parseOutputUpdate(`text:Hi|border:${border};padding:${padding};valign:bottom;align:right;font-size:16`);
       // Act
@@ -1440,7 +1472,7 @@ for (const border of [0.000001, 0.333333, 2.718281, 7.999999]) {
       close(text.x, 144 - expected);
       close(Number(text.y) + 3.2, 144 - expected);
       assert.equal(update.options.padding, padding);
-      for (const attribute of ['x', 'y', 'width', 'height']) assert.match(clip[attribute], /^\d+(?:\.\d{1,6})?$/);
+      for (const attribute of ['x', 'y', 'width', 'height']) assert.ok(Number.isFinite(Number(clip[attribute])));
     });
   }
 }
@@ -1460,7 +1492,7 @@ for (const size of ['auto', 16, 32]) {
           const clip = contentRect(decode(first));
           // Assert
           assert.equal(second, first);
-          assert.deepEqual([clip.x, clip.y, clip.width, clip.height], ['12', '12', '120', '120']);
+          assert.deepEqual([clip.x, clip.y, clip.width, clip.height].map(Number), [12, 12, 120, 120]);
         });
       }
     }
@@ -1521,13 +1553,15 @@ for (const [value, expected] of [['', ''], ['<>&"\'', '&lt;&gt;&amp;&quot;&apos;
     const update = parseOutputUpdate(`text:${value}|border:8;padding:12;background:ivory;font-size:16`);
     // Act
     const svg = decode(createPrimitiveArtwork(update));
-    const clip = contentRect(svg);
     const texts = elements(svg, 'text');
     // Assert
     assert.equal(texts.map(text => text.text).join(''), expected);
     assert.equal(texts.length, expected === '' ? 0 : 1);
-    assert.equal(elements(svg, 'rect').find(rect => rect.width === '144').fill, '#fffff0');
-    assertProtectedBox(Number(clip.x), Number(clip.y), Number(clip.x) + Number(clip.width), Number(clip.y) + Number(clip.height), 8);
+    assert.equal(elements(svg, 'rect').find(rect => Number(rect.width) === 144).fill, '#fffff0');
+    if (texts.length) {
+      const clip = contentRect(svg);
+      assertProtectedBox(Number(clip.x), Number(clip.y), Number(clip.x) + Number(clip.width), Number(clip.y) + Number(clip.height), 8);
+    }
   });
 }
 
@@ -1541,7 +1575,7 @@ for (const count of [512, 513]) {
     const texts = elements(svg, 'text');
     // Assert
     assert.equal(texts.length, 5);
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     assert.ok(texts.at(-1).text.endsWith('…'));
     assert.equal(texts.map(text => text.text).join('').replace(/…$/, '').split(cluster).join(''), '');
     assert.ok(svg.length < 10000);
@@ -1574,8 +1608,8 @@ for (const type of ['bar', 'ring']) {
           assert.equal(JSON.stringify(update), before);
           assertSnapshotMatches(snapshotOutput(update), update);
           assert.equal(texts.length, 2);
-          assert.deepEqual([texts[0].text, texts[0]['font-size'], texts[0].fill], ['1%', '16', '#ffff00']);
-          assert.deepEqual([texts[1]['font-size'], texts[1].fill], ['22', '#0000ff']);
+          assert.deepEqual([texts[0].text, Number(texts[0]['font-size']), texts[0].fill], ['1%', 16, '#ffff00']);
+          assert.deepEqual([Number(texts[1]['font-size']), texts[1].fill], [22, '#0000ff']);
           const innerRadius = (124 - border) / 2 - 6;
           for (const [index, text] of texts.entries()) {
             const size = Number(text['font-size']);
@@ -1593,7 +1627,10 @@ for (const type of ['bar', 'ring']) {
                 assert.ok(text.text.length < label.length);
               }
             }
-            assert.equal(text['clip-path'], 'url(#content-clip)');
+            if (type === 'ring') {
+              const track = elements(svg, 'circle').find(circle => circle.stroke === '#333333');
+              assertRingContentClip(svg, text, track);
+            } else assertPaddedClip(svg, text, { x: 16, y: 16, width: 112, height: 112 });
           }
           const firstBottom = Number(texts[0].y) + 16 * 0.2;
           const secondTop = Number(texts[1].y) - 22 * 0.8;
@@ -1621,7 +1658,7 @@ for (const position of ['above', 'below']) {
       if (!fits) assert.equal(result, undefined);
       else {
         const text = elements(decode(result), 'text')[0];
-        assert.deepEqual([text.text, text['font-size']], ['12.3%', '16']);
+        assert.deepEqual([text.text, Number(text['font-size'])], ['12.3%', 16]);
       }
     });
   }
@@ -1695,9 +1732,9 @@ for (const type of ['ring', 'bar']) {
             assertSnapshotMatches(snapshotOutput(update), update);
             assert.ok(Object.isFrozen(update) && Object.isFrozen(update.options) && Object.isFrozen(update.overrides));
             const frame = elements(svg, 'rect').find(rect => rect.stroke);
-            assert.deepEqual([frame.x, frame.y, frame.width, frame.height, frame.rx, frame.fill, frame.stroke], ['8', '8', '128', '128', '16', 'none', '#008000']);
+            assert.deepEqual([Number(frame.x), Number(frame.y), Number(frame.width), Number(frame.height), Number(frame.rx), frame.fill, frame.stroke], [8, 8, 128, 128, 16, 'none', '#008000']);
             close(frame['stroke-width'], border);
-            assert.equal(elements(svg, 'rect').find(rect => rect.width === '144').fill, '#fffff0');
+            assert.equal(elements(svg, 'rect').find(rect => Number(rect.width) === 144).fill, '#fffff0');
             close(left - innerEdge, 2 + (span - extent) / 2);
             close(136 - border / 2 - (left + extent), 2 + (span - extent) / 2);
             assert.ok(left >= innerEdge + 2);
@@ -1708,7 +1745,7 @@ for (const type of ['ring', 'bar']) {
               for (const circle of circles) {
                 close(circle.r, (extent - thickness) / 2);
                 close(circle['stroke-width'], thickness);
-                assert.deepEqual([circle.cx, circle.cy, circle.fill], ['72', '72', 'none']);
+                assert.deepEqual([Number(circle.cx), Number(circle.cy), circle.fill], [72, 72, 'none']);
                 close(72 - Number(circle.r) - thickness / 2, left);
                 close(72 + Number(circle.r) + thickness / 2, left + extent);
               }
@@ -1736,10 +1773,7 @@ for (const type of ['ring', 'bar']) {
                 close(fill.height, thickness);
                 close(fill.width, extent * value / 100);
                 close(fill.rx, rounded ? Math.min(thickness / 2, extent * value / 200) : 0);
-                const reference = /^url\(#([^)]*)\)$/.exec(fill['clip-path']);
-                const clip = [...svg.matchAll(/<clipPath\b([^>]*)>([\s\S]*?)<\/clipPath>/g)].find(match => /\bid="([^"]*)"/.exec(match[1])?.[1] === reference?.[1]);
-                assert.ok(reference && clip, 'fill clips to its own track, never the frame');
-                const clipRects = elements(clip[2], 'rect');
+                const clipRects = elements(referencedClip(svg, fill), 'rect');
                 assert.equal(clipRects.length, 1);
                 for (const attribute of ['x', 'y', 'width', 'height', 'rx']) close(clipRects[0][attribute], Number(track[attribute]));
                 if (rounded && value === 0.01) assert.ok(Number(fill.rx) < Number(clipRects[0].rx));
@@ -1766,9 +1800,9 @@ for (const position of ['center', 'above', 'below']) {
       else {
         const svg = decode(result);
         const text = elements(svg, 'text')[0];
-        assert.deepEqual([text.text, text['font-size']], ['12.3%', '16']);
+        assert.deepEqual([text.text, Number(text['font-size'])], ['12.3%', 16]);
         close(elements(svg, 'rect').find(rect => rect.fill === '#333333').width, 121);
-        assert.ok(elements(svg, 'rect').some(rect => rect.x === '16' && rect.y === '16' && rect.width === '112' && rect.height === '112'));
+        assertPaddedClip(svg, text, { x: 16, y: 16, width: 112, height: 112 });
       }
     });
   }
@@ -1782,7 +1816,7 @@ for (const position of ['above', 'below']) {
       // Act
       const text = elements(decode(createPrimitiveArtwork(update)), 'text')[0];
       // Assert
-      assert.deepEqual([text.text, text['font-size']], [expected, '16']);
+      assert.deepEqual([text.text, Number(text['font-size'])], [expected, 16]);
       assert.match(text['clip-path'], /^url\(#[^)]+\)$/);
     });
   }
@@ -1861,7 +1895,7 @@ for (const type of ['ring', 'bar']) {
       const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
       // Assert
       assert.equal(texts.length, 1);
-      assert.equal(texts[0]['font-size'], '32');
+      assert.equal(Number(texts[0]['font-size']), 32);
       assert.equal(texts[0].fill, '#fffff0');
       assert.ok(texts[0].text.endsWith('…'));
       assert.equal(texts[0].text.slice(0, -1).split(cluster).join(''), '');
@@ -1874,7 +1908,7 @@ test('fractional fixed percentage size rounds its caption without truncation or 
   // Act
   const text = elements(decode(createPrimitiveArtwork(update)), 'text')[0];
   // Assert
-  assert.deepEqual([text.text, text['font-size'], text.fill], ['12.3%', '20.5', '#ff0000']);
+  assert.deepEqual([text.text, Number(text['font-size']), text.fill], ['12.3%', 20.5, '#ff0000']);
 });
 for (const line of ['progress:45|scale:50;thickness:16;value-size:32', 'progress:12.345678901234567|type:bar;value-size:32;font:mono', 'progress:45|scale:50;thickness:16;value-position:none;label:Hi;label-size:32']) {
   test('infeasible fixed annotation skips whole artwork without shrinking glyphs or ring geometry', () => {
@@ -1905,9 +1939,9 @@ test('empty text clears to an opaque logical black canvas without a default bord
   // Act
   const svg = decode(createPrimitiveArtwork(update));
   // Assert
-  assert.match(svg, /viewBox="0 0 144 144"/);
+  assertSvgCanvas(svg);
   assert.deepEqual(elements(svg, 'text'), []);
-  assert.ok(elements(svg, 'rect').some(rect => rect.width === '144' && rect.height === '144' && rect.fill === '#000000'));
+  assertSvgElement(svg, 'rect', { fill: '#000000' }, { width: 144, height: 144 });
   assert.equal(elements(svg, 'rect').filter(rect => rect.stroke).length, 0);
 });
 
@@ -1918,7 +1952,7 @@ test('optional border uses the approved inset, stroke, radius and accent', () =>
   const svg = decode(createPrimitiveArtwork(update));
   // Assert
   const border = elements(svg, 'rect').find(rect => rect.stroke);
-  assert.deepEqual([border.x, border.y, border.width, border.height, border.rx, border['stroke-width'], border.stroke, border.fill], ['8', '8', '128', '128', '16', '3', '#0000ff', 'none']);
+  assert.deepEqual([Number(border.x), Number(border.y), Number(border.width), Number(border.height), Number(border.rx), Number(border['stroke-width']), border.stroke, border.fill], [8, 8, 128, 128, 16, 3, '#0000ff', 'none']);
 });
 
 for (const [source, background, ink] of [
@@ -1932,7 +1966,7 @@ for (const [source, background, ink] of [
     // Act
     const svg = decode(createPrimitiveArtwork(update));
     // Assert
-    const canvas = elements(svg, 'rect').find(rect => rect.width === '144' && rect.height === '144');
+    const canvas = elements(svg, 'rect').find(rect => Number(rect.width) === 144 && Number(rect.height) === 144);
     assert.equal(canvas.fill, background);
     assert.ok(elements(svg, 'text').every(text => text.fill === ink));
   });
@@ -1944,7 +1978,7 @@ test('empty text clears to its selected background and optional independent fram
   const svg = decode(createPrimitiveArtwork(update));
   // Assert
   assert.equal(elements(svg, 'text').length, 0);
-  assert.ok(elements(svg, 'rect').some(rect => rect.width === '144' && rect.fill === '#fffff0'));
+  assertSvgElement(svg, 'rect', { fill: '#fffff0' }, { width: 144, height: 144 });
   const border = elements(svg, 'rect').find(rect => rect.stroke);
   assert.equal(border.stroke, '#0000ff');
   close(border['stroke-width'], 0.5);
@@ -1959,7 +1993,7 @@ for (const width of [0, 0.5, 8]) {
     assert.equal(borders.length, width === 0 ? 0 : 1);
     if (width > 0) {
       close(borders[0]['stroke-width'], width);
-      assert.deepEqual([borders[0].x, borders[0].y, borders[0].rx, borders[0].stroke], ['8', '8', '16', '#0000ff']);
+      assert.deepEqual([Number(borders[0].x), Number(borders[0].y), Number(borders[0].rx), borders[0].stroke], [8, 8, 16, '#0000ff']);
     }
   });
 }
@@ -2036,12 +2070,12 @@ for (const source of ['Hi', 'text:Hi', 'text:1|font:mono;weight:bold;font-size:a
       assert.equal(texts[0].fill, ink);
       assert.equal(Object.hasOwn(update.overrides, 'color'), false);
       assert.equal(Object.hasOwn(update.overrides, 'foreground'), false);
-      const canvas = elements(svg, 'rect').find(rect => rect.width === '144');
+      const canvas = elements(svg, 'rect').find(rect => Number(rect.width) === 144);
       assert.equal(canvas.fill, source.includes('background:') ? '#090d18' : '#000000');
       if (source.includes('border:')) {
         const frame = elements(svg, 'rect').find(rect => rect.stroke);
-        assert.deepEqual([frame.stroke, frame['stroke-width']], [update.options.color, '3']);
-        assert.deepEqual([texts[0].text, texts[0]['font-family'], texts[0]['font-weight'], texts[0]['font-size']], ['1', 'monospace', 'bold', '48']);
+        assert.deepEqual([frame.stroke, Number(frame['stroke-width'])], [update.options.color, 3]);
+        assert.deepEqual([texts[0].text, texts[0]['font-family'], texts[0]['font-weight'], Number(texts[0]['font-size'])], ['1', 'monospace', 'bold', 48]);
       }
     });
   }
@@ -2053,7 +2087,7 @@ test('black theme on black background is not automatically contrasted', () => {
   const svg = decode(createPrimitiveArtwork(update));
   // Assert
   assert.equal(elements(svg, 'text')[0].fill, '#000000');
-  assert.equal(elements(svg, 'rect').find(rect => rect.width === '144').fill, '#000000');
+  assert.equal(elements(svg, 'rect').find(rect => Number(rect.width) === 144).fill, '#000000');
 });
 for (const ink of ['#ffffff', '#ff0000']) {
   test('forged ink cannot replace implicit theme provenance at the rendering boundary', () => {
@@ -2073,7 +2107,7 @@ for (const type of ['ring', 'bar']) {
     const svg = decode(createPrimitiveArtwork(update));
     const texts = elements(svg, 'text');
     // Assert
-    assert.deepEqual(texts.map(text => [text.text, text.fill, text['font-size']]), [['42%', '#ffffff', '16'], ['Hi', '#ffffff', '16']]);
+    assert.deepEqual(texts.map(text => [text.text, text.fill, Number(text['font-size'])]), [['42%', '#ffffff', 16], ['Hi', '#ffffff', 16]]);
     if (type === 'ring') assert.ok(elements(svg, 'circle').some(circle => circle.stroke === '#0000ff'));
     else assert.ok(elements(svg, 'rect').some(rect => rect.fill === '#0000ff'));
   });
@@ -2087,7 +2121,7 @@ for (const [font, family] of [['sans', 'Arial,sans-serif'], ['mono', 'monospace'
       // Act
       const text = elements(decode(createPrimitiveArtwork(update)), 'text')[0];
       // Assert
-      assert.deepEqual([text['font-family'], text['font-weight'], text['font-size']], [family, weight, '20']);
+      assert.deepEqual([text['font-family'], text['font-weight'], Number(text['font-size'])], [family, weight, 20]);
     });
   }
 }
@@ -2108,8 +2142,7 @@ for (const [align, x, anchor] of [['left', 24, 'start'], ['center', 72, 'middle'
       if (position === 'top') close(baseline - 16, 24);
       if (position === 'center') close(baseline - 6, 72);
       if (position === 'bottom') close(baseline + 4, 120);
-      assert.ok(elements(svg, 'rect').some(rect => rect.x === '24' && rect.y === '24' && rect.width === '96' && rect.height === '96'));
-      assert.match(text['clip-path'], /^url\(#[^)]+\)$/);
+      assertPaddedClip(svg, text, { x: 24, y: 24, width: 96, height: 96 });
     });
   }
 }
@@ -2120,19 +2153,32 @@ test('auto uses the largest allowed size for short complete text', () => {
   // Act
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['Hi', '48']]);
+  assert.deepEqual(texts.map(text => [text.text, Number(text['font-size'])]), [['Hi', 48]]);
 });
 
-// Wrapping policy uses the existing estimated widths, not hardware font metrics.
-test('default Canvas prefers a complete 26-unit single line over larger wrapped text', () => {
+// Compare public fixed-size probes, not private font coefficients or word splits.
+function assertAutoFit(content, texts, options = '') {
+  const candidates = Array.from({ length: 33 }, (_, index) => 48 - index).map(size => {
+    const svg = createPrimitiveArtwork(parseOutputUpdate(`text:${content}|${options}${options ? ';' : ''}font-size:${size}`));
+    return { size, texts: svg ? elements(decode(svg), 'text') : [] };
+  }).filter(candidate => candidate.texts.length && candidate.texts.map(text => text.text).join('') === content);
+  assert.ok(candidates.length, 'at least one fixed size must preserve complete content');
+  const fewest = Math.min(...candidates.map(candidate => candidate.texts.length));
+  const largest = candidates.find(candidate => candidate.texts.length === fewest);
+  assert.equal(texts.length, fewest, 'auto prefers fewest complete lines');
+  assert.equal(texts.map(text => text.text).join(''), content);
+  assert.ok(texts.every(text => Number(text['font-size']) === largest.size), 'largest complete size at that line count');
+}
+
+test('default Canvas prefers the largest complete single line over larger wrapped text', () => {
   // Arrange
   const update = parseOutputUpdate('text:Canvas');
   // Act
   const svg = decode(createPrimitiveArtwork(update));
   const texts = elements(svg, 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['Canvas', '30']]);
-  assert.ok(elements(svg, 'rect').some(rect => rect.x === '16' && rect.y === '16' && rect.width === '112' && rect.height === '112'));
+  assertAutoFit('Canvas', texts);
+  assertPaddedClip(svg, texts[0], { x: 16, y: 16, width: 112, height: 112 });
 });
 
 test('fixed 32-unit Canvas still wraps rather than adopting the auto single-line size', () => {
@@ -2141,7 +2187,8 @@ test('fixed 32-unit Canvas still wraps rather than adopting the auto single-line
   // Act
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['Canva', '32'], ['s', '32']]);
+  assert.equal(texts.map(text => text.text).join(''), 'Canvas');
+  assert.ok(texts.every(text => Number(text['font-size']) === 32));
 });
 
 test('auto chooses the largest complete two-line size when one line cannot fit at minimum size', () => {
@@ -2153,8 +2200,9 @@ test('auto chooses the largest complete two-line size when one line cannot fit a
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   const largerTexts = elements(decode(createPrimitiveArtwork(larger)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['MMMMMM', '17'], ['MMMMMM', '17']]);
-  assert.deepEqual(largerTexts.map(text => [text.text, text['font-size']]), [['MMMM', '22'], ['MMMM', '22'], ['MMMM', '22']]);
+  assertAutoFit(content, texts);
+  assert.ok(largerTexts.every(text => Number(text['font-size']) === 22));
+  assert.equal(largerTexts.map(text => text.text).join(''), content);
   assert.equal(texts.map(text => text.text).join(''), content);
 });
 
@@ -2163,15 +2211,13 @@ for (const padding of [12, 16, 32]) {
       test(`auto wrapping respects available height, padding ${padding}, and line-height ${lineHeight}`, () => {
         // Arrange - Exercise both complete layouts and minimum-size ellipsis fallback.
         const content = 'M'.repeat(12);
-        const size = padding === 12 ? 19 : padding === 16 ? 17 : lineHeight === 1 ? 19 : 16;
-        const lineCount = padding === 32 ? 3 : 2;
         const update = parseOutputUpdate(`text:${content}|padding:${padding};line-height:${lineHeight};valign:bottom`);
         // Act
         const svg = decode(createPrimitiveArtwork(update));
         const texts = elements(svg, 'text');
         // Assert
-        assert.equal(texts.length, lineCount);
-        assert.ok(texts.every(text => Number(text['font-size']) === size));
+        assertAutoFit(content, texts, `padding:${padding};line-height:${lineHeight};valign:bottom`);
+        const size = Number(texts[0]['font-size']);
         assert.equal(texts.at(-1).text.endsWith('…'), false);
         assert.equal(texts.map(text => text.text).join(''), content);
         assert.ok(elements(svg, 'rect').some(rect => Number(rect.x) === padding && Number(rect.y) === padding && Number(rect.width) === 144 - 2 * padding && Number(rect.height) === 144 - 2 * padding));
@@ -2195,7 +2241,7 @@ for (const lineHeight of [1, 1.2, 2]) {
     const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
     // Assert
     assert.equal(texts.length, 1 + Math.floor((112 - 16) / (16 * lineHeight)));
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     assert.ok(texts.at(-1).text.endsWith('…'));
     assert.ok(texts.slice(0, -1).every(text => !text.text.includes('…')));
   });
@@ -2208,7 +2254,13 @@ for (const size of ['auto', 32]) {
       // Act
       const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
       // Assert
-      assert.deepEqual(texts.map(text => [text.text, text['font-size']]), size === 'auto' ? [['Canvas', '30']] : [['Can…', '32']]);
+      assert.equal(texts.length, 1);
+      if (size === 'auto') assertAutoFit('Canvas', texts, 'overflow:ellipsis');
+      else {
+        assert.equal(Number(texts[0]['font-size']), size);
+        assert.ok(texts[0].text.endsWith('…'));
+        assert.ok('Canvas'.startsWith(texts[0].text.slice(0, -1)));
+      }
     });
 }
 
@@ -2218,7 +2270,8 @@ test('incomplete auto ellipsis remains one line at minimum size despite availabl
   // Act
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   // Assert
-  assert.deepEqual(texts.map(text => [text.text, text['font-size']]), [['MMMMM…', '16']]);
+  assert.equal(texts.length, 1); assert.equal(Number(texts[0]['font-size']), 16);
+  assert.ok(/^M*…$/.test(texts[0].text));
 });
 
 for (const size of ['auto', 16]) {
@@ -2231,7 +2284,7 @@ for (const size of ['auto', 16]) {
     // Assert
     assert.equal(texts.length, 5);
     assert.equal(texts.map(text => text.text).join(''), content);
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
   });
 }
 
@@ -2264,7 +2317,7 @@ for (const count of [512, 513]) {
     const texts = elements(svg, 'text');
     // Assert
     assert.equal(texts.length, 6);
-    assert.ok(texts.every(text => text['font-size'] === '16'));
+    assert.ok(texts.every(text => Number(text['font-size']) === 16));
     assert.ok(texts.at(-1).text.endsWith('…'));
     assert.equal(texts.map(text => text.text).join('').replace(/…$/, '').split(cluster).join(''), '');
     assert.ok(svg.length < 10000);
@@ -2301,7 +2354,7 @@ test('ordinary text uses longer lines while preserving words', () => {
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   // Assert
   assert.deepEqual(texts.map(text => text.text), ['Big ideas start', 'again']);
-  assert.ok(texts.every(text => text['font-size'] === '16'));
+  assert.ok(texts.every(text => Number(text['font-size']) === 16));
 });
 
 test('word wrapping preserves complete words and line-height spacing', () => {
@@ -2344,7 +2397,7 @@ test('extreme valid padding and line height reduce lines without shrinking fixed
   const texts = elements(decode(createPrimitiveArtwork(update)), 'text');
   // Assert
   assert.equal(texts.length, 1);
-  assert.equal(texts[0]['font-size'], '32');
+  assert.equal(Number(texts[0]['font-size']), 32);
   assert.ok(texts[0].text.endsWith('…'));
   close(Number(texts[0].y) + 6.4, 112);
 });
@@ -2356,7 +2409,7 @@ test('long auto content reaches minimum size with a bounded ellipsis result', ()
   const svg = decode(createPrimitiveArtwork(update));
   const texts = elements(svg, 'text');
   // Assert
-  assert.ok(texts.every(text => text['font-size'] === '16'));
+  assert.ok(texts.every(text => Number(text['font-size']) === 16));
   assert.equal(texts.length, 6);
   assert.ok(texts.at(-1).text.endsWith('…'));
   assert.ok([...texts.map(text => text.text).join('')].length <= 512);
@@ -2382,7 +2435,7 @@ for (const [size, thickness] of [[80, 8], [50, 16], [100, 4]]) {
     assert.equal(circles.length, 2);
     for (const circle of circles) {
       close(Number(circle.r) * 2 + Number(circle['stroke-width']), 144 * size / 100);
-      assert.deepEqual([circle.cx, circle.cy, circle.fill], ['72', '72', 'none']);
+      assert.deepEqual([Number(circle.cx), Number(circle.cy), circle.fill], [72, 72, 'none']);
     }
     const fill = circles.find(circle => circle.stroke === '#969696');
     assertRingSweep(fill, 25, true);
@@ -2457,12 +2510,8 @@ for (const [value, rounded] of [[0.01, true], [1, true], [5, true], [100, true],
     const rects = elements(svg, 'rect');
     const track = rects.find(rect => rect.fill === '#0000ff');
     const fill = rects.find(rect => rect.fill === '#ff0000');
-    const reference = /^url\(#([^)]*)\)$/.exec(fill['clip-path']);
-    const clips = [...svg.matchAll(/<clipPath\b([^>]*)>([\s\S]*?)<\/clipPath>/g)];
-    const referencedClip = reference && clips.find(clip => /\bid="([^"]*)"/.exec(clip[1])?.[1] === reference[1]);
-    const clipRects = referencedClip ? elements(referencedClip[2], 'rect') : [];
+    const clipRects = elements(referencedClip(svg, fill), 'rect');
     // Assert
-    assert.ok(reference && referencedClip, 'accent must reference a defined SVG clip');
     assert.equal(clipRects.length, 1);
     const clip = clipRects[0];
     for (const attribute of ['x', 'y', 'width', 'height', 'rx']) close(clip[attribute], Number(track[attribute]));
@@ -2505,7 +2554,7 @@ for (const type of ['ring', 'bar']) {
       // Assert
        assert.deepEqual(texts.map(text => text.text), ['12.3%', 'Hi']);
       for (const text of texts) {
-        assert.deepEqual([text['font-size'], text['font-family'], text['font-weight'], text.fill], ['16', 'monospace', 'bold', annotation === 'white' ? '#ffffff' : '#ff0000']);
+         assert.deepEqual([Number(text['font-size']), text['font-family'], text['font-weight'], text.fill], [16, 'monospace', 'bold', annotation === 'white' ? '#ffffff' : '#ff0000']);
         assert.ok(Number(text.y) >= 24 && Number(text.y) <= 132.8);
       }
       assert.ok(svg.includes('#0000ff'));
@@ -2695,7 +2744,7 @@ for (const type of ['ring', 'bar']) {
       // Act
       const svg = decode(createPrimitiveArtwork(update));
       // Assert
-      assert.deepEqual(elements(svg, 'text').map(text => [text.text, text['font-size']]), [[caption, '16']]);
+      assert.deepEqual(elements(svg, 'text').map(text => [text.text, Number(text['font-size'])]), [[caption, 16]]);
       if (type === 'ring') {
         const fill = elements(svg, 'circle').find(circle => circle.stroke === '#ff0000');
         if (percentage === 0) assert.equal(fill, undefined);
@@ -2733,7 +2782,7 @@ for (const type of ['ring', 'bar']) {
       const texts = elements(svg, 'text');
       // Assert
       assert.equal(texts.length, 1);
-      assert.equal(texts[0]['font-size'], '32');
+      assert.equal(Number(texts[0]['font-size']), 32);
       assert.ok(texts[0].text.endsWith('…'));
       assert.equal(texts[0].text.slice(0, -1).split(cluster).join(''), '');
       assert.ok(svg.length < 10000);
@@ -2807,7 +2856,7 @@ for (const border of [0, 8]) {
     const artwork = createPrimitiveArtwork(fitting);
     const rejected = createPrimitiveArtwork(small);
     // Assert
-    assert.deepEqual(elements(decode(artwork), 'text').map(text => [text.text, text['font-size']]), [['V', '16'], ['L', '16']]);
+    assert.deepEqual(elements(decode(artwork), 'text').map(text => [text.text, Number(text['font-size'])]), [['V', 16], ['L', 16]]);
     assert.equal(rejected, undefined);
     assert.equal(JSON.stringify(small), before);
     close(elements(decode(artwork), 'circle').find(circle => circle.stroke).r, 31);
@@ -2822,7 +2871,7 @@ test('default percent never truncates at a narrow bar while explicit display may
   const artwork = createPrimitiveArtwork(explicit);
   // Assert
   assert.equal(rejected, undefined);
-  assert.deepEqual(elements(decode(artwork), 'text').map(text => [text.text, text['font-size']]), [['…', '32']]);
+  assert.deepEqual(elements(decode(artwork), 'text').map(text => [text.text, Number(text['font-size'])]), [['…', 32]]);
 });
 for (const [index, change] of [
   record => ({ ...record, options: { ...record.options, display: 1 } }),

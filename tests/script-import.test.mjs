@@ -13,6 +13,9 @@ const uuids = { Stream: 'git.renaudcerrato.deckforge.stream', Loop: 'git.renaudc
 const tokenA = 'a'.repeat(32), tokenB = 'b'.repeat(32);
 const source = '#!/usr/bin/env python3\nprint("PRIVATE_SOURCE")\n';
 const draft = { source, extension: 'py' };
+// Fake OS/SDK operations resolve in microtasks unless a test explicitly holds
+// them. Drain a check-phase turn, not an internal coordinator/session queue.
+const progress = () => new Promise(resolve => setImmediate(resolve));
 function deferred() {
   let resolve;
   const promise = new Promise(yes => { resolve = yes; });
@@ -26,13 +29,11 @@ function harness(t, platform = 'darwin') {
   const local = platform === 'win32' ? 'C:/synthetic/Local' : undefined;
   const syntheticProcess = { platform, env: local ? { LOCALAPPDATA: local } : {}, cwd: () => '/synthetic/cwd' };
   const files = [], opens = [], directories = [], inspected = [], logs = [], replies = [], registrations = [], launches = [];
-  const sessions = [], states = [], managers = [], tracked = [], imports = new Set(), gates = [], timers = new Map();
+  const tracked = [], gates = [], availability = new Map();
   const decorated = new Map(), resultWaiters = [];
-  let sequence = 0, timerId = 0, link;
-  const timing = { now: () => 0, setTimer(callback, delay) { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
-    clearTimer(id) { timers.delete(id); } };
+  let sequence = 0, link;
   const io = { existing: false, badSegment: undefined, writeFailure: false, closeFailure: false,
-    uuid: undefined, writeGate: undefined, writeEntered: deferred() };
+    uuid: undefined, writeGate: undefined, writeEntered: deferred(), closeGate: undefined, closeEntered: deferred() };
   const filesystem = {
     async mkdir(filename, settings) {
       directories.push({ filename, settings });
@@ -56,18 +57,26 @@ function harness(t, platform = 'darwin') {
           if (io.writeGate) await io.writeGate.promise;
           if (io.writeFailure) throw Error('PRIVATE_WRITE_FAILURE');
         },
-        async close() { file.closeCalls++; if (io.closeFailure) throw Error('PRIVATE_CLOSE_FAILURE'); file.closed = true; },
+        async close() {
+          file.closeCalls++; io.closeEntered.resolve();
+          if (io.closeGate) await io.closeGate.promise;
+          if (io.closeFailure) throw Error('PRIVATE_CLOSE_FAILURE'); file.closed = true;
+        },
       };
     },
   };
-  const subscribe = () => ({ dispose() {} });
+  const subscribe = event => listener => {
+    const listeners = availability.get(event) ?? [];
+    listeners.push(listener); availability.set(event, listeners);
+    return { dispose() {} };
+  };
   const sdk = {
     info: { plugin: { uuid: 'git.renaudcerrato.deckforge', version: '0.1.0.0' },
       application: { platform: platform === 'win32' ? 'windows' : 'mac', version: '7.6', language: 'en', platformVersion: '26' } },
     logger: { setLevel() {}, info: value => logs.push(value), warn: value => logs.push(value) },
     actions: { registerAction(action) { registrations.push(action); } },
-    devices: { onDeviceDidConnect: subscribe, onDeviceDidDisconnect: subscribe },
-    system: { onSystemDidWakeUp: subscribe, onDidReceiveDeepLink(listener) { link = listener; return { dispose() {} }; } },
+    devices: { onDeviceDidConnect: subscribe('connect'), onDeviceDidDisconnect: subscribe('disconnect') },
+    system: { onSystemDidWakeUp: subscribe('wake'), onDidReceiveDeepLink(listener) { link = listener; return { dispose() {} }; } },
     ui: { async sendToPropertyInspector(value) {
       replies.push(structuredClone(value));
       io.onReply?.(structuredClone(value));
@@ -75,12 +84,6 @@ function harness(t, platform = 'darwin') {
     } },
     connect: async () => {},
   };
-  const factories = new Map([
-    ['action-session', 'createActionSession', sessions], ['once-session', 'createOnceSession', sessions],
-    ['timer-session', 'createTimerSession', sessions], ['run-state', 'createRunStateCoordinator', states],
-    ['once-settings', 'createOnceStateCoordinator', states], ['timer-settings', 'createTimerStateCoordinator', states],
-    ['availability', 'createAvailabilityManager', managers],
-  ].map(([name, factory, values]) => [`../core/${name}.mjs`, { factory, values }]));
   const load = createAdapterLoader(codes, { process: syntheticProcess, resolve(name) {
     if (name === '@elgato/streamdeck') return { default: sdk, SingletonAction: class {},
       action: metadata => Action => { decorated.set(Action, metadata.UUID); return Action; } };
@@ -90,29 +93,19 @@ function harness(t, platform = 'darwin') {
     if (name === '../core/process-runner.mjs') return { startProcessRun() {
       launches.push('unexpected launch'); throw Error('Unexpected process launch');
     } };
-  }, observe(name, actual) {
-    const capture = factories.get(name);
-    return capture ? { ...actual, [capture.factory](dependencies) {
-      const boundary = capture.values === managers ? dependencies : { ...dependencies, ...timing };
-      const value = actual[capture.factory](boundary); capture.values.push(value); return value;
-    } } : actual;
   } });
-  async function idle() {
-    await Promise.all(managers.map(manager => manager.whenIdle()));
-    await Promise.all(states.map(state => state.whenIdle()));
-    await Promise.all(sessions.map(session => session.whenIdle()));
-  }
+  const idle = progress;
   t.after(async () => {
     for (const gate of gates) gate.resolve();
-    await Promise.all([...imports]);
+    await idle();
     for (const { action, runtime } of tracked) await action.onWillDisappear({ action: runtime });
-    for (const session of sessions) await session.setConnected(false);
-    await idle(); for (const manager of managers) manager.dispose();
+    for (const listener of availability.get('disconnect') ?? []) listener({ device: { id: 'synthetic-device', isConnected: false } });
+    await idle();
   });
   load('../plugin');
   const actions = Object.fromEntries(Object.entries(uuids).map(([name, uuid]) => [name,
     registrations.find(action => decorated.get(action.constructor) === uuid)]));
-  const runtimeModule = load('./program-runtime'), writer = load('../script-import');
+  const writer = load('../script-import');
   function runtime(id, kind = 'Stream', input, slot) {
     slot ??= { value: structuredClone(input ?? { executable: platform === 'win32' ? 'C:/synthetic/old.exe' : '/synthetic/old', args: ['legacy'], extra: { keep: [true, 42] } }), writes: [] };
     return { id, manifestId: uuids[kind], slot, writes: slot.writes,
@@ -138,12 +131,12 @@ function harness(t, platform = 'darwin') {
     await send(r, 'canvas:script', 3, { changes: { token } }, inspectorId, kind);
   }
   const parameters = (token = tokenA, changes = {}) => new URLSearchParams({ token, ...draft, ...changes });
-  function receive(query, route = '/import') {
-    const operation = runtimeModule.receiveScriptImport(route, query, `${route}?${query}`.length);
-    imports.add(operation); void operation.finally(() => imports.delete(operation)); return operation;
+  async function receive(query, route = '/import') {
+    link({ url: { path: route, queryParameters: query, href: `${route}?${query}` } });
+    await progress();
   }
   return { load, writer, actions, runtime, appear, send, claim, arm, parameters, receive, idle,
-    files, opens, directories, inspected, logs, replies, launches, io, syntheticProcess, states, sessions,
+    files, opens, directories, inspected, logs, replies, launches, io, syntheticProcess,
     hold() { const gate = deferred(); gates.push(gate); return gate; },
     dispatch(query) {
       const result = deferred(); resultWaiters.push(result);
@@ -264,6 +257,8 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     const original = structuredClone(target.slot.value), untouched = structuredClone(other.slot.value), registration = h.replies.at(-1);
     // Act
     const result = await h.dispatch(h.parameters(tokenA, { title: 'Imported title' })); await h.idle();
+    // A visibility cycle must not turn an import into an implicit Start.
+    await h.actions[kind].onWillDisappear({ action: target }); await h.appear(target, kind);
     // Assert: callback has no implicit Start and preserves the complete baseline.
     assert.equal(result.status, 'saved'); assert.equal(result.context, target.id);
     assert.equal(result.inspectorId, registration.inspectorId); assert.equal(result.requestId, registration.requestId);
@@ -271,10 +266,6 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     assert.deepEqual(result.settings, target.slot.value); assert.deepEqual(other.slot.value, untouched); assert.deepEqual(other.writes, []);
     assert.equal(h.files.length, 1); assert.equal(h.files[0].closed, true);
     assert.deepEqual(h.launches, []);
-    const state = h.sessions[0].getState();
-    assert.equal(state.phase, 'stopped');
-    if (kind === 'Stream') assert.equal(state.runRequested, false);
-    if (kind === 'Loop') { assert.equal(state.enabled, false); assert.equal(state.dueMs, undefined); }
     assert.ok(h.logs.every(value => /^(?:SETTINGS_ACCEPTED_|SETTINGS_REJECTED_)/.test(value)));
     assert.equal(JSON.stringify(h.logs).includes('PRIVATE'), false);
   });
@@ -329,12 +320,33 @@ test('one token cannot target two keys; busy callbacks drop but a later callback
   // Act
   const importing = h.receive(h.parameters()); await h.io.writeEntered.promise;
   await h.receive(h.parameters()); const whileHeld = { files: h.files.length, writes: first.writes.length };
-  h.io.writeGate.resolve(); await importing; await h.receive(h.parameters()); await h.idle();
+  h.io.writeGate.resolve(); await importing; await h.idle(); await h.receive(h.parameters()); await h.idle();
   // Assert
   assert.equal(duplicateRegistration.status, 'error'); assert.deepEqual(whileHeld, { files: 1, writes: 0 }); assert.equal(h.files.length, 2);
   assert.equal(first.writes.length, 2); assert.deepEqual(other.writes, []); assert.deepEqual(h.launches, []);
   assert.notEqual(h.files[0].filename, h.files[1].filename);
 });
+
+for (const stage of ['write', 'close']) {
+  test(`registered import waits for file ${stage} completion before settings or a correlated result`, options, async t => {
+    // Arrange: only the external file operation is held, not import or settings logic.
+    const h = harness(t), r = h.runtime('completion-key'); await h.appear(r); await h.arm(r);
+    const registration = h.replies.at(-1), original = structuredClone(r.slot.value), gate = h.hold();
+    h.io[`${stage}Gate`] = gate;
+    // Act: allow all runnable work to progress while the file boundary is held.
+    const importing = h.dispatch(h.parameters()); await h.io[`${stage}Entered`].promise; await h.idle();
+    const before = { writes: structuredClone(r.writes), settings: structuredClone(r.slot.value),
+      results: h.replies.filter(reply => reply.type === 'canvas:script-result'), closed: h.files[0].closed };
+    gate.resolve(); const result = await importing; await h.idle();
+    // Assert: file completion is necessary, and releasing it really permits the same callback to save.
+    assert.deepEqual(before, { writes: [], settings: original, results: [], closed: false });
+    assert.equal(h.files[0].closed, true);
+    assert.deepEqual(r.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '' }]);
+    assert.deepEqual(result, { type: 'canvas:script-result', context: r.id, inspectorId: registration.inspectorId,
+      requestId: registration.requestId, importSequence: 1, status: 'saved', settings: r.slot.value });
+    assert.deepEqual(h.launches, []);
+  });
+}
 
 for (const matching of [true, false]) {
   test(`import completion waits for complete host confirmation and rejects mismatching readback=${!matching}`, options, async t => {
@@ -343,7 +355,7 @@ for (const matching of [true, false]) {
     const old = structuredClone(r.slot.value), read = h.hold(), entered = deferred();
     r.getSettings = async () => { entered.resolve(structuredClone(r.slot.value)); return read.promise; };
     // Act
-    const importing = h.receive(h.parameters()), expected = await entered.promise;
+    const importing = h.receive(h.parameters()), expected = await entered.promise; await h.idle();
     const beforeReadback = h.replies.filter(reply => reply.type === 'canvas:script-result').length;
     read.resolve(matching ? expected : old); await importing;
     if (!matching) await h.receive(h.parameters());

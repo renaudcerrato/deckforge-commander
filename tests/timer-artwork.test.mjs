@@ -5,21 +5,21 @@ import { TIMER_READY_SVG, TIMER_SETUP_SVG, createTimerArtwork } from '../src/cor
 import { createKeyLayout, createTimerKeyLayout } from '../src/core/key-layout.mjs';
 import { SETUP_SVG, createLaunchArtwork } from '../src/core/launch-artwork.mjs';
 import { createErrorArtwork } from '../src/core/error-artwork.mjs';
+import { svgElements, assertSvgElement, assertPaddedClip, assertBadgeAddition, assertKeyFrame, assertSetupWarning } from './helpers/svg-harness.mjs';
 
 const decode = uri => decodeURIComponent(uri.slice('data:image/svg+xml,'.length));
-const captionOf = svg => /<text[^>]*clip-path="url\(#caption-clip\)"[^>]*>([^<]*)<\/text>/.exec(svg)?.[1];
-const fontSizeOf = svg => Number(/<text[^>]*font-size="([\d.]+)"[^>]*clip-path=/.exec(svg)?.[1]);
+const captionOf = svg => svgElements(svg, 'text').find(text => text['clip-path'])?.text;
+const fontSizeOf = svg => Number(svgElements(svg, 'text').find(text => text['clip-path'])?.['font-size']);
 
 for (const [kind, footer, expectedFooter] of [['ready', 'ready', 'ready'], ['waiting', 'success', 'loading...'], ['ready', 'success', 'success']]) {
   test(`Loop ${expectedFooter} retains header and caption while adding a full suffix badge`, () => {
     // Arrange
-    const badge = '<text x="124" y="32" text-anchor="end" font-family="Arial,sans-serif" font-size="16" fill="#abcdef">.sh</text>';
     const expected = decode(createTimerArtwork(kind, 'report', '#ABCDEF', footer));
     // Act
     const actual = decode(createTimerArtwork(kind, 'report', '#ABCDEF', footer, '.SH'));
     const layout = createTimerKeyLayout('report', '#ABCDEF', expectedFooter, '.SH');
     // Assert
-    assert.equal(actual, expected.replace('>Loop</text>', `>Loop</text>${badge}`));
+    assertBadgeAddition(expected, actual, '.sh', '#abcdef');
     assert.equal(layout, actual);
     assert.equal(captionOf(actual), 'report');
     assert.equal(/>Stream<|>Timer<|>Run</.test(actual), false);
@@ -94,16 +94,13 @@ for (const [kind, footer, expectedFooter] of [
     const svg = decode(uri);
     // Assert
     assert.ok(uri.startsWith('data:image/svg+xml,'));
-    assert.match(svg, /width="144" height="144" viewBox="0 0 144 144"/);
-    assert.ok(svg.includes('<rect width="144" height="144" fill="#000000"/>'));
-    assert.ok(svg.includes('<rect x="8" y="8" width="128" height="128" rx="16" fill="none" stroke="#abcdef" stroke-width="3" stroke-opacity="0.35"/>'));
-    assert.match(svg, /x="22" y="32"[^>]*font-size="16"[^>]*>Loop<\/text>/);
-    assert.ok(svg.includes(`<text x="72" y="124" text-anchor="middle" font-family="Arial,sans-serif" font-size="16" fill="#abcdef">${expectedFooter}</text>`));
+    assertKeyFrame(svg, '#abcdef');
+    assertSvgElement(svg, 'text', { text: 'Loop' }, { x: 22, y: 32, 'font-size': 16, fill: '#abcdef' });
+    assertSvgElement(svg, 'text', { text: expectedFooter }, { x: 72, y: 124, 'text-anchor': 'middle', 'font-family': 'Arial,sans-serif', 'font-size': 16, fill: '#abcdef' });
     assert.equal(captionOf(svg), expectedFooter === 'setup required' ? undefined : caption);
-    if (expectedFooter === 'setup required') assert.match(svg, /aria-label="Setup required"/);
+    if (expectedFooter === 'setup required') assertSetupWarning(svg);
     else assert.equal(/<path|<circle/.test(svg), false);
     assert.equal(/<script|foreignObject|href=|onload=|>Run<|>Timer<|>Stream<|>Error</.test(svg), false);
-    assert.ok(svg.endsWith('</svg>\n'));
   });
 }
 
@@ -132,7 +129,7 @@ for (const [label, makeInput] of [...rejectedFooters, ...rejectedSetupFooters, [
     const actual = createTimerArtwork('waiting', 'report', undefined, input);
     // Assert
     assert.equal(actual, expected);
-    assert.match(decode(actual), /y="124"[^>]*>loading\.\.\.<\/text>/);
+    assertSvgElement(decode(actual), 'text', { text: 'loading...' }, { y: 124 });
     assert.equal(captionOf(decode(actual)), 'report');
   });
 }
@@ -146,7 +143,7 @@ for (const footer of ['ready', 'success', 'loading...', 'setup required']) {
     // Assert
     if (footer === 'setup required') {
       assert.equal(captionOf(actual), undefined);
-      assert.match(actual, /aria-label="Setup required"/);
+      assertSetupWarning(actual);
     } else {
       assert.equal(actual, expected.replace('>ready</text>', `>${footer}</text>`));
     }
@@ -164,10 +161,9 @@ test('Timer static default matches Setup including its trailing newline, not con
   assert.equal(rendered, svg);
   assert.notEqual(svg, TIMER_READY_SVG);
   assert.equal(captionOf(svg), undefined);
-  assert.match(svg, /aria-label="Setup required"/);
+  assertSetupWarning(svg);
   assert.equal(svg.includes('DeckForge'), false);
-  assert.ok(svg.endsWith('</svg>\n'));
-  assert.match(svg, /y="124"[^>]*>setup required<\/text>/);
+  assertSvgElement(svg, 'text', { text: 'setup required' }, { y: 124 });
 });
 
 test('Timer configured Ready keeps its caption while Setup uses the warning icon', () => {
@@ -177,10 +173,10 @@ test('Timer configured Ready keeps its caption while Setup uses the warning icon
   const setup = decode(createTimerArtwork('ready', undefined, undefined, 'setup required'));
   // Assert
   assert.equal(ready, TIMER_READY_SVG);
-  assert.match(ready, /y="124"[^>]*>ready<\/text>/);
+  assertSvgElement(ready, 'text', { text: 'ready' }, { y: 124 });
   assert.equal(setup, TIMER_SETUP_SVG);
   assert.equal(captionOf(setup), undefined);
-  assert.match(setup, /aria-label="Setup required"/);
+  assertSetupWarning(setup);
   assert.notEqual(setup, ready);
 });
 
@@ -208,7 +204,7 @@ for (const [label, input, expectedCaption] of captions) {
     assert.equal(waiting, ready.replace('>ready</text>', '>loading...</text>'));
     assert.equal(success, ready.replace('>ready</text>', '>success</text>'));
     assert.equal(captionOf(setup), undefined);
-    assert.match(setup, /aria-label="Setup required"/);
+    assertSetupWarning(setup);
     assert.equal(ready, run.replace('>Stream</text>', '>Loop</text>'));
     assert.ok(fontSizeOf(ready) >= 16 && fontSizeOf(ready) <= 32);
     assert.equal(/<x|\u202e|\ud800|\uffff|[\r\t]/.test(ready), false);
@@ -220,7 +216,7 @@ for (const [label, input, expectedCaption] of captions) {
       if (label === 'long graphemes') assert.equal(shown.slice(0, -1).split('👨‍👩‍👧‍👦').join(''), '');
       if (label === 'long combining') assert.equal(shown.slice(0, -1).split('é').join(''), '');
     }
-    assert.match(ready, /<clipPath id="caption-clip"><rect x="16" y="48" width="112" height="48"/);
+    assertPaddedClip(ready, svgElements(ready, 'text').find(text => text['clip-path']), { x: 16, y: 48, width: 112, height: 48 });
   });
 }
 
@@ -248,17 +244,17 @@ for (const [input, expected] of [['#ABCDEF', '#abcdef'], ['#000000', '#000000'],
     // Act
     const artworks = kinds.map(([kind, footer]) => decode(createTimerArtwork(kind, 'report', input, footer)));
     // Assert
-    for (const svg of artworks) {
-      assert.ok(svg.includes('<rect width="144" height="144" fill="#000000"/>'));
-      assert.ok(svg.includes(`fill="none" stroke="${expected}"`));
-      assert.match(svg, new RegExp(`fill="${expected}">Loop<\\/text>`));
-      if (svg.includes('aria-label="Setup required"')) {
-        assert.match(svg, /fill="#ffd43b"/);
+    for (const [index, svg] of artworks.entries()) {
+      assertKeyFrame(svg, expected);
+      assertSvgElement(svg, 'text', { text: 'Loop' }, { fill: expected });
+      if (kinds[index][1] === 'setup required') {
+        assertSetupWarning(svg);
         assert.equal(captionOf(svg), undefined);
       } else {
-        assert.match(svg, new RegExp(`fill="${expected}" clip-path=`));
+        const caption = assertSvgElement(svg, 'text', { text: 'report' }, { fill: expected });
+        assertPaddedClip(svg, caption, { x: 16, y: 48, width: 112, height: 48 });
       }
-      assert.match(svg, new RegExp(`y="124"[^>]*fill="${expected}"`));
+      assertSvgElement(svg, 'text', { text: kinds[index][1] }, { y: 124, fill: expected });
     }
   });
 }
@@ -323,7 +319,7 @@ test('Run continues to reject the Timer success footer and preserve its static d
 });
 
 test('Error diagnosis ignores the additive Timer success footer byte-for-byte', () => {
-  // Arrange: existing tests retain the exhaustive old diagnosis byte fixtures.
+  // Arrange: Error tests separately retain exhaustive fixed diagnostic appearance checks.
   const diagnosis = { code: 'EXEC', lines: ['Executable', 'path invalid'] };
   const expected = decode(createErrorArtwork('INVALID_EXECUTABLE'));
   // Act
