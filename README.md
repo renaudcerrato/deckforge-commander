@@ -31,7 +31,9 @@ Turn a program's stdout into text, progress, or images on a Stream Deck key. An 
 
 **Run and Loop** keep a successful run's final output visible, if any. Loop retains it between runs; no-output success shows `success`.
 
-Hidden keys never start background work. Stream stops; Loop and Run may let an active program finish locally but will not launch another. A device disconnect stops execution. After reconnect, Stream may resume eligible intent within the same plugin session; after a plugin restart, all keys start stopped.
+- **Switching pages or profiles:** Stream stops and may restart when you return if you had left it running. Loop and Run may finish their current program, but start nothing new while hidden.
+- **Disconnecting the device:** All running programs stop. After reconnecting, Stream may restart if you had left it running; Loop and Run require another press.
+- **Restarting the plugin:** All keys start stopped, regardless of their previous state.
 
 Set an absolute path to a program you trust. It runs directly with your permissions—without a shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang. On Windows, choose an interpreter executable and put the script path in **Arguments**; see the [Windows setup guide](docs/windows-support.md#choose-an-executable).
 
