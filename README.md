@@ -12,7 +12,7 @@ Turn a program's stdout into text, progress, or images on a Stream Deck key. An 
 <a href="demos/showcase.py">showcase.py</a> • <a href="demos/video.sh">video.sh</a> • <a href="demos/gif.py">gif.py</a> • <a href="demos/fluxcapacitor.py">fluxcapacitor.py</a>
 </p>
 
-**Requirements**
+## Requirements
 
 - **Runtime:** macOS 13+ or Windows 11 x64 · Stream Deck 7.1+
 - **Build:** Node.js 24 and npm on macOS arm64/x64, Linux x64 (build-only), or Windows x64; internet access is needed for the first build (see the Windows guide)
@@ -31,15 +31,15 @@ Turn a program's stdout into text, progress, or images on a Stream Deck key. An 
 
 **Run and Loop** keep a successful run's final output visible, if any. Loop retains it between runs; no-output success shows `success`.
 
-Hidden keys do not start background work: Stream stops, while Loop and Run may let a current child finish locally but will not launch another. Device disconnect stops execution. The reconnect behavior above applies within the same plugin session; restarting the plugin starts all keys stopped.
+Hidden keys never start background work. Stream stops; Loop and Run may let an active program finish locally but will not launch another. A device disconnect stops execution. After reconnect, Stream may resume eligible intent within the same plugin session; after a plugin restart, all keys start stopped.
 
-Choose an absolute executable path. Programs run directly with your permissions—no shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang; on Windows, select an interpreter executable and pass the script path as an argument. Use only programs you trust; see [Windows setup](docs/windows-support.md#choose-an-executable).
+Set an absolute path to a program you trust. It runs directly with your permissions—without a shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang. On Windows, choose an interpreter executable and put the script path in **Arguments**; see the [Windows setup guide](docs/windows-support.md#choose-an-executable).
 
-In Windows **Arguments**, backslashes stay literal: `C:\Scripts\showcase.py` is one argument. Use single or double quotes to group spaces, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`.
+In Windows **Arguments**, backslashes stay literal. Use quotes to keep a path with spaces together, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`.
 
 ## Install a packaged build
 
-With Stream Deck installed, open `git.renaudcerrato.deckforge.streamDeckPlugin`, then [create your first key](#first-key).
+If you have a packaged build, open `git.renaudcerrato.deckforge.streamDeckPlugin` with Stream Deck to install it, then [create your first key](#first-key).
 
 ## Build from source
 
@@ -48,9 +48,9 @@ npm install
 npm run pack
 ```
 
-Open the resulting `dist/git.renaudcerrato.deckforge.streamDeckPlugin` to install. Use `npm run build` to build without packaging. Building requires neither Stream Deck nor a device; see [Requirements](#requirements) and the [Windows guide](docs/windows-support.md).
+Open `dist/git.renaudcerrato.deckforge.streamDeckPlugin` with Stream Deck to install. Use `npm run build` to build without packaging. Neither command requires Stream Deck or a device. See [Requirements](#requirements) and the [Windows guide](docs/windows-support.md).
 
-For an optional local Stream Deck test, link the checkout:
+For local development, link the checkout:
 
 ```sh
 npm run link
@@ -66,13 +66,13 @@ streamdeck restart git.renaudcerrato.deckforge
 
 ## First key
 
-On macOS, start with the Python showcase:
+On macOS, try the Python showcase:
 
 1. Drag **Stream** onto a key.
-2. Select `demos/showcase.py` under **Executable**.
-3. Tap to play. Tap while running to stop; after completion, tap to replay.
+2. Under **Executable**, select the absolute path to `demos/showcase.py` in your checkout.
+3. Tap to start the demo. Tap again while it runs to stop; after it exits, tap again to replay.
 
-On Windows 11 x64, run the [`clock.ps1` demo](demos/clock.ps1) with Stream and configure the explicit PowerShell 5.1 interpreter:
+On Windows 11 x64, add **Stream** to a key and run the [`clock.ps1` demo](demos/clock.ps1) with PowerShell 5.1. Replace the example script path with its absolute path on your computer:
 
 ```text
 Executable: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe

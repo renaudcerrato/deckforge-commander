@@ -94,7 +94,7 @@ export type SessionRecord<State extends ProgramState = ProgramState, Session ext
 	cleanupBlocked: boolean;
 	ready: Promise<void>;
 	ownedRun?: ProcessRun;
-	scriptImport?: { token: string; revision: number; busy: boolean };
+	scriptImport?: { token: string; sequence: number; busy: boolean };
 	importScript(draft: ScriptDraft): Promise<void>;
 	retire(): Promise<void>;
 };
@@ -354,7 +354,8 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 			await record.state.whenIdle();
 			await this.reply(record, request, record.state.isBlocked() || record.persistenceUncertain
 				? { status: "error", diagnosticCode: "STATE_SAVE_FAILED" }
-				: { status: "saved", settings: record.state.getSettings() });
+				: { status: "saved", settings: record.state.getSettings(),
+					...(record.scriptImport ? { scriptToken: record.scriptImport.token, importSequence: record.scriptImport.sequence } : {}) });
 			return;
 		}
 		const inspector = record.inspector;
@@ -370,9 +371,10 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 				const command = copySettings(request.changes);
 				if (Object.keys(command).some(key => key !== "token") || record.scriptImport?.busy || record.state.isBlocked()
 					|| typeof command.token !== "string" || !/^[a-f0-9]{32}$/.test(command.token)
-					|| [...owners.values()].some(owner => owner.active && owner.scriptImport?.token === command.token)) throw saveFailed();
-				record.scriptImport = { token: command.token, revision: record.state.getRevision(), busy: false };
-				await this.reply(record, request, { status: "saved", settings: record.state.getSettings() });
+					|| (!record.scriptImport && [...owners.values()].some(owner => owner.active && owner.scriptImport?.token === command.token))) throw saveFailed();
+				record.scriptImport ??= { token: command.token, sequence: 0, busy: false };
+				await this.reply(record, request, { status: "saved", settings: record.state.getSettings(),
+					scriptToken: record.scriptImport.token, importSequence: record.scriptImport.sequence });
 				return;
 			}
 			const saving = record.state.editConfiguration(request.changes);
@@ -419,9 +421,11 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 		const pending = record.scriptImport;
 		if (!pending || pending.busy) return;
 		pending.busy = true;
+		// Each callback targets the current configuration, not the revision that opened ChatGPT.
+		const revision = record.state.getRevision();
 		const current = () => record.active && owners.get(record.runtime.current.id) === record
 			&& record.scriptImport === pending && !record.persistenceUncertain && !record.state.isBlocked();
-		const unchanged = () => current() && record.state.getRevision() === pending.revision;
+		const unchanged = () => current() && record.state.getRevision() === revision;
 		let status = "error";
 		try {
 			await record.ready;
@@ -437,18 +441,19 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 			if (current() && result.status === "saved" && result.revision === record.state.getRevision()) status = "saved";
 		} catch { /* Only a fixed outcome leaves this boundary; never log source, paths, or exceptions. */ }
 		finally {
-			// Consume each attempted import, including uncertain saves; retries must use a fresh prompt.
-			if (record.scriptImport === pending) record.scriptImport = undefined;
+			// Retain the link; only another explicit callback retries, and uncertainty still blocks saves.
+			const importSequence = ++pending.sequence;
 			const inspector = record.inspector;
-			if (record.active && inspector) {
+			if (record.active && record.scriptImport === pending && inspector) {
 				try {
 					await streamDeck.ui.sendToPropertyInspector({
 						type: "canvas:script-result", context: record.runtime.current.id,
-						inspectorId: inspector.id, requestId: inspector.requestId, status,
+						inspectorId: inspector.id, requestId: inspector.requestId, importSequence, status,
 						...(status === "saved" ? { settings: record.state.getSettings() } : {}),
 					});
 				} catch { /* A closed or different inspector never gates the import. */ }
 			}
+			pending.busy = false;
 		}
 	}
 

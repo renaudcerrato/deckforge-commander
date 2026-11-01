@@ -73,6 +73,8 @@ export function createInspectorBridge({
   let transportFailed = false;
   let requestId = 0;
   let latestRequest;
+  let scriptToken;
+  let importSequence = 0;
   let debounceTimer;
   let replyTimer;
   let pending = false;
@@ -267,8 +269,11 @@ export function createInspectorBridge({
     if (message?.event !== 'sendToPropertyInspector') return;
     const payload = message.payload;
     if (payload?.type === 'canvas:script-result') {
-      if (ready && payload.context === context && payload.inspectorId === inspectorId
-        && payload.requestId === latestRequest?.id && !latestRequest.active && !pending && protectedFields().size === 0) {
+      if (open && ready && payload.context === context && payload.inspectorId === inspectorId
+        && payload.requestId === latestRequest?.id && Number.isSafeInteger(payload.importSequence)
+        && payload.importSequence > importSequence && ['saved', 'error'].includes(payload.status)) {
+        importSequence = payload.importSequence;
+        if (latestRequest.active || pending || protectedFields().size > 0) return;
         if (payload.status === 'saved') {
           if (hydrate(payload.settings)) onStatus('imported');
         } else if (payload.status === 'error') failure('SCRIPT_IMPORT_FAILED', 'PLUGIN_REPLY');
@@ -303,6 +308,16 @@ export function createInspectorBridge({
     if (!['canvas:claim', 'canvas:edit', 'canvas:script'].includes(request.type)) { observeConnection(); failure('STATE_SAVE_FAILED', 'PLUGIN_REPLY'); return; }
     let settings;
     try { settings = copyRunSettings(payload.settings); } catch { observeConnection(); failure('STATE_SAVE_FAILED', 'INSPECTOR_HYDRATION'); return; }
+    if (request.type === 'canvas:claim' || request.type === 'canvas:script') {
+      if (payload.scriptToken !== undefined) {
+        if (typeof payload.scriptToken !== 'string' || !/^[a-f0-9]{32}$/.test(payload.scriptToken)
+          || !Number.isSafeInteger(payload.importSequence) || payload.importSequence < importSequence) {
+          failure('STATE_SAVE_FAILED', 'PLUGIN_REPLY'); return;
+        }
+        scriptToken = payload.scriptToken;
+        importSequence = payload.importSequence;
+      } else if (request.type === 'canvas:script') { failure('STATE_SAVE_FAILED', 'PLUGIN_REPLY'); return; }
+    }
     for (const key of request.fields) {
       const fieldVersion = request.versions.get(key);
       if (versions.get(key) === fieldVersion) {
@@ -324,6 +339,8 @@ export function createInspectorBridge({
     connectionVersion++;
     open = false;
     ready = false;
+    scriptToken = undefined;
+    importSequence = 0;
     transportFailed = true;
     bindingValid = false;
     platform = 'posix';
@@ -432,8 +449,12 @@ export function createInspectorBridge({
 
   function beginScriptImport(token) {
     if (!open || !ready || pending || protectedFields().size > 0 || latestRequest?.active) return false;
-    sendRequest('canvas:script', { token });
-    return true;
+    const selectedToken = scriptToken ?? token;
+    if (typeof selectedToken !== 'string' || !/^[a-f0-9]{32}$/.test(selectedToken)) return false;
+    // Keep the proposed token even if its registration reply times out or is superseded.
+    scriptToken = selectedToken;
+    sendRequest('canvas:script', { token: selectedToken });
+    return open ? selectedToken : false;
   }
 
   function openUrl(url) {

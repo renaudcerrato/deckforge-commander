@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { loadAdapterCode, createAdapterLoader } from './helpers/adapter-harness.mjs';
+import { createInspectorFixture } from './helpers/inspector-harness.mjs';
 import { parseArguments } from '../src/core/arguments.mjs';
 
 const options = { timeout: 3000 };
@@ -67,6 +70,7 @@ function harness(t, platform = 'darwin') {
     system: { onSystemDidWakeUp: subscribe, onDidReceiveDeepLink(listener) { link = listener; return { dispose() {} }; } },
     ui: { async sendToPropertyInspector(value) {
       replies.push(structuredClone(value));
+      io.onReply?.(structuredClone(value));
       if (value.type === 'canvas:script-result') for (const waiter of resultWaiters.splice(0)) waiter.resolve(value);
     } },
     connect: async () => {},
@@ -149,6 +153,110 @@ function harness(t, platform = 'darwin') {
 }
 
 for (const kind of ['Stream', 'Loop', 'Run']) {
+  test(`${kind} conversation imports distinct, identical and older revisions using the latest complete settings`, options, async t => {
+    // Arrange: no source/version deduplication; the retained capability belongs to the owner.
+    const h = harness(t), r = h.runtime('key', kind); await h.appear(r, kind); await h.arm(r, tokenA, kind);
+    const original = structuredClone(r.slot.value), sources = [source, '#!/usr/bin/env python3\nprint("revision two")\n', source, source];
+    // Act
+    for (const [index, text] of sources.entries()) {
+      if (index === 1) await h.send(r, 'canvas:edit', 4, { changes: { title: 'local title', themeColor: '#abcdef' } }, 'synthetic-pi', kind);
+      await h.receive(h.parameters(tokenA, { source: text }));
+    }
+    await h.idle();
+    const results = h.replies.filter(reply => reply.type === 'canvas:script-result');
+    // Assert: each callback saves a fresh file and never starts any action mode.
+    assert.equal(new Set(h.files.map(file => file.filename)).size, 4);
+    assert.deepEqual(h.files.map(file => file.writes[0].value), sources);
+    assert.deepEqual(results.map(result => [result.status, result.importSequence]), [['saved', 1], ['saved', 2], ['saved', 3], ['saved', 4]]);
+    assert.deepEqual(r.slot.value, { ...original, executable: h.files[3].filename, argsText: '', cwd: '', title: 'local title', themeColor: '#abcdef' });
+    assert.deepEqual(h.launches, []);
+  });
+}
+
+test('owner keeps the canonical token through Ask registration, edits, hide/show and a new inspector claim', options, async t => {
+  // Arrange
+  const h = harness(t), r = h.runtime('key'); await h.appear(r); await h.arm(r);
+  // Act
+  await h.send(r, 'canvas:edit', 4, { changes: { title: 'keep me' } });
+  await h.send(r, 'canvas:script', 5, { changes: { token: tokenB } }); const subsequent = h.replies.at(-1);
+  await h.actions.Stream.onWillDisappear({ action: r });
+  await h.receive(h.parameters()); await h.appear(r);
+  await h.claim(r, 'Stream', 'reopened-pi'); const reopened = h.replies.at(-1);
+  await h.receive(h.parameters()); await h.receive(h.parameters(tokenB)); await h.idle();
+  // Assert: the old conversation survives; the unused proposal authorizes nothing.
+  assert.equal(subsequent.scriptToken, tokenA); assert.equal(reopened.scriptToken, tokenA);
+  assert.equal(reopened.importSequence, 1); assert.equal(h.files.length, 2);
+  assert.equal(r.slot.value.title, 'keep me'); assert.deepEqual(h.launches, []);
+  assert.equal(h.replies.at(-1).inspectorId, 'reopened-pi');
+});
+
+test('pre-write storage rejection leaves the owner link usable after the boundary recovers', options, async t => {
+  // Arrange: a rejected owned-directory boundary must never create a script.
+  const h = harness(t), r = h.runtime('key'); await h.appear(r); await h.arm(r);
+  h.io.existing = true; h.io.badSegment = { name: 'scripts', kind: 'symlink' };
+  // Act
+  await h.receive(h.parameters()); const rejected = { files: h.files.length, writes: r.writes.length, status: h.replies.at(-1).status };
+  h.io.badSegment = undefined; await h.receive(h.parameters()); await h.idle();
+  // Assert
+  assert.deepEqual(rejected, { files: 0, writes: 0, status: 'error' });
+  assert.equal(h.files.length, 1); assert.equal(r.writes.length, 1); assert.equal(h.replies.at(-1).status, 'saved');
+  assert.equal(h.replies.at(-1).importSequence, 2); assert.deepEqual(h.launches, []);
+});
+
+test('built Ask prompt callback configures the real settings graph twice and updates inspector controls without execution', options, async t => {
+  // Arrange: built browser code and actual import/authority/session logic, only external boundaries doubled.
+  const h = harness(t), r = h.runtime('integration-key'); await h.appear(r);
+  const fixture = createInspectorFixture(), queue = [], opened = [], events = new Map(), timers = new Map();
+  let socket, timerId = 0, randomByte = 1;
+  class Socket {
+    constructor() { socket = this; this.readyState = 0; }
+    send(text) { const message = JSON.parse(text); if (message.event === 'sendToPlugin') queue.push(message); else if (message.event === 'openUrl') opened.push(message.payload.url); }
+    close() { this.readyState = 3; }
+  }
+  const window = { addEventListener(name, callback) { events.set(name, callback); } };
+  runInNewContext(readFileSync(new URL('../git.renaudcerrato.deckforge.sdPlugin/ui/run.js', import.meta.url), 'utf8'), {
+    window, document: { readyState: 'complete', getElementById: fixture.getElementById }, WebSocket: Socket, TextEncoder,
+    crypto: { getRandomValues(bytes) { return bytes.fill(randomByte++); } },
+    setTimeout(callback) { const id = ++timerId; timers.set(id, callback); return id; }, clearTimeout(id) { timers.delete(id); },
+  }, { timeout: 1000 });
+  h.io.onReply = payload => socket.onmessage({ data: JSON.stringify({ event: 'sendToPropertyInspector', payload }) });
+  async function pump() {
+    while (queue.length) await h.actions.Stream.onSendToPlugin({ action: r, payload: queue.shift().payload });
+    await h.idle();
+  }
+  t.after(() => events.get('unload')());
+  window.connectElgatoStreamDeckSocket('12345', 'synthetic-pi', 'registerPropertyInspector', '{}', JSON.stringify({ context: r.id, action: uuids.Stream, payload: { settings: r.slot.value } }));
+  socket.readyState = 1; socket.onopen(); await pump();
+  // Act: one conversation's actual prompt supplies the capability for both revisions.
+  fixture.fields.askChatgpt.dispatch('click'); await pump();
+  const prompt = new URL(opened[0]).searchParams.get('q');
+  const callback = new URL(prompt.match(/Return URL: (\S+)/)[1]);
+  const query = new URLSearchParams(callback.search); for (const [key, value] of Object.entries(draft)) query.set(key, value);
+  const malformed = new URLSearchParams(query); malformed.set('source', '');
+  await h.receive(malformed); const rejectedFiles = h.files.length;
+  await h.dispatch(query); await h.idle();
+  const first = { path: fixture.fields.executable.value, status: fixture.fields.status.textContent };
+  query.set('source', '#!/usr/bin/env python3\nprint("second")\n');
+  await h.dispatch(query); await h.idle();
+  const secondStatus = fixture.fields.status.textContent;
+  socket.onmessage({ data: JSON.stringify({ event: 'sendToPropertyInspector', payload: {
+    ...h.replies.at(-1), context: 'foreign-key', importSequence: 99, settings: { executable: '/foreign.py' },
+  } }) });
+  const afterForeign = fixture.fields.executable.value;
+  fixture.fields.askChatgpt.dispatch('click'); await pump();
+  const nextPrompt = new URL(opened[1]).searchParams.get('q');
+  // Assert: no mocked business logic, host durability or hardware claim.
+  assert.equal(first.path, h.files[0].filename); assert.equal(first.status, 'Script imported. Press the key to run.');
+  assert.equal(rejectedFiles, 0); assert.equal(secondStatus, first.status); assert.equal(afterForeign, h.files[1].filename);
+  assert.equal(fixture.fields.executable.value, h.files[1].filename);
+  assert.equal(fixture.fields.status.textContent, ''); // subsequent registration acknowledges current settings
+  assert.equal(new URL(nextPrompt.match(/Return URL: (\S+)/)[1]).searchParams.get('token'), query.get('token'));
+  assert.match(prompt, /Reuse this same Return URL/); assert.notEqual(h.files[0].filename, h.files[1].filename);
+  assert.deepEqual(r.slot.value.extra, { keep: [true, 42] }); assert.deepEqual(r.slot.value.args, ['legacy']);
+  assert.deepEqual(h.launches, []); assert.equal(JSON.stringify(h.logs).includes('PRIVATE'), false);
+});
+
+for (const kind of ['Stream', 'Loop', 'Run']) {
   test(`token callback configures only its ${kind} key with confirmed complete settings and no launch`, options, async t => {
     // Arrange: execute real plugin deep-link registration and the real adapter/authority graph.
     const h = harness(t), target = h.runtime('PRIVATE_TARGET', kind), other = h.runtime('other-key');
@@ -156,14 +264,12 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     const original = structuredClone(target.slot.value), untouched = structuredClone(other.slot.value), registration = h.replies.at(-1);
     // Act
     const result = await h.dispatch(h.parameters(tokenA, { title: 'Imported title' })); await h.idle();
-    const afterFirst = h.files.length;
-    await h.receive(h.parameters(tokenA));
-    // Assert: callback has no implicit Start; replay cannot create another file or settings write.
+    // Assert: callback has no implicit Start and preserves the complete baseline.
     assert.equal(result.status, 'saved'); assert.equal(result.context, target.id);
     assert.equal(result.inspectorId, registration.inspectorId); assert.equal(result.requestId, registration.requestId);
     assert.deepEqual(target.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '', title: 'Imported title' }]);
     assert.deepEqual(result.settings, target.slot.value); assert.deepEqual(other.slot.value, untouched); assert.deepEqual(other.writes, []);
-    assert.equal(afterFirst, 1); assert.equal(h.files.length, 1); assert.equal(h.files[0].closed, true);
+    assert.equal(h.files.length, 1); assert.equal(h.files[0].closed, true);
     assert.deepEqual(h.launches, []);
     const state = h.sessions[0].getState();
     assert.equal(state.phase, 'stopped');
@@ -214,7 +320,7 @@ for (const defect of ['foreign context', 'foreign inspector', 'stale request', '
   });
 }
 
-test('one token cannot target two keys and concurrent callbacks consume one admitted import', options, async t => {
+test('one token cannot target two keys; busy callbacks drop but a later callback is admitted', options, async t => {
   // Arrange
   const h = harness(t), first = h.runtime('first'), other = h.runtime('other');
   await h.appear(first); await h.appear(other); await h.arm(first); await h.arm(other);
@@ -225,8 +331,9 @@ test('one token cannot target two keys and concurrent callbacks consume one admi
   await h.receive(h.parameters()); const whileHeld = { files: h.files.length, writes: first.writes.length };
   h.io.writeGate.resolve(); await importing; await h.receive(h.parameters()); await h.idle();
   // Assert
-  assert.equal(duplicateRegistration.status, 'error'); assert.deepEqual(whileHeld, { files: 1, writes: 0 }); assert.equal(h.files.length, 1);
-  assert.equal(first.writes.length, 1); assert.deepEqual(other.writes, []); assert.deepEqual(h.launches, []);
+  assert.equal(duplicateRegistration.status, 'error'); assert.deepEqual(whileHeld, { files: 1, writes: 0 }); assert.equal(h.files.length, 2);
+  assert.equal(first.writes.length, 2); assert.deepEqual(other.writes, []); assert.deepEqual(h.launches, []);
+  assert.notEqual(h.files[0].filename, h.files[1].filename);
 });
 
 for (const matching of [true, false]) {
@@ -238,12 +345,15 @@ for (const matching of [true, false]) {
     // Act
     const importing = h.receive(h.parameters()), expected = await entered.promise;
     const beforeReadback = h.replies.filter(reply => reply.type === 'canvas:script-result').length;
-    read.resolve(matching ? expected : old); await importing; await h.receive(h.parameters()); await h.idle();
+    read.resolve(matching ? expected : old); await importing;
+    if (!matching) await h.receive(h.parameters());
+    await h.idle();
     // Assert
     assert.equal(beforeReadback, 0); assert.equal(h.files.length, 1); assert.equal(r.writes.length, 1);
     assert.equal(h.replies.at(-1).status, matching ? 'saved' : 'error');
     assert.equal(Object.hasOwn(h.replies.at(-1), 'settings'), matching);
     if (matching) assert.deepEqual(h.replies.at(-1).settings, expected);
+    else assert.equal(h.replies.some(reply => reply.type === 'canvas:script-result' && reply.status === 'saved'), false);
     assert.deepEqual(h.launches, []); assert.equal(JSON.stringify(h.logs).includes('PRIVATE'), false);
   });
 }
@@ -263,7 +373,9 @@ for (const change of ['revision', 'same-facade owner', 'different-facade owner']
       current = h.runtime(r.id, kind, undefined, r.slot); await h.appear(current, kind);
     }
     const latest = structuredClone(current.slot.value), writes = structuredClone(current.writes);
-    h.io.writeGate.resolve(); await importing; await h.receive(h.parameters()); await h.idle();
+    h.io.writeGate.resolve(); await importing;
+    if (change !== 'revision') await h.receive(h.parameters());
+    await h.idle();
     // Assert: an already-created orphan is allowed; stale configuration application is not.
     assert.deepEqual(current.slot.value, latest); assert.deepEqual(current.writes, writes);
     assert.equal(h.files.length, 1); assert.equal(h.files[0].closed, true); assert.deepEqual(h.launches, []);
@@ -367,18 +479,21 @@ for (const base of [undefined, 'relative', String.raw`\\server\share`, String.ra
   });
 }
 for (const failure of ['write', 'close']) {
-  test(`failed file ${failure} awaits handle close, emits only a fixed outcome and consumes the attempted token`, options, async t => {
+  test(`failed file ${failure} awaits handle close, redacts failure and permits an explicit retry`, options, async t => {
     // Arrange
     const h = harness(t), r = h.runtime('key'); await h.appear(r); await h.arm(r);
     const registration = h.replies.at(-1);
     h.io.writeFailure = failure === 'write'; h.io.closeFailure = failure === 'close';
     // Act
-    await h.receive(h.parameters()); await h.receive(h.parameters()); await h.idle();
+    await h.receive(h.parameters()); await h.idle();
+    const result = h.replies.at(-1), failedFiles = h.files.length;
+    h.io.writeFailure = h.io.closeFailure = false;
+    await h.receive(h.parameters()); await h.idle();
     // Assert
-    assert.equal(h.files.length, 1); assert.equal(h.files[0].closeCalls, 1);
-    assert.equal(h.files[0].closed, failure === 'write'); assert.deepEqual(r.writes, []);
-    const result = h.replies.at(-1);
-    assert.deepEqual(result, { type: 'canvas:script-result', context: r.id, inspectorId: registration.inspectorId, requestId: registration.requestId, status: 'error' });
+    assert.equal(failedFiles, 1); assert.equal(h.files.length, 2); assert.equal(h.files[0].closeCalls, 1);
+    assert.equal(h.files[0].closed, failure === 'write'); assert.equal(r.writes.length, 1);
+    assert.deepEqual(result, { type: 'canvas:script-result', context: r.id, inspectorId: registration.inspectorId, requestId: registration.requestId, importSequence: 1, status: 'error' });
+    assert.equal(h.replies.at(-1).status, 'saved'); assert.equal(h.replies.at(-1).importSequence, 2);
     assert.equal(JSON.stringify([result, h.logs]).includes('PRIVATE'), false); assert.deepEqual(h.launches, []);
   });
 }

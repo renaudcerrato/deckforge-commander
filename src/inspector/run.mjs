@@ -16,7 +16,7 @@ const REASONS = new Map([
   ['INTERVAL_INVALID', 'Enter whole seconds from 1 to 86400.'],
   ['ACTION_ON_PRESS_INVALID', 'Choose start / refresh or start / stop.'],
   ['TITLE_INVALID', 'Use a title of at most 8192 characters without NUL.'],
-  ['SCRIPT_IMPORT_FAILED', 'Script import could not be confirmed. Ask ChatGPT again or save the script locally.'],
+  ['SCRIPT_IMPORT_FAILED', 'Script import could not be confirmed. Check the key’s settings before trying the import URL again, or save the script locally.'],
 ]);
 
 const INTERVAL_PRESETS = new Set(['1', '10', '30', '60', '600', '1800', '3600']);
@@ -65,6 +65,7 @@ Append individually URL-encoded parameters:
 - args: argument text, including {{script}} for the saved script path
 - cwd: optional absolute working directory
 - title: optional short, readable key title; omit to keep the current title, or leave empty to use the default
+Reuse this same Return URL for later revisions, including earlier or identical scripts. Each import saves a new unique file. The link expires if the plugin restarts or the key’s runtime owner changes; closing the inspector does not expire it. Wait for an import to finish before using another URL; callbacks received while busy are ignored, not queued.
 Provide the complete import URL on a single line inside a code block, with instructions to paste it into my browser’s address bar. This automatically saves a unique script file and configures the original key, even if its inspector is closed; it never runs the script. Ask me to review the source before using the URL, since scripts run with my permissions and are not sandboxed. Keep the complete URL under 2,000 characters. If it is too long, omit the URL and explain how to save the complete script to a local file and configure the key’s normal Executable, Arguments, and optional Working directory and Title fields.` : 'A return link is not available. Provide the complete script and explain how to save it to a local file and configure the key’s normal Executable, Arguments, and optional Working directory and Title fields; do not invent a return link.'}`;
 }
 
@@ -75,8 +76,8 @@ function installChatGptLink(document, bridge) {
     try {
       token = Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
     } catch { token = undefined; }
-    const registered = token && bridge.beginScriptImport(token);
-    const prompt = scriptPrompt(registered ? token : undefined, bridge.getConnectionState());
+    const registered = bridge.beginScriptImport(token);
+    const prompt = scriptPrompt(registered || undefined, bridge.getConnectionState());
     // Never wait for the plugin reply before opening ChatGPT.
     const opening = bridge.openUrl(`https://chatgpt.com/?q=${encodeURIComponent(prompt)}`);
     if (!opening) document.getElementById('settings-status').textContent = 'The browser request could not be sent. Try the ChatGPT link again.';

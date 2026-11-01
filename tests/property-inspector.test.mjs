@@ -9,6 +9,12 @@ import { parseArguments } from '../src/core/arguments.mjs';
 import { getInspectorConfiguration, validateSettings } from '../src/core/settings.mjs';
 
 const initial = { executable: '/program', argsText: 'old', cwd: '', runRequested: false };
+const importToken = 'a'.repeat(32), otherImportToken = 'b'.repeat(32);
+function registerImport(h, token = importToken, importSequence = 0) {
+  const selected = h.bridge.beginScriptImport(token), request = h.last();
+  h.reply({ ...request, type: 'canvas:reply', status: 'saved', settings: initial, scriptToken: importToken, importSequence });
+  return { selected, request };
+}
 function controls() {
   return createInspectorFixture().fields;
 }
@@ -58,6 +64,90 @@ function harness(overrides = {}) {
   }
   return { bridge, controller, fields, sockets, timers, errors, statuses, connections, normal, connect, ready, reply, last, tick };
 }
+
+test('repeat import results update controls successively; duplicate and reordered outcomes cannot revert them', () => {
+  // Arrange: sequence ordering is a safety contract, not arrival-time deduplication.
+  const h = harness(); h.ready(); const { request } = registerImport(h);
+  const result = (sequence, executable, status = 'saved') => ({ ...request, type: 'canvas:script-result', importSequence: sequence, status, settings: { ...initial, executable } });
+  // Act
+  h.reply(result(1, '/synthetic/first.py')); const first = h.fields.executable.value;
+  h.reply(result(3, '/synthetic/latest.py')); const status = h.fields.status.textContent;
+  h.reply(result(2, '/synthetic/older.py')); h.reply(result(3, '/synthetic/duplicate.py', 'error'));
+  // Assert
+  assert.equal(first, '/synthetic/first.py'); assert.equal(h.fields.executable.value, '/synthetic/latest.py');
+  assert.equal(status, 'Script imported. Press the key to run.'); assert.equal(h.fields.status.textContent, status);
+  assert.deepEqual(h.errors, []); h.controller.dispose(); h.bridge.disconnect();
+});
+
+for (const defect of ['context', 'inspectorId', 'requestId', 'missing sequence', 'invalid sequence', 'unknown status']) {
+  test(`import result rejects ${defect} without changing controls or status`, () => {
+    // Arrange
+    const h = harness(); h.ready(); const { request } = registerImport(h);
+    const result = { ...request, type: 'canvas:script-result', importSequence: 1, status: 'saved', settings: { ...initial, executable: '/foreign.py' } };
+    if (['context', 'inspectorId'].includes(defect)) result[defect] = 'foreign';
+    if (defect === 'requestId') result.requestId++;
+    if (defect === 'missing sequence') delete result.importSequence;
+    if (defect === 'invalid sequence') result.importSequence = 1.5;
+    if (defect === 'unknown status') result.status = 'PRIVATE_STATUS';
+    const before = h.fields.status.textContent;
+    // Act
+    h.reply(result);
+    // Assert
+    assert.equal(h.fields.executable.value, initial.executable); assert.equal(h.fields.status.textContent, before);
+    assert.deepEqual(h.errors, []); h.controller.dispose(); h.bridge.disconnect();
+  });
+}
+
+test('Ask retains canonical token across registrations and receives it from a reopened owner claim', () => {
+  // Arrange
+  const h = harness(); h.ready(); const first = registerImport(h);
+  // Act
+  const second = registerImport(h, otherImportToken);
+  const oldSocket = h.sockets[0]; h.connect(initial);
+  h.reply({ ...h.last(), type: 'canvas:reply', status: 'challenge', token: 'challenge', settings: initial });
+  h.reply({ ...h.last(), type: 'canvas:reply', status: 'saved', settings: initial, scriptToken: importToken, importSequence: 2 });
+  const reopened = h.bridge.beginScriptImport(otherImportToken);
+  // Assert
+  assert.equal(first.selected, importToken); assert.equal(second.selected, importToken); assert.equal(reopened, importToken);
+  assert.equal(h.last().changes.token, importToken); assert.equal(oldSocket.closed, true);
+  assert.deepEqual(h.errors, []); h.controller.dispose(); h.bridge.disconnect();
+});
+
+for (const state of ['pending typing', 'sent edit', 'registration pending', 'disconnected', 'reconnected']) {
+  test(`import results cannot overwrite ${state} or falsely acknowledge local edits`, () => {
+    // Arrange
+    const h = harness(); h.ready(); const { request } = registerImport(h), oldSocket = h.sockets[0];
+    const result = { ...request, type: 'canvas:script-result', status: 'saved', importSequence: 1, settings: { ...initial, title: 'PRIVATE_REMOTE', executable: '/stale.py' } };
+    // Act
+    if (state === 'pending typing' || state === 'sent edit') {
+      h.fields.title.value = 'local title'; if (state === 'sent edit') h.tick(200);
+    }
+    if (state === 'registration pending') h.bridge.beginScriptImport(otherImportToken);
+    if (state === 'disconnected') h.bridge.disconnect();
+    if (state === 'reconnected') h.ready({ ...initial, title: 'new session' });
+    const before = { title: h.fields.title.value, path: h.fields.executable.value, status: h.fields.status.textContent };
+    h.reply(result, oldSocket);
+    const after = { title: h.fields.title.value, path: h.fields.executable.value, status: h.fields.status.textContent };
+    const retry = h.bridge.beginScriptImport(otherImportToken);
+    // Assert
+    assert.deepEqual(after, before); assert.notEqual(after.title, 'PRIVATE_REMOTE');
+    if (state !== 'reconnected') assert.equal(retry, false);
+    h.controller.dispose(); h.bridge.disconnect();
+  });
+}
+
+test('current import failure is fixed plaintext; a later success clears it without rendering supplied HTML', () => {
+  // Arrange: fixture innerHTML assignment throws, including on untrusted result contents.
+  const h = harness(); h.ready(); const { request } = registerImport(h);
+  // Act
+  h.reply({ ...request, type: 'canvas:script-result', importSequence: 1, status: 'error', diagnosticCode: '<script>PRIVATE</script>' });
+  const failure = h.fields.status.textContent;
+  h.reply({ ...request, type: 'canvas:script-result', importSequence: 2, status: 'saved', settings: { ...initial, title: '<script>PRIVATE</script>' } });
+  // Assert
+  assert.match(failure, /^Script import could not be confirmed\./); assert.equal(failure.includes('PRIVATE'), false);
+  assert.equal(h.fields.title.value, '<script>PRIVATE</script>'); assert.equal(h.fields.status.textContent, 'Script imported. Press the key to run.');
+  assert.deepEqual(h.errors, ['SCRIPT_IMPORT_FAILED']); h.controller.dispose(); h.bridge.disconnect();
+});
 
 // S2: the SDK registration platform is connection-local, never a settings field.
 test('TITLE-1 Stream inspector hydrates saved title only, repaints dynamic placeholder and debounces literal edits', () => {
