@@ -5,10 +5,18 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DeckForge Commander Settings</title>
     <style>
-        p { margin: 24px 0; }
-        sdpi-item > small { display: block; margin-top: 4px; }
-        #settings-status { color: #969696; }
-        #themeColor { width: 100%; height: 30px; }
+        body { font-family: system-ui, sans-serif; }
+        a { color: #8ab4e8; text-decoration: none; }
+        a:hover { color: #b5d3f5; text-decoration: underline; }
+        a:focus-visible, #themeColor:focus-visible { outline: 2px solid #8ab4e8; outline-offset: 3px; }
+        sdpi-item > small { display: block; margin-top: 4px; color: #a0a0a0; }
+        #settings-status { margin: 16px 20px; color: #a0a0a0; font-size: 12px; line-height: 1.5; }
+        #settings-status:empty { display: none; }
+        #themeColor { box-sizing: border-box; width: 100%; height: 30px; padding: 3px; border: 1px solid #606060; border-radius: 4px; background: transparent; cursor: pointer; }
+        #themeColor::-webkit-color-swatch-wrapper { padding: 0; }
+        #themeColor::-webkit-color-swatch { border: 0; border-radius: 2px; }
+        #themeColor::-moz-color-swatch { border: 0; border-radius: 2px; }
+        .project-footer { margin: 20px 0 12px; color: #969696; text-align: center; font-size: 12px; line-height: 1.5; }
         #timer-controls[hidden], #custom-interval[hidden] { display: none !important; }
     </style>
     <script src="sdpi-components.js"></script>
@@ -59,8 +67,8 @@
         <input id="themeColor" type="color" value="#606060" aria-label="Artwork theme color" />
     </sdpi-item>
     <p id="settings-status" role="status" aria-live="polite"></p>
-    <sdpi-item>
-        <a id="github-project" href="https://github.com/renaudcerrato/deckforge-commander">GitHub project</a>
-    </sdpi-item>
+    <footer class="project-footer">
+        DeckForge Commander · <a id="github-project" href="https://github.com/renaudcerrato/deckforge-commander">GitHub ↗</a>
+    </footer>
 </body>
 </html>
