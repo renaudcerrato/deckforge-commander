@@ -1,8 +1,10 @@
 # DeckForge Commander
 
-Turn a program's stdout into text, progress, or images on a Stream Deck key. An open-source Stream Deck plugin.
+**Your scripts. Your Stream Deck.**
 
-**Navigation:** [Available keys](#available-keys) · [Install a packaged build](#install-a-packaged-build) · [Build from source](#build-from-source) · [First key](#first-key) · [Examples](#examples) · [Demos](demos/README.md) · [Protocol](#protocol) · [Windows guide](docs/windows-support.md)
+Turn program output into live text, progress rings, and images. An open-source Stream Deck plugin for macOS and Windows.
+
+[Get started](#install-a-packaged-build) · [Examples](#examples) · [Protocol](#protocol) · [Build](#build-from-source)
 
 <p align="center" width="100%">
 <img src="assets/hero.gif" width="520" alt="Animated Stream Deck Mini illustration showing four demos and native Loop and Run ready cards"/>
@@ -12,61 +14,68 @@ Turn a program's stdout into text, progress, or images on a Stream Deck key. An 
 <a href="demos/showcase.py">showcase.py</a> • <a href="demos/video.sh">video.sh</a> • <a href="demos/gif.py">gif.py</a> • <a href="demos/fluxcapacitor.py">fluxcapacitor.py</a>
 </p>
 
-## Requirements
+## Examples
 
-- **Runtime:** macOS 13+ or Windows 11 x64 · Stream Deck 7.1+
-- **Build:** Node.js 24 and npm on macOS arm64/x64, Linux x64 (build-only), or Windows x64; internet access is needed for the first build (see the Windows guide)
-- **Demos:** See [demo requirements](demos/README.md).
-
-## Available keys
+A line of output is all it takes:
 
 <table>
-<thead><tr><th>Preview</th><th>Key</th><th>Usage</th><th>Behavior</th></tr></thead>
+<thead><tr><th>Code</th><th>On your key</th></tr></thead>
 <tbody>
-<tr><td><img src="assets/key-stream.png" width="120" height="120" alt="Ready Stream key illustration with a cyan accent"></td><td><strong>Stream</strong></td><td>Tap to start or stop.</td><td>Runs until stopped or the program exits. Remembers start/stop intent across reconnects and can restart if still requested.</td></tr>
-<tr><td><img src="assets/key-loop.png" width="120" height="120" alt="Ready Loop key illustration with a violet accent"></td><td><strong>Loop</strong></td><td>Tap to start/refresh; hold for one second to stop.</td><td>Repeats after each completion and the selected delay. Remains disabled after reconnect.</td></tr>
-<tr><td><img src="assets/key-run.png" width="120" height="120" alt="Ready Run key illustration with a warm orange accent"></td><td><strong>Run</strong></td><td>Tap to execute once. Busy taps are ignored; hold one second to stop.</td><td>Runs once and retains successful output. Never restarts automatically.</td></tr>
+<tr><td><strong>Bash</strong><pre><code>printf 'Hello, world\n'</code></pre></td><td><img src="assets/protocol-text-plain.svg" width="144" alt="Plain text"></td></tr>
+<tr><td><strong>Python</strong><pre><code>print("progress:17/1034|label:Build;color:cyan", flush=True)</code></pre></td><td><img src="assets/protocol-progress-ring.svg" width="144" alt="Cyan progress ring with 1.6 percent and Build centered together"></td></tr>
+<tr><td><strong>Node.js</strong><pre><code>process.stdout.write('text:128|font:mono;font-size:40;color:orange\n');</code></pre></td><td><img src="assets/protocol-text-mono.svg" width="144" alt="Large orange monospace text"></td></tr>
 </tbody>
 </table>
 
+Try the [clocks, CPU, disk space, and counter demos](demos/README.md), or explore the [output protocol](#protocol).
+
+## Available keys
+
+Choose how your program runs:
+
+<table>
+<thead><tr><th>Stream</th><th>Loop</th><th>Run</th></tr></thead>
+<tbody>
+<tr>
+<td align="center"><img src="assets/key-stream.png" width="120" height="120" alt="Ready Stream key illustration with a cyan accent"><br><strong>Keep it live.</strong></td>
+<td align="center"><img src="assets/key-loop.png" width="120" height="120" alt="Ready Loop key illustration with a violet accent"><br><strong>Run. Wait. Repeat.</strong></td>
+<td align="center"><img src="assets/key-run.png" width="120" height="120" alt="Ready Run key illustration with a warm orange accent"><br><strong>One press. One execution.</strong></td>
+</tr>
+</tbody>
+</table>
+
+- **Stream:** Tap to start or stop. Runs until stopped or the program exits; can restart after reconnect if still requested.
+- **Loop:** Tap to start or refresh; hold one second to stop. Repeats after each completion and the selected delay. Remains disabled after reconnect.
+- **Run:** Tap to execute once; hold one second to stop. Busy taps are ignored. Retains successful output and never restarts automatically.
+
 **Run and Loop** keep a successful run's final output visible, if any. Loop retains it between runs; no-output success shows `success`.
+
+<details>
+<summary>Switching pages, disconnecting, and restarting</summary>
 
 - **Switching pages or profiles:** Stream stops and may restart when you return if you had left it running. Loop and Run may finish their current program, but start nothing new while hidden.
 - **Disconnecting the device:** All running programs stop. After reconnecting, Stream may restart if you had left it running; Loop and Run require another press.
 - **Restarting the plugin:** All keys start stopped, regardless of their previous state.
 
-Set an absolute path to a program you trust. It runs directly with your permissions—without a shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang. On Windows, choose an interpreter executable and put the script path in **Arguments**; see the [Windows setup guide](docs/windows-support.md#choose-an-executable).
+</details>
 
-In Windows **Arguments**, backslashes stay literal. Use quotes to keep a path with spaces together, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`.
+## Requirements
+
+- **Runtime:** macOS 13+ or Windows 11 x64 · Stream Deck 7.1+
+- **Build:** Node.js 24 and npm on macOS arm64/x64, Linux x64 (build-only), or Windows x64; internet access is needed for the first build (see the [Windows guide](docs/windows-support.md))
+- **Demos:** See [demo requirements](demos/README.md).
 
 ## Install a packaged build
 
 If you have a packaged build, open `git.renaudcerrato.deckforge.streamDeckPlugin` with Stream Deck to install it, then [create your first key](#first-key).
 
-## Build from source
-
-```sh
-npm install
-npm run pack
-```
-
-Open `dist/git.renaudcerrato.deckforge.streamDeckPlugin` with Stream Deck to install. Use `npm run build` to build without packaging. Neither command requires Stream Deck or a device. See [Requirements](#requirements) and the [Windows guide](docs/windows-support.md).
-
-For local development, link the checkout:
-
-```sh
-npm run link
-```
-
-After rebuilding an already-linked checkout:
-
-```sh
-streamdeck restart git.renaudcerrato.deckforge
-```
-
-`npm run stop` stops the plugin; `npm run unlink` removes its development link without deleting plugin files. `npm run watch` builds on startup and source changes, restarting the plugin only after a successful build.
+No package yet? [Build one from source](#build-from-source).
 
 ## First key
+
+Set an absolute path to a program you trust. It runs directly with your permissions—without a shell or plugin `PATH` lookup. On macOS, executable scripts use their shebang. On Windows, choose an interpreter executable and put the script path in **Arguments**; see the [Windows setup guide](docs/windows-support.md#choose-an-executable).
+
+In Windows **Arguments**, backslashes stay literal. Use quotes to keep a path with spaces together, such as `'C:\My Scripts\showcase.py'` or `"C:\My Scripts\showcase.py"`.
 
 On macOS, try the Python showcase:
 
@@ -84,17 +93,6 @@ Arguments:  -NoLogo -NoProfile -NonInteractive -File 'C:\absolute\path\to\repo\d
 PowerShell's execution policy applies; do not weaken it if the script is blocked.
 
 More examples: [clocks, CPU, disk space, and counters](demos/README.md).
-
-## Examples
-
-<table>
-<thead><tr><th>Code</th><th>Output</th></tr></thead>
-<tbody>
-<tr><td><strong>Bash</strong><pre><code>printf 'Hello, world\n'</code></pre></td><td><img src="assets/protocol-text-plain.svg" width="144" alt="Plain text"></td></tr>
-<tr><td><strong>Python</strong><pre><code>print("progress:17/1034|label:Build;color:cyan", flush=True)</code></pre></td><td><img src="assets/protocol-progress-ring.svg" width="144" alt="Cyan progress ring with 1.6 percent and Build centered together"></td></tr>
-<tr><td><strong>Node.js</strong><pre><code>process.stdout.write('text:128|font:mono;font-size:40;color:orange\n');</code></pre></td><td><img src="assets/protocol-text-mono.svg" width="144" alt="Large orange monospace text"></td></tr>
-</tbody>
-</table>
 
 ## Protocol
 
@@ -372,6 +370,31 @@ print(f"text:Building|color:{theme}", flush=True)
 ```
 
 Theme changes affect the next launch only. See [Launch Environment](docs/launch-environment.md) for all available variables.
+
+## Build from source
+
+```sh
+npm install
+npm run pack
+```
+
+Open `dist/git.renaudcerrato.deckforge.streamDeckPlugin` with Stream Deck to install. Use `npm run build` to build without packaging. Neither command requires Stream Deck or a device. See [Requirements](#requirements) and the [Windows guide](docs/windows-support.md).
+
+### Local development
+
+Link the checkout:
+
+```sh
+npm run link
+```
+
+After rebuilding an already-linked checkout:
+
+```sh
+streamdeck restart git.renaudcerrato.deckforge
+```
+
+`npm run stop` stops the plugin; `npm run unlink` removes its development link without deleting plugin files. `npm run watch` builds on startup and source changes, restarting the plugin only after a successful build.
 
 ## License
 
