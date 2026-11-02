@@ -30,6 +30,8 @@ export interface ProgramState {
 	observe(input: unknown): { accepted: boolean };
 	getSettings(): StoredSettings;
 	editConfiguration(changes: unknown): Promise<SaveResult>;
+	/** Plugin-only intent update; absent for one-shot actions. */
+	setResumeRequested?(value: boolean): Promise<SaveResult>;
 	whenIdle(): Promise<void>;
 	isBlocked(): boolean;
 	getRevision(): number;
@@ -58,6 +60,7 @@ export interface ProgramSessionDependencies {
 	platform?: ExecutionPlatform;
 	/** Wait only on settings authority, never the session queue; matching reports are not durability proof. */
 	confirmLaunchSettings(expected: StoredSettings): Promise<boolean>;
+	saveResumeRequested(value: boolean): Promise<void>;
 	startRun(settings: ExecutionSettings, callbacks: ProcessRunCallbacks & {
 		onDiagnostic(event: ProcessRunDiagnostic): void;
 	}): ProcessRun;
@@ -378,16 +381,28 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 				return;
 			}
 			const saving = record.state.editConfiguration(request.changes);
+			const expectedConfiguration = record.state.getSettings();
 			diagnosticStage = "PLUGIN_APPLY_BEGIN";
 			const applying = record.session.applySettings(record.state.getSettings());
 			diagnosticStage = "PLUGIN_SAVE_WAIT";
 			const result = await saving;
 			diagnosticStage = "PLUGIN_APPLY_WAIT";
 			await applying;
+			// Applying an edit may also update plugin-owned intent. Confirm that newer
+			// complete save rather than reporting a successful preference edit as stale.
+			await record.state.whenIdle();
+			if (record.state.isBlocked() || record.persistenceUncertain) throw saveFailed();
+			const latestSettings = record.state.getSettings();
+			const latestConfiguration = copySettings(latestSettings);
+			if (record.state.setResumeRequested) {
+				delete expectedConfiguration.resumeRequested;
+				delete latestConfiguration.resumeRequested;
+			}
 			await this.showSafetyError(record);
 			diagnosticStage = "PLUGIN_REPLY";
-			if (result.status === "saved" && result.revision === record.state.getRevision()) {
-				await this.reply(record, request, { status: "saved", settings: result.settings });
+			if ((result.status === "saved" && result.revision === record.state.getRevision())
+				|| (record.state.setResumeRequested && sameSettingsJson(expectedConfiguration, latestConfiguration))) {
+				await this.reply(record, request, { status: "saved", settings: latestSettings });
 			} else {
 				await this.reply(record, request, { status: "stale" });
 			}
@@ -531,10 +546,17 @@ export abstract class ProgramRuntimeAction<Settings extends StoredSettings, Stat
 		});
 		const session = this.createSession(state, {
 			platform: executionPlatform(),
+			saveResumeRequested: value => {
+				// A retired owner's cleanup must never write through the replacement owner.
+				if (!currentOwner() || !state.setResumeRequested) return Promise.resolve();
+				return state.setResumeRequested(value).then(() => {});
+			},
 			confirmLaunchSettings: async expected => {
 				if (!currentOwner()) return false;
 				await record.ready;
-				if (!currentOwner() || record.cleanupBlocked || record.persistenceUncertain) return false;
+				// Configuration confirmation is not execution permission: cleanup-only
+				// uncertainty still allows saves; session/startRun retain the launch gates.
+				if (!currentOwner() || record.persistenceUncertain) return false;
 				const snapshot = copySettings(expected);
 				while (true) {
 					const revision = state.getRevision();

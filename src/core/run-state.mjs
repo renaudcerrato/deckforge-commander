@@ -1,4 +1,4 @@
-import { validateExecutionEdit, validateTitleEdit } from './settings.mjs';
+import { validateExecutionEdit, validateTitleEdit, readRememberRunningState, sameExecutionSettings } from './settings.mjs';
 import { normalizeThemeColor } from './theme.mjs';
 import { copySettings, createSettingsAuthority } from './settings-authority.mjs';
 
@@ -27,6 +27,10 @@ export function applyConfigurationEdit(settings, changes, platform) {
   const edit = copyRunSettings(changes);
   if (Object.keys(edit).length === 0) throw invalidSettings();
   for (const key of Object.keys(edit)) {
+    if (key === 'rememberRunningState') {
+      next.rememberRunningState = readRememberRunningState(edit);
+      continue;
+    }
     if (key === 'title') {
       const title = validateTitleEdit(edit.title);
       if (title === undefined) delete next.title;
@@ -41,9 +45,10 @@ export function applyConfigurationEdit(settings, changes, platform) {
     next[key] = edit[key];
   }
   // Cosmetic-only edits preserve the complete snapshot, even when execution is invalid/unconfigured.
-  if (Object.keys(edit).some(key => key !== 'themeColor' && key !== 'title')) {
+  if (Object.keys(edit).some(key => key !== 'themeColor' && key !== 'title' && key !== 'rememberRunningState')) {
     if (!Object.hasOwn(next, 'argsText') && !Object.hasOwn(next, 'args')) next.argsText = '';
   }
+  if (!sameExecutionSettings(settings, next, platform) || edit.rememberRunningState === false) next.resumeRequested = false;
   return next;
 }
 
@@ -66,8 +71,17 @@ export function createRunStateCoordinator({
     try { return save(applyConfigurationEdit(getSettings(), changes, platform)); } catch (error) { return Promise.reject(error); }
   }
 
+  function setResumeRequested(value) {
+    if (typeof value !== 'boolean') return Promise.reject(invalidSettings('INVALID_RUN_STATE'));
+    try {
+      const next = getSettings();
+      next.resumeRequested = value && readRememberRunningState(next);
+      return save(next);
+    } catch (error) { return Promise.reject(error); }
+  }
+
   return {
-    observe, getSettings, editConfiguration, whenIdle,
+    observe, getSettings, editConfiguration, setResumeRequested, whenIdle,
     isBlocked, getRevision,
   };
 }

@@ -248,6 +248,22 @@ function reformatMarkup(html) {
 }
 const markupVariants = [['controlled', inspectorTestMarkup], ['controlled reformatted', reformatMarkup(inspectorTestMarkup)]];
 
+for (const [label, html] of [
+  ['complete', inspectorTestMarkup],
+  ['missing checkbox', inspectorTestMarkup.replace(/<sdpi-checkbox\b[^>]*>[\s\S]*?<\/sdpi-checkbox>/, '')],
+  ['wrong control', inspectorTestMarkup.replaceAll('sdpi-checkbox', 'sdpi-select')],
+  ['missing checkbox label', inspectorTestMarkup.replace('label="Resume after sleep, reconnect, or restart"', '')],
+]) {
+  test(`remember static control contract ${label === 'complete' ? 'accepts' : 'rejects'} ${label}`, () => {
+    // Arrange
+    const input = html;
+    // Act
+    const verify = () => assertInspectorMarkup(input);
+    // Assert
+    if (label === 'complete') assert.doesNotThrow(verify); else assert.throws(verify);
+  });
+}
+
 for (const [variant, html] of [['authored', staticControls], ['generated', generatedControls], ...markupVariants]) {
   test(`central inspector static contract holds for ${variant} markup`, () => {
     // Arrange
@@ -326,6 +342,38 @@ const presetIs = value => node => node.tag === 'option' && node.attributes.get('
 const entryScript = node => node.tag === 'script' && node.attributes.get('src') === 'run.js';
 const body = node => node.tag === 'body';
 
+for (const [variant, input] of markupVariants) {
+  for (const heading of ['program-heading', 'behavior-heading', 'appearance-heading']) {
+    test(`${variant} labelled section tolerates anonymous wrappers around ${heading}`, () => {
+      // Arrange
+      const section = node => node.attributes.get('aria-labelledby') === heading;
+      // Act
+      const wrapped = mutateMarkup(input, section, node => { node.content = `<div><article>${node.content}</article></div>`; });
+      // Assert: membership and order, not immediate parentage or CSS serialization.
+      assert.doesNotThrow(() => assertInspectorMarkup(wrapped));
+    });
+  }
+  test(`${variant} Program field-order assertion rejects executable after working directory`, () => {
+    // Arrange
+    const select = node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Executable';
+    const item = extractInspectorMarkup(input).nodes.find(select), content = input.slice(item.start, item.end);
+    const without = mutateMarkup(input, select, node => { node.remove = true; });
+    // Act
+    const reordered = mutateMarkup(without, node => node.attributes.get('aria-labelledby') === 'program-heading', node => { node.content += content; });
+    // Assert: all controls and copy remain intact; only their semantic order changed.
+    assert.throws(() => assertInspectorMarkup(reordered), /section field order/);
+  });
+  test(`${variant} section-order assertion rejects Behavior after the footer`, () => {
+    // Arrange
+    const section = extractInspectorMarkup(input).nodes.find(idIs('remember-controls'));
+    const content = input.slice(section.start, section.end), without = mutateMarkup(input, idIs('remember-controls'), node => { node.remove = true; });
+    // Act
+    const reordered = mutateMarkup(without, body, node => { node.content += content; });
+    // Assert
+    assert.throws(() => assertInspectorMarkup(reordered), /section order/);
+  });
+}
+
 // Objective: ancestor visibility survives arbitrary anonymous wrappers, not a fixed layout.
 test('hidden ancestry follows anonymous wrappers and their current state', () => {
   // Arrange
@@ -342,7 +390,8 @@ test('hidden ancestry follows anonymous wrappers and their current state', () =>
 });
 
 for (const [id, container] of [['actionOnPress', 'body'], ['intervalPreset', 'body'],
-  ['custom-interval', 'body'], ['intervalSeconds', 'timer-controls']]) {
+  ['custom-interval', 'body'], ['intervalSeconds', 'timer-controls'], ['rememberRunningState', 'body'],
+  ['behavior-heading', 'body'], ['timer-controls', 'body'], ['title', 'body'], ['argsText', 'body']]) {
   test(`static visibility boundaries reject misplaced ${id} despite retained control semantics`, () => {
     // Arrange: relocate only independent test input, keeping accessible labels and values.
     const node = extractInspectorMarkup(inspectorTestMarkup).nodes.find(idIs(id));
@@ -375,7 +424,17 @@ for (const [defect, select, edit] of [
   ['wrong picker element', idIs('executable'), node => { node.tag = 'sdpi-textfield'; }],
   ['wrong native color type', idIs('themeColor'), node => node.attributes.set('type', 'text')],
   ['missing color accessibility name', idIs('themeColor'), node => node.attributes.delete('aria-label')],
-  ['missing picker accessibility name', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Program', node => node.attributes.delete('label')],
+  ['missing picker accessibility name', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Executable', node => node.attributes.delete('label')],
+  ['missing Program heading', idIs('program-heading'), node => { node.remove = true; }],
+  ['changed Behavior heading', idIs('behavior-heading'), node => { node.content = 'Execution'; }],
+  ['missing Behavior accessible name', idIs('remember-controls'), node => node.attributes.delete('aria-labelledby')],
+  ['changed Run every label', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'Run every', node => node.attributes.set('label', 'Interval')],
+  ['changed On Press label', node => node.tag === 'sdpi-item' && node.attributes.get('label') === 'On Press', node => node.attributes.set('label', 'Action on press')],
+  ['changed ChatGPT text', idIs('ask-chatgpt'), node => { node.content = 'Ask ChatGPT'; }],
+  ['changed ChatGPT href', idIs('ask-chatgpt'), node => node.attributes.set('href', 'https://example.invalid/')],
+  ['changed arguments helper', node => node.tag === 'small' && node.text.startsWith('Quote arguments'), node => { node.content = 'New instructions'; }],
+  ['changed custom interval helper', node => node.tag === 'small' && node.text.startsWith('Enter whole seconds'), node => { node.content = 'New interval instructions'; }],
+  ['changed preset label', presetIs('60'), node => { node.content = '60 seconds'; }],
   ['disabled executable', idIs('executable'), node => node.attributes.set('disabled', '')],
   ['readonly arguments', idIs('argsText'), node => node.attributes.set('readonly', '')],
   ['environment field', body, node => { node.content += '<input id="environment" />'; }],
@@ -514,6 +573,29 @@ test('SDPI edits strip CRLF and dispatch synchronously without detail, then resp
   assert.equal(synchronous, 1);
   assert.deepEqual(observed, [['abcd', 'valuechange', false, undefined]]);
   assert.equal(field.value, 'afterremoval');
+});
+
+test('SDPI checkbox value stays boolean and distinct programmatic assignments emit plain valuechange events', () => {
+  // Arrange
+  const field = createInspectorFixture().fields.rememberRunningState, observed = [];
+  const initial = field.value;
+  const listener = event => observed.push([field.value, event.type, event.bubbles, event.detail]);
+  field.addEventListener('valuechange', listener);
+  // Act
+  field.value = true; const synchronous = observed.length;
+  field.value = true; field.value = false; field.value = false;
+  field.removeEventListener('valuechange', listener); field.userEdit(true);
+  // Assert
+  assert.equal(initial, false); assert.equal(synchronous, 1); assert.equal(field.value, true);
+  assert.deepEqual(observed, [[true, 'valuechange', false, undefined], [false, 'valuechange', false, undefined]]);
+});
+test('checkbox fixture does not coerce malformed boundary values or change textfield CRLF handling', () => {
+  // Arrange: malformed callback values must reach controller validation, not turn into valid false.
+  const { rememberRunningState, argsText } = createInspectorFixture().fields;
+  // Act
+  rememberRunningState.value = 'false'; argsText.value = 'a\r\nb';
+  // Assert
+  assert.equal(rememberRunningState.value, 'false'); assert.equal(argsText.value, 'ab');
 });
 
 test('native color assignment and event delivery are independent and listener removal is respected', () => {
@@ -695,6 +777,6 @@ test('adapter loaders isolate runtime ownership, configuration and process state
   assert.deepEqual(second.launches.map(launch => launch.input.executable), ['/synthetic/second']);
   assert.equal(first.launches[0].stopped, true); assert.equal(second.launches[0].stopped, false);
   assert.equal(first.replies.at(-1).status, 'saved');
-  assert.deepEqual(await first.runtime.getSettings(), { executable: '/synthetic/first', argsText: '', title: 'first title' });
-  assert.deepEqual(await second.runtime.getSettings(), { executable: '/synthetic/second', argsText: '' });
+  assert.deepEqual(await first.runtime.getSettings(), { executable: '/synthetic/first', argsText: '', title: 'first title', resumeRequested: false });
+  assert.deepEqual(await second.runtime.getSettings(), { executable: '/synthetic/second', argsText: '', resumeRequested: true });
 });

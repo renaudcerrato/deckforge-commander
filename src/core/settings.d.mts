@@ -11,6 +11,9 @@ export interface ExecutionSettingsInput {
 	argsText?: string;
 	cwd?: string;
 	runRequested?: boolean;
+	rememberRunningState?: boolean;
+	/** Plugin-owned saved resume intent; not an inspector-editable field. */
+	resumeRequested?: boolean;
 	/** Cosmetic metadata; execution validation ignores malformed stored colors. */
 	themeColor?: unknown;
 	title?: unknown;
@@ -22,6 +25,7 @@ export interface InspectorConfiguration {
 	argsText?: string;
 	themeColor: string;
 	title: string;
+	rememberRunningState?: boolean;
 	diagnosticCode?: string;
 }
 
@@ -30,6 +34,9 @@ export declare function validateSettings(input: unknown, platform?: ExecutionPla
 export declare function validateExecutionEdit(key: string, value: unknown, platform?: ExecutionPlatform): void;
 /** Empty/normalized blank clears the optional title; other valid strings stay literal. */
 export declare function validateTitleEdit(value: unknown): string | undefined;
+/** Missing defaults to true; present non-booleans reject without coercion. */
+export declare function readRememberRunningState(input: unknown): boolean;
+export declare function readResumeRequested(input: unknown): boolean;
 /** Partial setup accepts missing/empty executable and omitted argv, validating supplied fields. Throws fixed diagnostics. */
 export type SettingsClassification = { kind: 'setup' } | { kind: 'configured'; execution: ExecutionSettings };
 export declare function classifySettings(input: unknown, platform?: ExecutionPlatform): SettingsClassification;

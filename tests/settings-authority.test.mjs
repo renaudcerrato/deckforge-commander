@@ -86,6 +86,7 @@ test('1000 Start/Stop pairs plus 1000 unique edits retain local authority agains
   // Arrange
   const h = storage(); h.state.observe(executionInitial);
   const live = createActionSession({ initialConnected: true,
+    saveResumeRequested: value => h.state.setResumeRequested(value).then(() => {}),
     async confirmLaunchSettings() { await h.state.whenIdle(); return !h.state.isBlocked(); },
     startRun() { return { done: new Promise(() => {}), async stop() { return true; } }; },
     async setImage() {}, async setTitle() {}, onError() {},
@@ -116,7 +117,7 @@ test('1000 Start/Stop pairs plus 1000 unique edits retain local authority agains
   }
   await session.whenIdle();
   // Assert: behavioral stress only, not a heap/GC or private-history proof.
-  assert.equal(writes, 1000);
+  assert.equal(writes, 3000);
   assert.equal(live.getState().runRequested, false);
   assert.equal(h.host.writes, writes);
   assert.equal(h.host.reads, writes);
@@ -205,6 +206,7 @@ for (const loss of ['hide', 'disconnect', 'execution-edit']) {
     const h = storage();
     h.state.observe(executionInitial);
     const session = createActionSession({ initialConnected: true,
+      saveResumeRequested: value => h.state.setResumeRequested(value).then(() => {}),
       async confirmLaunchSettings(snapshot) {
         await h.state.whenIdle();
         if (++confirmations === 1) { entered.resolve(); await read.promise; }
@@ -290,7 +292,7 @@ function runtime(id = 'synthetic-key', input = executionInitial, host = { value:
 
 // Copy/restart regression: exercise actual per-key adapter ownership, not a mocked intent store.
 for (const legacy of [true, false, 'missing']) {
-  test(`actual Stream copy with legacy ${legacy} starts independently and never disturbs the original`, options, async () => {
+  test(`actual Stream enabled copy restores saved intent while legacy ${legacy} remains unchanged`, options, async () => {
     // Arrange
     const input = { executable: '/synthetic/program', args: ['legacy', ''] };
     if (legacy !== 'missing') input.runRequested = legacy;
@@ -309,18 +311,18 @@ for (const legacy of [true, false, 'missing']) {
     await h.action.onWillAppear(event(copy));
 
     // Assert
-    assert.deepEqual(beforeCopyPress, { launches: 1, stops: 0 });
-    assert.deepEqual(h.launches.map(launch => launch.stops), [0, 1]);
+    assert.deepEqual(beforeCopyPress, { launches: 2, stops: 0 });
+    assert.deepEqual(h.launches.map(launch => launch.stops), [0, 1, 0]);
     assert.deepEqual(original.host.images, originalImages);
     assert.deepEqual(original.host.value, saved);
     assert.deepEqual(copy.host.value, saved);
-    assert.deepEqual([original.host.writes, copy.host.writes], [0, 0]);
+    assert.deepEqual([original.host.writes, copy.host.writes], [1, 2]);
     assert.equal(Object.hasOwn(copy.host.value, 'runRequested'), legacy !== 'missing');
     await h.action.onWillDisappear(event(original));
     await h.action.onWillDisappear(event(copy));
   });
 
-  test(`actual fresh Stream adapter reusing the same action ID ignores legacy ${legacy} and prior live intent`, options, async () => {
+  test(`actual fresh Stream adapter restores saved intent but never rewrites legacy ${legacy}`, options, async () => {
     // Arrange
     const input = { executable: '/synthetic/program', args: ['legacy', ''] };
     if (legacy !== 'missing') input.runRequested = legacy;
@@ -338,11 +340,11 @@ for (const legacy of [true, false, 'missing']) {
     await fresh.action.onKeyDown(event(restored));
 
     // Assert
-    assert.equal(beforePress, 0);
+    assert.equal(beforePress, 1);
     assert.equal(fresh.launches.length, 1);
     assert.equal(live.launches[0].stops, 0);
-    assert.deepEqual(restored.host.value, input);
-    assert.deepEqual([original.host.writes, restored.host.writes], [0, 0]);
+    assert.deepEqual(restored.host.value, { ...input, resumeRequested: false });
+    assert.deepEqual([original.host.writes, restored.host.writes], [1, 1]);
     await live.action.onWillDisappear(event(original));
     await fresh.action.onWillDisappear(event(restored));
   });
@@ -418,7 +420,7 @@ for (const started of ['legacy-true', 'legacy-false']) {
     assert.deepEqual(r.host.titles.slice(titleIndex), []);
     assert.deepEqual(r.host.value, saved);
     assert.deepEqual([r.host.writes, r.host.reads], traffic);
-    assert.equal(traffic[0], 0);
+    assert.equal(traffic[0], 1);
   });
 
   test(`actual Stream adapter fast return with ${started} Started waits for old cleanup without image or title handoffs`, options, async t => {
@@ -460,7 +462,7 @@ for (const started of ['legacy-true', 'legacy-false']) {
     assert.deepEqual(r.host.titles.slice(titleIndex), []);
     assert.deepEqual(r.host.value, saved);
     assert.deepEqual([r.host.writes, r.host.reads], traffic);
-    assert.equal(traffic[0], 0);
+    assert.equal(traffic[0], 1);
   });
 }
 
@@ -514,8 +516,8 @@ for (const availabilityEvent of ['connect', 'wake']) {
     assert.deepEqual(h.launches.map(launch => launch.stops), [1, 0]);
     assert.deepEqual({ images: r.host.images, titles: r.host.titles }, before);
     assert.deepEqual(r.host.footers, ['ready', 'loading...']);
-    assert.deepEqual(r.host.value, input);
-    assert.deepEqual([r.host.writes, r.host.reads], [0, 0]);
+    assert.deepEqual(r.host.value, { ...input, resumeRequested: true });
+    assert.deepEqual([r.host.writes, r.host.reads], [1, 1]);
   });
 }
 
@@ -527,19 +529,20 @@ test('move-integrity Stream fast unchanged wrapper return preserves intent but c
   let hiding, returning;
   t.after(async () => { firstStopGate.resolve(); await Promise.all([hiding, returning]); await h.action.onWillDisappear(event(r)); });
   await h.action.onWillAppear(event(r)); await h.action.onKeyDown(event(r));
+  const runningA = structuredClone(r.host.value);
   // Act: unchanged hide/show while cleanup is held remains the same session.
-  hiding = h.action.onWillDisappear(event(runtime(r.action.id, a, r.host)));
+  hiding = h.action.onWillDisappear(event(runtime(r.action.id, runningA, r.host)));
   await h.launches[0].stopEntered;
-  returning = h.action.onWillAppear(event(runtime(r.action.id, a, r.host)));
+  returning = h.action.onWillAppear(event(runtime(r.action.id, runningA, r.host)));
   const pending = h.launches.length;
   firstStopGate.resolve(); await Promise.all([hiding, returning]);
   const unchanged = h.launches.length;
-  await h.action.onWillDisappear(event(runtime(r.action.id, a, r.host)));
+  await h.action.onWillDisappear(event(runtime(r.action.id, runningA, r.host)));
   r.host.value = structuredClone(b);
   await h.action.onWillAppear(event(runtime(r.action.id, b, r.host)));
   // Assert: a title-only complete-JSON difference is sufficient; no inherited Started.
   assert.equal(pending, 1); assert.equal(unchanged, 2);
   assert.equal(h.launches.length, 2);
   assert.deepEqual(r.host.footers.slice(-1), ['ready']);
-  assert.deepEqual([r.host.writes, r.host.reads], [0, 0]); assert.deepEqual(r.host.value, b);
+  assert.deepEqual([r.host.writes, r.host.reads], [1, 1]); assert.deepEqual(r.host.value, b);
 });

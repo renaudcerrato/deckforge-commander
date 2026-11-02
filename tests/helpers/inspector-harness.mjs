@@ -7,41 +7,56 @@ const authoredMarkup = readFileSync(new URL('../../src/inspector/run.html', impo
 export const inspectorTestMarkup = `<html><head>
   <script src="sdpi-components.js"></script><script src="run.js"></script>
   </head><body>
-  <section id="settings-status" role="status" aria-live="polite"></section>
-  <input id="themeColor" type="color" value="#abcdef" aria-label="Key artwork" />
-  <sdpi-item label="Program"><sdpi-file id="executable"></sdpi-file></sdpi-item>
-  <sdpi-item label="Working folder"><sdpi-textfield id="cwd"></sdpi-textfield></sdpi-item>
-  <sdpi-item label="Parameters"><sdpi-textfield id="argsText"></sdpi-textfield></sdpi-item>
-  <sdpi-item label="Key title"><sdpi-textfield id="title"></sdpi-textfield></sdpi-item>
-  <section id="timer-controls" hidden>
-    <sdpi-item label="Delay"><sdpi-select id="intervalPreset">
-      <option value="custom">Other duration</option><option value="3600">Hour</option>
-      <option value="1800">Half hour</option><option value="600">Ten minutes</option>
-      <option value="60">Minute</option><option value="30">Half minute</option>
-      <option value="10">Ten seconds</option><option value="1">Second</option>
-    </sdpi-select></sdpi-item>
-    <sdpi-item label="Press behavior"><div><sdpi-select id="actionOnPress">
-      <option value="stop">Toggle</option><option value="refresh">Refresh</option>
-    </sdpi-select></div></sdpi-item>
-    <section id="custom-interval" hidden><sdpi-item label="Seconds">
-      <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
-    </sdpi-item></section>
-  </section>
-  <p>Independent helper copy.</p><p>Additional explanation.</p>
-  <a id="github-project" href="#">Project</a><a id="ask-chatgpt" href="#">Script help</a>
+   <section aria-labelledby="program-heading"><div>
+     <h2 id="program-heading">Program</h2>
+     <sdpi-item label="Executable"><sdpi-file id="executable"></sdpi-file></sdpi-item>
+     <sdpi-item><a id="ask-chatgpt" href="#">Ask ChatGPT to create your script</a></sdpi-item>
+     <sdpi-item label="Arguments"><div><sdpi-textfield id="argsText"></sdpi-textfield>
+       <small>Quote arguments containing spaces, for example --mode "daily report".</small>
+     </div></sdpi-item>
+     <sdpi-item label="Working directory (optional)"><sdpi-textfield id="cwd"></sdpi-textfield></sdpi-item>
+   </div></section>
+   <section id="remember-controls" aria-labelledby="behavior-heading" hidden>
+     <h2 id="behavior-heading">Behavior</h2>
+     <section id="timer-controls" hidden>
+       <sdpi-item label="Run every"><sdpi-select id="intervalPreset">
+         <option value="custom">Custom</option><option value="3600">1h</option>
+         <option value="1800">30mn</option><option value="600">10mn</option>
+         <option value="60">1mn</option><option value="30">30s</option>
+         <option value="10">10s</option><option value="1">1s</option>
+       </sdpi-select></sdpi-item>
+       <section id="custom-interval" hidden><sdpi-item label="Interval (seconds)">
+         <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
+         <small>Enter whole seconds from 1 to 86400.</small>
+       </sdpi-item></section>
+       <sdpi-item label="On Press"><div><sdpi-select id="actionOnPress">
+         <option value="stop">start / stop</option><option value="refresh">start / refresh (long press to stop)</option>
+       </sdpi-select></div></sdpi-item>
+     </section>
+     <sdpi-item><sdpi-checkbox id="rememberRunningState" label="Resume after sleep, reconnect, or restart"></sdpi-checkbox></sdpi-item>
+   </section>
+   <section aria-labelledby="appearance-heading">
+     <h2 id="appearance-heading">Appearance</h2>
+     <sdpi-item label="Title (optional)"><sdpi-textfield id="title"></sdpi-textfield></sdpi-item>
+     <sdpi-item label="Theme color"><input id="themeColor" type="color" value="#abcdef" aria-label="Artwork theme color" /></sdpi-item>
+   </section>
+   <section id="settings-status" role="status" aria-live="polite"></section>
+   <footer><a id="github-project" href="#">GitHub ↗</a></footer>
   </body></html>`;
 
 function element(tag, attributes) {
   const listeners = new Map();
   const color = tag === 'input' && attributes.get('type') === 'color';
-  let value = attributes.get('value') ?? '', renderedHint = attributes.get('placeholder') ?? null;
+  const checkbox = tag === 'sdpi-checkbox';
+  let value = checkbox ? false : attributes.get('value') ?? '', renderedHint = attributes.get('placeholder') ?? null;
   return {
     hidden: attributes.has('hidden'), textContent: '',
     set innerHTML(_) { throw new Error('Status must remain plaintext'); },
     get value() { return value; },
     // Stress synchronous hydration, as existing SDPI/native boundary doubles do.
     set value(next) {
-      value = typeof next === 'string' ? next.replace(/[\r\n]/g, '') : next;
+      if (checkbox && Object.is(value, next)) return;
+      value = !checkbox && typeof next === 'string' ? next.replace(/[\r\n]/g, '') : next;
       if (!color && tag.startsWith('sdpi-')) this.dispatch('valuechange');
     },
     userEdit(next) { this.value = next; },
@@ -129,6 +144,17 @@ export function assertInspectorMarkup(html = authoredMarkup) {
   assert.equal(new Set(ids).size, ids.length, 'bindings must be unique');
   const named = node => {
     if (node.attributes.get('aria-label')?.trim()) return true;
+    if (node.tag === 'input' && node.attributes.get('type') === 'color') {
+      // An SDPI item's shadow label does not name a slotted native input.
+      const hasText = label => Boolean(label.text || label.children.some(hasText));
+      const id = node.attributes.get('id');
+      if (id && nodes.some(label => label.tag === 'label' && label.attributes.get('for') === id && hasText(label))) return true;
+      for (let parent = node.parent; parent; parent = parent.parent) {
+        if (parent.tag === 'label' && hasText(parent)) return true;
+      }
+      return false;
+    }
+    if (node.tag === 'sdpi-checkbox' && node.attributes.get('label')?.trim()) return true;
     for (let parent = node.parent; parent; parent = parent.parent) {
       if (parent.tag === 'sdpi-item' && parent.attributes.get('label')?.trim()) return true;
     }
@@ -171,7 +197,54 @@ export function assertInspectorMarkup(html = authoredMarkup) {
     return option.attributes.get('value');
   });
   assert.deepEqual(optionsOf(press).sort(), ['refresh', 'stop']);
+  const remember = byId('rememberRunningState'), rememberControls = byId('remember-controls');
+  assert.equal(remember.tag, 'sdpi-checkbox'); usable(remember);
+  assert.equal(remember.attributes.get('label'), 'Resume after sleep, reconnect, or restart');
+  assert.equal(rememberControls.attributes.has('hidden'), true);
+  assert.ok(within(remember, rememberControls), 'rememberRunningState must be within remember-controls');
   assert.deepEqual(optionsOf(interval).sort(), ['1', '10', '30', '60', '600', '1800', '3600', 'custom'].sort());
+  const labelledSection = name => {
+    const headings = nodes.filter(node => /^h[1-6]$/.test(node.tag) && node.text === name);
+    assert.equal(headings.length, 1, `expected one ${name} heading`);
+    const heading = headings[0], id = heading.attributes.get('id');
+    assert.ok(id, `${name} heading needs an accessible reference`);
+    const sections = nodes.filter(node => (node.attributes.get('aria-labelledby') ?? '').split(/\s+/).includes(id));
+    assert.equal(sections.length, 1, `expected one labelled ${name} section`);
+    assert.ok(within(heading, sections[0]), `${name} heading must be within its section`);
+    return { section: sections[0], heading };
+  };
+  const program = labelledSection('Program'), behavior = labelledSection('Behavior'), appearance = labelledSection('Appearance');
+  assert.equal(behavior.section, rememberControls, 'the entire Behavior section must use the managed visibility boundary');
+  assert.ok(within(timer, behavior.section), 'timer-controls must be within Behavior');
+  const orderedFields = (group, fields) => {
+    const controls = fields.map(byId);
+    for (const node of controls) assert.ok(within(node, group.section), `${node.attributes.get('id')} must be within its section`);
+    assert.ok(group.heading.end <= controls[0].start, 'section heading must precede its fields');
+    for (let index = 1; index < controls.length; index++) assert.ok(controls[index - 1].end <= controls[index].start, 'section field order');
+  };
+  orderedFields(program, ['executable', 'ask-chatgpt', 'argsText', 'cwd']);
+  orderedFields(behavior, ['intervalPreset', 'intervalSeconds', 'actionOnPress', 'rememberRunningState']);
+  orderedFields(appearance, ['title', 'themeColor']);
+  assert.ok(program.section.end <= behavior.section.start && behavior.section.end <= appearance.section.start, 'Program, Behavior, Appearance section order');
+  const footers = nodes.filter(node => node.tag === 'footer' && within(byId('github-project'), node));
+  assert.equal(footers.length, 1, 'project link belongs to one footer');
+  assert.ok(appearance.section.end <= status.start && status.end <= footers[0].start, 'status and footer must follow Appearance');
+  const itemFor = node => {
+    for (let parent = node.parent; parent; parent = parent.parent) if (parent.tag === 'sdpi-item') return parent;
+  };
+  for (const [id, label] of [['executable', 'Executable'], ['argsText', 'Arguments'], ['cwd', 'Working directory (optional)'],
+    ['intervalPreset', 'Run every'], ['intervalSeconds', 'Interval (seconds)'], ['actionOnPress', 'On Press'],
+    ['title', 'Title (optional)'], ['themeColor', 'Theme color']]) assert.equal(itemFor(byId(id))?.attributes.get('label'), label);
+  for (const [id, text] of [['argsText', 'Quote arguments containing spaces, for example --mode "daily report".'],
+    ['intervalSeconds', 'Enter whole seconds from 1 to 86400.']]) {
+    assert.ok(nodes.some(node => node.tag === 'small' && within(node, itemFor(byId(id))) && node.text === text), `${id} helper copy`);
+  }
+  const chat = byId('ask-chatgpt');
+  assert.equal(chat.text, 'Ask ChatGPT to create your script'); assert.equal(chat.attributes.get('href'), '#');
+  for (const [control, entries] of [[interval, [['1', '1s'], ['10', '10s'], ['30', '30s'], ['60', '1mn'], ['600', '10mn'], ['1800', '30mn'], ['3600', '1h'], ['custom', 'Custom']]],
+    [press, [['refresh', 'start / refresh (long press to stop)'], ['stop', 'start / stop']]]]) {
+    for (const [value, label] of entries) assert.equal(control.children.find(node => node.attributes.get('value') === value)?.text, label);
+  }
   const css = styles.map(style => style.text).join('\n');
   // Inspect only flat rules and declarations used by this static contract, not general CSS.
   const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(([, selectors, body]) => ({
@@ -190,6 +263,7 @@ export function createInspectorFixture(html = inspectorTestMarkup) {
   for (const node of extractInspectorMarkup(html).nodes) {
     const { tag, attributes } = node;
     const field = element(tag, attributes);
+    if (/^h[1-6]$/.test(tag)) field.textContent = node.text;
     // Anonymous wrappers participate too: hiding one must hide its descendants.
     field.parentElement = boundaries.get(node.parent) ?? null;
     boundaries.set(node, field);

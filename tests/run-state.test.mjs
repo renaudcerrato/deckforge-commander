@@ -13,6 +13,89 @@ import { createOnceStateCoordinator } from '../src/core/once-settings.mjs';
 const options = { timeout: 1_000 };
 const initial = { executable: '/program', args: ['two words', ''], runRequested: true };
 
+// RESTART: real authority, complete host snapshots, no hydration normalization.
+for (const [name, create] of [['Stream', createRunStateCoordinator], ['Loop', createTimerStateCoordinator]]) {
+  test(`${name} stale true readback cannot undo a newer Stop snapshot`, options, async () => {
+    // Arrange
+    const read = deferred(), entered = deferred(), writes = []; let host, reads = 0;
+    const input = { executable: '/synthetic/program', argsText: '' };
+    const state = create({ async writeSettings(value) { host = structuredClone(value); writes.push(host); },
+      async readSettings() { if (++reads === 1) { entered.resolve(); return read.promise; } return host; } }); state.observe(input);
+    // Act
+    const starting = state.setResumeRequested(true); await entered.promise;
+    const stopping = state.setResumeRequested(false); read.resolve({ ...input, resumeRequested: true });
+    await Promise.all([starting, stopping]);
+    // Assert
+    assert.deepEqual(writes, [{ ...input, resumeRequested: true }, { ...input, resumeRequested: false }]);
+    assert.equal(state.getSettings().resumeRequested, false); assert.equal(state.isBlocked(), false);
+  });
+}
+for (const [name, create] of [['Stream', createRunStateCoordinator], ['Loop', createTimerStateCoordinator]]) {
+  test(`${name} plugin intent saves serialize complete JSON while rejecting inspector ownership`, options, async () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', args: ['legacy'], extra: { retained: [null, true] },
+      ...(name === 'Stream' ? { runRequested: true } : {}) };
+    const writes = []; let host = structuredClone(input);
+    const state = create({ async writeSettings(value) { host = structuredClone(value); writes.push(host); }, async readSettings() { return host; } });
+    state.observe(input); const hydration = [...writes];
+    // Act
+    await state.setResumeRequested(true); await state.setResumeRequested(true);
+    await assert.rejects(state.editConfiguration({ resumeRequested: false }), { diagnosticCode: 'INVALID_SETTINGS' });
+    await state.setResumeRequested(false); const stopped = state.getSettings();
+    const freshWrites = [], fresh = create({ async writeSettings(value) { freshWrites.push(value); }, async readSettings() { return stopped; } });
+    fresh.observe(stopped); await fresh.whenIdle();
+    // Assert
+    assert.deepEqual(hydration, []); assert.deepEqual(writes, [{ ...input, resumeRequested: true }, { ...input, resumeRequested: false }]);
+    assert.deepEqual(freshWrites, []); assert.deepEqual(fresh.getSettings(), stopped); assert.deepEqual(input.extra, { retained: [null, true] });
+  });
+  for (const changes of [{ executable: '/synthetic/changed' }, { argsText: 'changed' }, { rememberRunningState: false }]) {
+    test(`${name} ${Object.keys(changes)[0]} edit clears saved intent in the same complete save`, options, async () => {
+      // Arrange
+      const input = { executable: '/synthetic/program', argsText: '', resumeRequested: true };
+      const writes = []; let host = input;
+      const state = create({ async writeSettings(value) { host = structuredClone(value); writes.push(host); }, async readSettings() { return host; } });
+      state.observe(input);
+      // Act
+      await state.editConfiguration(changes);
+      // Assert
+      assert.deepEqual(writes, [{ ...input, ...changes, resumeRequested: false }]); assert.equal(input.resumeRequested, true);
+    });
+  }
+  test(`${name} opt-out cannot save true and invalid plugin intent cannot poison authority`, options, async () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', argsText: '', rememberRunningState: false }, writes = []; let host = input;
+    const state = create({ async writeSettings(value) { host = structuredClone(value); writes.push(host); }, async readSettings() { return host; } }); state.observe(input);
+    // Act
+    await state.setResumeRequested(true);
+    const invalid = state.setResumeRequested('true');
+    // Assert
+    await assert.rejects(invalid, { diagnosticCode: 'INVALID_RUN_STATE' });
+    assert.deepEqual(writes, [{ ...input, resumeRequested: false }]); assert.equal(state.isBlocked(), false);
+  });
+}
+
+// REMEMBER: saves contain explicit configuration only, retaining complete legacy JSON.
+for (const [name, create] of [['Stream', createRunStateCoordinator], ['Loop', createTimerStateCoordinator]]) {
+  test(`${name} remember saves preserve complete snapshots without hydration or argument synthesis`, options, async () => {
+    // Arrange
+    const writes = []; let host;
+    const state = create({ async writeSettings(value) { host = structuredClone(value); writes.push(host); },
+      async readSettings() { return structuredClone(host); } });
+    const input = { extra: { keep: [true, null] }, ...(name === 'Stream' ? { runRequested: true } : {}) };
+    state.observe(input); await state.whenIdle(); const hydration = [...writes];
+    // Act
+    await state.editConfiguration({ rememberRunningState: false });
+    await state.editConfiguration({ rememberRunningState: true });
+    const beforeInvalid = state.getSettings(); let failure;
+    try { await state.editConfiguration({ rememberRunningState: 'false', themeColor: '#abcdef' }); } catch (error) { failure = error; }
+    // Assert
+    assert.deepEqual(hydration, []);
+    assert.deepEqual(writes, [{ ...input, rememberRunningState: false, resumeRequested: false }, { ...input, rememberRunningState: true, resumeRequested: false }]);
+    assert.deepEqual(state.getSettings(), beforeInvalid); assert.equal(failure?.diagnosticCode, 'INVALID_SETTINGS');
+    assert.equal(Object.hasOwn(state.getSettings(), 'argsText'), false); assert.equal(state.isBlocked(), false);
+  });
+}
+
 // TITLE-1: all actions save literal metadata in complete snapshots, never derived captions.
 for (const [name, create] of [['Stream', createRunStateCoordinator], ['Loop', createTimerStateCoordinator], ['Run', createOnceStateCoordinator]]) {
   test(`${name} title saves preserve unknown JSON, clear removes the field and hydration never repairs`, options, async () => {
@@ -63,8 +146,8 @@ for (const [name, create] of [['Stream', createRunStateCoordinator], ['Loop', cr
     const pending = state.getSettings(); readback.resolve(writes[0]); const result = await save; await state.whenIdle();
     // Assert
     assert.deepEqual(hydration, []); assert.equal(invalid?.diagnosticCode, 'INVALID_EXECUTABLE');
-    assert.equal(stale.accepted, false); assert.deepEqual(pending, { ...original, executable: 'D:/new.EXE' });
-    assert.deepEqual(writes, [{ ...original, executable: 'D:/new.EXE' }]); assert.equal(result.status, 'saved');
+    assert.equal(stale.accepted, false); assert.deepEqual(pending, { ...original, executable: 'D:/new.EXE', ...(name === 'Run' ? {} : { resumeRequested: false }) });
+    assert.deepEqual(writes, [{ ...original, executable: 'D:/new.EXE', ...(name === 'Run' ? {} : { resumeRequested: false }) }]); assert.equal(result.status, 'saved');
     assert.deepEqual(state.getSettings(), writes[0]); assert.deepEqual(input, original);
     assert.equal(state.isBlocked(), false); assert.equal(Object.hasOwn(writes[0], 'platform'), false); assert.equal(timers.size, 0);
   });
@@ -171,7 +254,7 @@ for (const value of [undefined, null, 1, 'true']) {
   });
 }
 
-test('equivalent and changed execution edits preserve legacy data without synthesizing intent', () => {
+test('equivalent edits preserve saved intent while changed execution clears only the new marker', () => {
   // Arrange
   const input = structuredClone(initial);
   // Act
@@ -180,8 +263,8 @@ test('equivalent and changed execution edits preserve legacy data without synthe
   const newKey = applyConfigurationEdit({}, { executable: '/new-program' });
   // Assert
   assert.deepEqual(migrated, { ...initial, argsText: '"two words" ""' });
-  assert.deepEqual(changed, { ...initial, argsText: '' });
-  assert.deepEqual(newKey, { executable: '/new-program', argsText: '' });
+  assert.deepEqual(changed, { ...initial, argsText: '', resumeRequested: false });
+  assert.deepEqual(newKey, { executable: '/new-program', argsText: '', resumeRequested: false });
   assert.deepEqual(input, initial);
 });
 
@@ -212,7 +295,7 @@ for (const input of [{}, { executable: '', argsText: '' }, { args: ['literal'], 
     assert.equal(hydrationWrites, 0);
     assert.deepEqual(themed, { ...input, themeColor: '#abcdef' });
     assert.deepEqual(writes, [{ ...input, themeColor: '#abcdef' }]);
-    assert.deepEqual(h.state.getSettings(), { ...input, themeColor: '#abcdef', executable: '/synthetic/program', argsText: '' });
+    assert.deepEqual(h.state.getSettings(), { ...input, themeColor: '#abcdef', executable: '/synthetic/program', argsText: '', resumeRequested: false });
     assert.deepEqual(input, original); assert.equal(h.state.isBlocked(), false);
   });
 }
@@ -236,8 +319,8 @@ test('configuration save writes complete detached settings and confirms matching
   const copy = h.state.getSettings(); copy.args.push('local');
   // Assert
   assert.equal(result.status, 'saved');
-  assert.deepEqual(h.writes, [{ ...initial, argsText: 'changed' }]);
-  assert.deepEqual(h.state.getSettings(), { ...initial, argsText: 'changed' });
+  assert.deepEqual(h.writes, [{ ...initial, argsText: 'changed', resumeRequested: false }]);
+  assert.deepEqual(h.state.getSettings(), { ...initial, argsText: 'changed', resumeRequested: false });
   assert.equal(h.timers.size, 0);
   assert.equal(h.state.isBlocked(), false);
 });
@@ -252,7 +335,7 @@ test('save does not report saved until matching readback arrives', options, asyn
   const saving = h.state.editConfiguration({ argsText: 'changed' }).then(result => { settled = true; return result; });
   await entered.promise;
   const beforeReadback = settled;
-  gate.resolve({ ...initial, argsText: 'changed' });
+  gate.resolve({ ...initial, argsText: 'changed', resumeRequested: false });
   const result = await saving;
   // Assert
   assert.equal(beforeReadback, false);
@@ -278,7 +361,7 @@ test('rapid edits serialize writes and obsolete confirmation cannot roll back ne
   assert.equal(oldResult.status, 'stale');
   assert.equal(newResult.status, 'saved');
   assert.equal(h.writes.length, 2);
-  assert.deepEqual(h.state.getSettings(), { ...initial, argsText: 'new argument' });
+  assert.deepEqual(h.state.getSettings(), { ...initial, argsText: 'new argument', resumeRequested: false });
 });
 
 test('superseded read failure is stale rather than blocking newer confirmed edit', options, async () => {
@@ -385,7 +468,7 @@ for (const legacy of [true, false, 'missing']) {
       const ignored = h.state.observe(original);
 
       // Assert
-      assert.deepEqual(stored, { ...original, argsText: 'changed' });
+      assert.deepEqual(stored, { ...original, argsText: 'changed', resumeRequested: false });
       assert.deepEqual(input, original);
       assert.equal(Object.hasOwn(stored, 'runRequested'), legacy !== 'missing');
       assert.equal(ignored.accepted, false);
@@ -405,8 +488,8 @@ test('copied settings have no subsequent cross-action writes', options, async ()
   await first.state.editConfiguration({ argsText: 'first' });
   await second.state.editConfiguration({ cwd: '/second' });
   // Assert
-  assert.deepEqual(first.writes, [{ ...initial, argsText: 'first' }]);
-  assert.deepEqual(second.writes, [{ ...initial, cwd: '/second' }]);
+  assert.deepEqual(first.writes, [{ ...initial, argsText: 'first', resumeRequested: false }]);
+  assert.deepEqual(second.writes, [{ ...initial, cwd: '/second', resumeRequested: false }]);
   assert.equal(Object.hasOwn(first.state.getSettings(), 'cwd'), false);
 });
 
@@ -430,19 +513,21 @@ test('equivalent argv edit superseding configuration save confirms only the late
 });
 
 // Integration of our two business modules; only process and host storage are mocked.
-function integrated(input, readback, onPresentation = () => {}) {
+function integrated(input, readback, onPresentation = () => {}, storageReadback) {
   const host = { value: structuredClone(input), writes: [] };
   let session;
   const h = harness({
     async writeSettings(value) {
       host.value = structuredClone(value); host.writes.push(structuredClone(value));
     },
-    async readSettings() { const snapshot = structuredClone(host.value); return readback ? readback(snapshot) : snapshot; },
+    // Launch-authorization gates and host save readbacks are independent boundaries.
+    async readSettings() { const snapshot = structuredClone(host.value); return storageReadback ? storageReadback(snapshot) : snapshot; },
     onFailure() { void session?.persistenceFailed(); },
   });
   h.state.observe(input);
   const runs = [], errors = [];
   session = createActionSession({
+    saveResumeRequested: value => h.state.setResumeRequested(value).then(() => {}),
     initialConnected: true,
     onPresentation,
     async confirmLaunchSettings(expected) {
@@ -464,7 +549,7 @@ function integrated(input, readback, onPresentation = () => {}) {
 }
 
 for (const loss of ['hide', 'disconnect']) {
-  test(`manual Stopped is local before cleanup despite ${loss}; fresh session stays stopped without writes`, options, async () => {
+  test(`manual Stopped clears saved intent before cleanup despite ${loss}; fresh adoption writes nothing`, options, async () => {
     // Arrange
     const h = integrated(initial);
     await h.session.appear(initial);
@@ -482,11 +567,11 @@ for (const loss of ['hide', 'disconnect']) {
     await Promise.all([stop, unavailable]);
     await h.session.whenIdle();
     // Assert
-    assert.deepEqual(savedWhileCleanupPending, initial);
+    assert.deepEqual(savedWhileCleanupPending, { ...initial, resumeRequested: false });
     assert.deepEqual(fresh.runs, []);
     assert.equal(h.runs[0].stops, 1);
     assert.equal(h.session.getState().runRequested, false);
-    assert.deepEqual(h.host.writes, []);
+    assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
   });
 }
 
@@ -510,8 +595,8 @@ for (const loss of ['hide', 'disconnect']) {
     const fresh = integrated(h.host.value);
     await fresh.session.appear(h.host.value);
     // Assert
-    assert.deepEqual(h.host.writes, []);
-    assert.deepEqual(h.host.value, stopped);
+    assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...stopped, resumeRequested })));
+    assert.deepEqual(h.host.value, { ...stopped, resumeRequested: false });
     assert.deepEqual(h.runs, []);
     assert.deepEqual(fresh.runs, []);
     assert.equal(h.state.isBlocked(), false);
@@ -545,7 +630,7 @@ for (const loss of ['hide', 'disconnect']) {
       await h.session.reconcileAvailability();
       const fresh = integrated(saved); await fresh.session.appear(saved);
       // Assert
-      assert.deepEqual(saved, initial);
+      assert.deepEqual(saved, { ...initial, resumeRequested: false });
       assert.equal(h.runs.length, 1);
       assert.deepEqual(fresh.runs, []);
       assert.equal(h.session.getState().runRequested, false);
@@ -592,8 +677,8 @@ for (const loss of ['hide', 'disconnect']) {
       ['waiting', 'program', '#969696', 'ready', undefined],
     ]);
     assert.ok(before.every(([, value]) => value.current() === false), 'old presentation guards are no longer current');
-    assert.deepEqual(h.host.writes, []);
-    assert.deepEqual(h.host.value, stopped);
+    assert.deepEqual(h.host.writes, [{ ...stopped, resumeRequested: true }]);
+    assert.deepEqual(h.host.value, { ...stopped, resumeRequested: true });
     assert.equal(h.session.getState().runRequested, true);
     assert.equal(h.state.isBlocked(), false);
     assert.deepEqual(h.errors, []);
@@ -619,7 +704,7 @@ test('pause-induced stopped result preserves Started rather than masquerading as
   assert.equal(h.host.writes.some(value => value.runRequested === false), false);
 });
 
-test('genuine new Start rejects an older terminal result without any intent readback or write', options, async () => {
+test('genuine new Start rejects older terminal delivery while saving its own eligible intent', options, async () => {
   // Arrange
   const h = integrated(initial);
   await h.session.appear(initial);
@@ -627,12 +712,14 @@ test('genuine new Start rejects an older terminal result without any intent read
   // Act
   h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY');
   const start = h.session.press();
+  await start; await h.state.whenIdle();
+  const savedBeforeLateCompletion = structuredClone(h.host.writes);
   h.runs[0].resolve({ status: 'success' });
-  await start;
   await h.session.whenIdle();
   // Assert
-  assert.deepEqual(h.host.writes, []);
-  assert.deepEqual(h.host.value, initial);
+  assert.deepEqual(h.host.writes, savedBeforeLateCompletion);
+  assert.equal(h.host.writes.at(-1).resumeRequested, true);
+  assert.deepEqual(h.host.value, { ...initial, resumeRequested: true });
   assert.equal(h.runs.length, 2);
   assert.equal(h.session.getState().runRequested, true);
   assert.equal(h.state.isBlocked(), false);
@@ -654,7 +741,7 @@ for (const loss of ['hide', 'disconnect']) {
     await h.session.whenIdle();
     // Assert
     assert.equal(h.host.value.runRequested, true);
-    assert.deepEqual(h.host.writes, []);
+    assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
     assert.equal(h.session.getState().runRequested, false);
     assert.deepEqual(h.host.value.args, initial.args);
   });
@@ -665,11 +752,12 @@ function nativeIntegrated(input, readback) {
   const host = { value: structuredClone(input), writes: [] };
   const h = harness({
     async writeSettings(value) { host.value = structuredClone(value); host.writes.push(structuredClone(value)); },
-    async readSettings() { const snapshot = structuredClone(host.value); return readback ? readback(snapshot) : snapshot; },
+    async readSettings() { return structuredClone(host.value); },
   });
   h.state.observe(input);
   const runs = [], errors = [], displayed = [], handoffs = [];
   const session = createActionSession({
+    saveResumeRequested: value => h.state.setResumeRequested(value).then(() => {}),
     initialConnected: true,
     async onPresentation(kind, caption, current, color, footer, extension) {
       if (current()) handoffs.push(['presentation', { kind, caption, color, footer, extension, current }]);
@@ -741,8 +829,8 @@ for (const loss of ['hide', 'disconnect']) {
     await fresh.session.appear(savedBeforeCleanup);
     // Assert: actual runner classification is deliberately stopped, not a preclassified mock error.
     assert.deepEqual(result, { status: 'stopped' });
-    assert.deepEqual(savedBeforeCleanup, initial);
-    assert.deepEqual(h.host.writes, []);
+    assert.deepEqual(savedBeforeCleanup, { ...initial, resumeRequested: false });
+    assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
     assert.equal(run.diagnostics.filter(code => code === 'PROCESS_LAUNCH_FAILED').length, 1);
     assert.equal(run.diagnostics.includes('PROCESS_LAUNCH_REASON_ENOENT'), true);
     assert.equal(h.session.getState().runRequested, false);
@@ -771,7 +859,7 @@ test('real pre-spawn failure while visible uses fixed launch diagnosis and local
   assert.deepEqual(result, { status: 'error', error: 'Program launch failed.' });
   assert.deepEqual(h.errors, [['Program launch failed.', 'PROCESS_LAUNCH_REASON_ENOENT']]);
   assert.equal(h.host.value.runRequested, true);
-  assert.deepEqual(h.host.writes, []);
+  assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
   assert.equal(h.session.getState().runRequested, false);
   assert.equal(h.runs.length, 1);
   disposeNative(h);
@@ -794,7 +882,7 @@ test('manual Stop followed by native pre-spawn error retains False without new s
   // Assert
   assert.equal(savedBeforeFailure.runRequested, true);
   assert.deepEqual(h.host.value, savedBeforeFailure);
-  assert.deepEqual(h.host.writes, []);
+  assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
   assert.deepEqual(h.errors, []);
   assert.deepEqual(await run.runner.done, { status: 'stopped' });
   assert.equal(h.runs.length, 1);
@@ -830,7 +918,7 @@ for (const loss of ['hide', 'disconnect']) {
     assert.equal(pausedSettings.runRequested, true);
     assert.equal(resumedIntent, true);
     assert.equal(resumedCount, 2);
-    assert.deepEqual(writesBeforeManualCleanup, []);
+    assert.deepEqual(writesBeforeManualCleanup, [{ ...initial, resumeRequested: true }]);
     assert.deepEqual(beforeResumeDisplay.map(([, value]) => [value.kind, value.caption, value.color, value.footer, value.extension]), [
       ['ready', 'program', '#969696', 'ready', undefined],
       ['waiting', 'program', '#969696', 'ready', undefined],
@@ -854,7 +942,7 @@ test('late native launch diagnostic from paused old generation cannot stop a new
   await old.signalEntered.promise;
   old.cleanup.resolve(true); // Cleanup can settle before the old child's error/close callbacks arrive.
   await hide;
-  await h.session.appear(initial);
+  await h.session.appear(h.state.getSettings());
   old.child.emit('error', launchError());
   old.child.emit('close', -2, null);
   await old.runner.done; await h.session.whenIdle();
@@ -867,8 +955,8 @@ test('late native launch diagnostic from paused old generation cannot stop a new
   assert.equal(old.diagnostics.includes('PROCESS_LAUNCH_FAILED'), true);
   assert.equal(h.runs.length, 2);
   assert.equal(currentIntent, true);
-  assert.deepEqual(currentSettings, initial);
-  assert.deepEqual(writesBeforeTeardown, []);
+  assert.deepEqual(currentSettings, { ...initial, resumeRequested: true });
+  assert.deepEqual(writesBeforeTeardown, [{ ...initial, resumeRequested: true }]);
   assert.deepEqual(h.errors, []);
   disposeNative(h);
 });
@@ -896,7 +984,7 @@ test('cancel Starting with late old native error and configuration readback reta
   await Promise.all([start, cancel]);
   await old.runner.done; await h.session.whenIdle();
   // Assert
-  assert.deepEqual(h.host.writes, []);
+  assert.deepEqual(h.host.writes, [true, false, true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
   assert.equal(h.host.value.runRequested, true);
   assert.equal(h.session.getState().runRequested, false);
   assert.equal(h.runs.length, 1);
@@ -923,7 +1011,7 @@ test('mixed executable/theme edit retains legacy intent and JSON without migrati
   // Act
   const next = applyConfigurationEdit(snapshot, { executable: '/replacement', themeColor: '#AABBCC' });
   // Assert
-  assert.deepEqual(next, { ...initial, executable: '/replacement', themeColor: '#aabbcc' });
+  assert.deepEqual(next, { ...initial, executable: '/replacement', themeColor: '#aabbcc', resumeRequested: false });
   assert.deepEqual(snapshot, initial);
 });
 test('invalid theme edit is rejected before coordinator writes without blocking healthy intent', options, async () => {
@@ -955,10 +1043,10 @@ test('real coordinator theme edit during pending True readback preserves Started
   // Assert
   assert.equal(h.runs.length, 1);
   assert.equal(h.runs[0].stops, 0);
-  assert.deepEqual(h.host.value, { ...stopped, themeColor: '#abcdef' });
+  assert.deepEqual(h.host.value, { ...stopped, themeColor: '#abcdef', resumeRequested: true });
   assert.equal(h.session.getState().runRequested, true);
   assert.equal(h.state.isBlocked(), false);
-  assert.deepEqual(h.host.writes, [{ ...stopped, themeColor: '#abcdef' }]);
+  assert.deepEqual(h.host.writes, [{ ...stopped, resumeRequested: true }, { ...stopped, themeColor: '#abcdef', resumeRequested: true }]);
   assert.deepEqual(h.errors, []);
 });
 test('real coordinator theme edit supersedes deferred Waiting drawing but not its single launch authorization', options, async () => {
@@ -983,7 +1071,7 @@ test('real coordinator theme edit supersedes deferred Waiting drawing but not it
   assert.equal(h.runs.length, 1);
   assert.equal(h.runs[0].stops, 0);
   assert.deepEqual(rendered, [['waiting', '#123456']]);
-  assert.deepEqual(h.host.writes, [{ ...initial, themeColor: '#123456' }]);
+  assert.deepEqual(h.host.writes, [{ ...initial, resumeRequested: true }, { ...initial, themeColor: '#123456', resumeRequested: true }]);
   assert.equal(h.session.getState().runRequested, true);
 });
 test('uncertain theme save retains coordinator block and cannot permit session launch', options, async () => {
@@ -1005,7 +1093,7 @@ test('uncertain theme save retains coordinator block and cannot permit session l
 
 test('real session cannot launch through coordinator uncertainty following a theme write', options, async () => {
   // Arrange
-  const h = integrated(initial, () => initial);
+  const h = integrated(initial, undefined, undefined, () => initial);
   let failure;
   // Act
   try { await h.state.editConfiguration({ themeColor: '#abcdef' }); } catch (error) { failure = error; }

@@ -18,6 +18,8 @@ type RunSettings = {
 	argsText?: string;
 	cwd?: string;
 	runRequested?: boolean;
+	rememberRunningState?: boolean;
+	resumeRequested?: boolean;
 	themeColor?: JsonValue;
 	title?: JsonValue;
 };

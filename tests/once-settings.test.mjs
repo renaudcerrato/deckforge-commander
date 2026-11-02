@@ -102,7 +102,7 @@ for (const [index, [input, code]] of [
   [{ args: 'not JSON' }, 'ARGS_JSON_INVALID'], [{ args: '{}' }, 'ARGS_NOT_ARRAY'],
   [{ args: ['a\0'] }, 'INVALID_ARGUMENT'], [{ cwd: 'relative' }, 'INVALID_CWD'],
   [{ cwd: '/synthetic\0' }, 'INVALID_CWD'],
-  ...['runRequested', 'intervalSeconds', 'actionOnPress', 'enabled', 'deadline', 'unknown'].map(key => [{ [key]: marker }, 'UNKNOWN_SETTING']),
+  ...['runRequested', 'resumeRequested', 'intervalSeconds', 'actionOnPress', 'rememberRunningState', 'enabled', 'deadline', 'unknown'].map(key => [{ [key]: marker }, 'UNKNOWN_SETTING']),
 ].entries()) {
   test(`Once malformed configuration ${index} has only a fixed diagnostic`, () => {
     // Arrange
@@ -165,7 +165,7 @@ test('Once edits preserve complete unknown JSON and legacy argv without adding a
 for (const [changes, code] of [[{}, 'INVALID_SETTINGS'], [{ executable: '' }, 'INVALID_EXECUTABLE'],
   [{ executable: 'relative' }, 'INVALID_EXECUTABLE'], [{ cwd: null }, 'INVALID_CWD'],
   [{ argsText: 'a\0' }, 'ARGS_TEXT_INVALID'], [{ args: [] }, 'INVALID_SETTINGS'],
-  ...['runRequested', 'intervalSeconds', 'actionOnPress', 'unknown'].map(key => [{ [key]: marker }, 'INVALID_SETTINGS'])]) {
+  ...['runRequested', 'resumeRequested', 'intervalSeconds', 'actionOnPress', 'rememberRunningState', 'unknown'].map(key => [{ [key]: marker }, 'INVALID_SETTINGS'])]) {
   test('Once PI edit rejects unsupported controls and empty executable', () => {
     // Arrange
     const input = structuredClone(base);

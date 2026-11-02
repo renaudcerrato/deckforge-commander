@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { createInspectorFixture } from './helpers/inspector-harness.mjs';
+import { createInspectorFixture, isHiddenByAncestry } from './helpers/inspector-harness.mjs';
 import { createInspectorBridge, ONCE_ACTION_UUID, RUN_ACTION_UUID, TIMER_ACTION_UUID } from '../src/inspector/bridge.mjs';
 import { createInspectorController } from '../src/inspector/run.mjs';
 import { parseArguments } from '../src/core/arguments.mjs';
@@ -260,9 +260,14 @@ for (const built of [false, true]) {
     // Arrange
     const h = harness({ built }), settings = structuredClone(initial);
     // Act
-    h.ready(settings); h.time.advance(200); const socket = h.sockets[0]; h.dispose();
+    h.ready(settings); h.time.advance(200); const socket = h.sockets[0];
+    const behaviorHidden = isHiddenByAncestry(h.f.behaviorHeading), sectionHidden = h.f.rememberControls.hidden;
+    const programHidden = isHiddenByAncestry(h.f.programHeading), appearanceHidden = isHiddenByAncestry(h.f.appearanceHeading);
+    h.dispose();
     // Assert
     assert.equal(h.f.timerControls.hidden, true); assert.equal(h.f.customInterval.hidden, true);
+    assert.equal(h.f.behaviorHeading.textContent, 'Behavior'); assert.equal(behaviorHidden, true); assert.equal(sectionHidden, true);
+    assert.equal(programHidden, false); assert.equal(appearanceHidden, false);
     assert.equal(h.f.actionOnPress.value, ''); assert.equal(h.f.intervalPreset.value, '');
     assert.equal(h.f.executable.value, initial.executable); assert.equal(h.f.themeColor.value, '#123456');
     assert.deepEqual(h.edits(), []); assert.deepEqual(settings, initial); assert.equal(h.sockets.length, 1);

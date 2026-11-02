@@ -12,7 +12,7 @@ export interface ActionSession {
 	/** Meaningful execution edits recover only after certain cleanup and latest matching configuration confirmation. */
 	applySettings(settings: unknown): Promise<void>;
 	disappear(): Promise<void>;
-	/** Update owning-device connectivity without changing visibility or session-local intent. */
+	/** Stop on disconnect; retain same-session intent only when remembering is enabled. */
 	setConnected(connected: boolean): Promise<void>;
 	/** Event-driven/idempotent reconciliation, not an execution retry after completion or failure. */
 	reconcileAvailability(): Promise<void>;
@@ -54,6 +54,8 @@ export interface ActionSessionDependencies {
 	onPresentation?: (kind: LaunchPresentation, caption: string, isCurrent: () => boolean, themeColor: string, readyFooter?: LaunchReadyFooter, extension?: string) => void | Promise<void>;
 	/** Confirm the latest complete configuration for launch or edit recovery; production supplies the authority gate. */
 	confirmLaunchSettings?: (expected: StoredSettings) => Promise<boolean>;
+	/** Update authority synchronously on entry; resolve only after complete-snapshot save confirmation. */
+	saveResumeRequested?: (value: boolean) => Promise<void>;
 }
 
 export declare function createActionSession(dependencies: ActionSessionDependencies): ActionSession;

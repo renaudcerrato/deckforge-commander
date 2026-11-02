@@ -13,6 +13,83 @@ const base = { executable: '/synthetic/program', argsText: '' };
 const stored = { executable: '/synthetic/program', args: ['two words', ''], extra: { nested: [null, true, 42, 'retained'] } };
 const marker = 'synthetic-sensitive-marker';
 
+for (const changes of [{ intervalSeconds: 10 }, { actionOnPress: 'stop' }, { themeColor: '#abcdef' }]) {
+  test(`Loop ${Object.keys(changes)[0]} metadata edit preserves saved intent and unknown complete JSON`, () => {
+    // Arrange
+    const input = { ...base, resumeRequested: true, extra: { retained: ['legacy'] } }, before = structuredClone(input);
+    // Act
+    const result = applyTimerConfigurationEdit(input, changes, 'posix');
+    // Assert
+    assert.deepEqual(result, { ...before, ...changes }); assert.deepEqual(input, before);
+  });
+}
+
+for (const resumeRequested of [true, false]) {
+  test(`Loop saved intent ${resumeRequested} is excluded from execution and interval comparisons`, () => {
+    // Arrange
+    const input = { ...base, intervalSeconds: 5, resumeRequested }, before = structuredClone(input);
+    // Act
+    const classified = classifyTimerSettings(input, 'posix');
+    const next = { ...input, resumeRequested: !resumeRequested };
+    // Assert
+    assert.deepEqual(classified.execution, { executable: base.executable, args: [] });
+    assert.equal(sameTimerExecutionSettings(input, next, 'posix'), true); assert.equal(sameTimerInterval(input, next), true);
+    assert.deepEqual(input, before); assert.throws(() => applyTimerConfigurationEdit(input, { resumeRequested }, 'posix'), { diagnosticCode: 'INVALID_SETTINGS' });
+  });
+}
+for (const value of [undefined, null, 'true', 0, {}, []]) {
+  test(`Loop rejects malformed saved intent ${String(value)} instead of guessing`, () => {
+    // Arrange
+    const input = { ...base, resumeRequested: value };
+    // Act
+    const classify = () => classifyTimerSettings(input, 'posix');
+    // Assert
+    assert.throws(classify, { message: 'Invalid settings.', diagnosticCode: 'INVALID_RUN_STATE' });
+  });
+}
+
+// REMEMBER: Loop metadata must neither change execution nor reset its interval.
+test('Loop remember accessors never run during validation or edit acceptance', () => {
+  // Arrange
+  let calls = 0;
+  const preference = { get rememberRunningState() { calls++; throw Error(marker); } };
+  const input = Object.defineProperty({ ...base }, 'rememberRunningState', Object.getOwnPropertyDescriptor(preference, 'rememberRunningState'));
+  // Act
+  const classify = () => classifyTimerSettings(input, 'posix');
+  const edit = () => applyTimerConfigurationEdit(base, preference, 'posix');
+  // Assert
+  assert.throws(classify, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' });
+  assert.throws(edit, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' }); assert.equal(calls, 0);
+});
+for (const preference of [undefined, true, false]) {
+  test(`Loop remember ${String(preference)} is read-only metadata with unchanged interval and execution`, () => {
+    // Arrange
+    const input = { ...base, intervalSeconds: 17, ...(preference === undefined ? {} : { rememberRunningState: preference }) };
+    const original = structuredClone(input);
+    // Act
+    const classified = classifyTimerSettings(input, 'posix'), view = getTimerInspectorConfiguration(input, 'posix');
+    const changed = { ...input, rememberRunningState: !preference };
+    // Assert
+    assert.deepEqual(classified.execution, { executable: base.executable, args: [] });
+    assert.equal(view.rememberRunningState, preference ?? true);
+    assert.equal(sameTimerExecutionSettings(input, changed, 'posix'), true); assert.equal(sameTimerInterval(input, changed), true);
+    assert.deepEqual(input, original);
+  });
+}
+for (const value of [undefined, null, 'true', 0, 1, {}, []]) {
+  test(`Loop rejects present invalid remember ${String(value)} atomically`, () => {
+    // Arrange
+    const input = { ...base, rememberRunningState: value };
+    // Act
+    const classify = () => classifyTimerSettings(input, 'posix');
+    const edit = () => applyTimerConfigurationEdit(base, { rememberRunningState: value }, 'posix');
+    // Assert
+    assert.throws(classify, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' });
+    assert.throws(edit, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' });
+    assert.equal(Object.hasOwn(base, 'rememberRunningState'), false);
+  });
+}
+
 for (const title of ['a/b\\c.txt', '', null, 42, 'bad\0title', 'x'.repeat(8193)]) {
   test('TITLE-1 Loop title never changes execution or scheduling configuration', () => {
     // Arrange
@@ -333,8 +410,8 @@ test('Timer execution edits preserve legacy/unknown fields without Run-style int
   const result = applyTimerConfigurationEdit(input, { executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd' }, 'posix');
   const newKey = applyTimerConfigurationEdit({}, { executable: base.executable }, 'posix');
   // Assert
-  assert.deepEqual(result, { ...original, executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd' });
-  assert.deepEqual(newKey, base);
+  assert.deepEqual(result, { ...original, executable: '/synthetic/other', argsText: '', cwd: '/synthetic/cwd', resumeRequested: false });
+  assert.deepEqual(newKey, { ...base, resumeRequested: false });
   assert.deepEqual(input, original);
 });
 

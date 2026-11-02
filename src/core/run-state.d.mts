@@ -1,7 +1,7 @@
 import type { StoredSettings as StoredRunSettings, SaveResult } from './settings-authority.mjs';
 import type { ExecutionPlatform } from './execution-paths.mjs';
 export type { SettingsJson, StoredSettings as StoredRunSettings, SaveResult } from './settings-authority.mjs';
-export interface ConfigurationEdit { executable?: string; argsText?: string; cwd?: string; themeColor?: string; title?: string }
+export interface ConfigurationEdit { executable?: string; argsText?: string; cwd?: string; themeColor?: string; title?: string; rememberRunningState?: boolean }
 
 export interface RunStateCoordinator {
 	/**
@@ -14,6 +14,8 @@ export interface RunStateCoordinator {
 	observe(input: unknown): { accepted: boolean; settings: StoredRunSettings; revision: number };
 	getSettings(): StoredRunSettings;
 	editConfiguration(changes: unknown): Promise<SaveResult>;
+	/** Plugin-only complete-snapshot saved intent update. */
+	setResumeRequested(value: boolean): Promise<SaveResult>;
 	whenIdle(): Promise<void>;
 	isBlocked(): boolean;
 	getRevision(): number;
@@ -30,6 +32,6 @@ export interface RunStateDependencies {
 }
 
 export declare function copyRunSettings(input: unknown): StoredRunSettings;
-/** Edits preserve legacy intent unchanged; cosmetic-only edits never synthesize argv. */
+/** Edits preserve legacy intent; execution/off edits atomically clear resumeRequested. */
 export declare function applyConfigurationEdit(settings: unknown, changes: unknown, platform?: ExecutionPlatform): StoredRunSettings;
 export declare function createRunStateCoordinator(dependencies: RunStateDependencies): RunStateCoordinator;

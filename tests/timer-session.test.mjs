@@ -17,6 +17,45 @@ const errors = h => h.events.filter(event => event[0] === 'error');
 const cards = h => h.events.filter(event => ['ready', 'waiting'].includes(event[0]));
 const svg = value => decodeURIComponent(value.slice('data:image/svg+xml,'.length));
 
+// RESTART: deadlines are session-local; the complete saved marker is the restoration authority.
+for (const result of [success, { status: 'error', error: ordinaryError }]) {
+  test(`Loop ${result.status} completion retains one saved enable transition across cycles and page changes`, options, async () => {
+    // Arrange
+    const h = harness(); await h.appear(); await h.tap();
+    // Act
+    if (result.status === 'error') h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_NONZERO');
+    await h.finish(result); await h.advance(2000); await h.session.disappear(); await h.advance(1000); await h.appear();
+    await h.advance(1999); const before = h.runs.length; await h.advance(1);
+    const restored = harness(); await restored.appear(h.coordinator.getSettings());
+    // Assert
+    assert.equal(before, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
+    assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
+    assert.equal(restored.runs.length, 1); assert.deepEqual(restored.writes, []);
+  });
+}
+test('Loop manual Stop reaches the child while the independent saved-intent write is held', options, async () => {
+  // Arrange
+  const entered = deferred(), saved = deferred();
+  const input = { ...base, actionOnPress: 'stop', resumeRequested: true };
+  const h = harness({ async intentWrite(value) { if (value.resumeRequested === false) { entered.resolve(); await saved.promise; } } }); await h.appear(input);
+  // Act
+  await h.session.keyDown(); const stopping = h.session.keyUp(); await entered.promise; await h.runs[0].stopEntered.promise;
+  const stops = h.runs[0].stops; saved.resolve(); await stopping; await h.session.whenIdle();
+  const fresh = harness(); await fresh.appear(h.coordinator.getSettings());
+  // Assert
+  assert.equal(stops, 1); assert.equal(h.runs.length, 1); assert.deepEqual(h.writes, [{ ...input, resumeRequested: false }]);
+  assert.deepEqual(fresh.runs, []); assert.deepEqual(fresh.writes, []);
+});
+test('Loop late callbacks from a stopped generation cannot clear a newer saved enable', options, async () => {
+  // Arrange
+  const h = harness(); await h.appear({ ...base, actionOnPress: 'stop' }); await h.tap(); const old = h.runs[0];
+  await h.tap(); await h.tap(); const before = structuredClone(h.writes);
+  // Act
+  old.callbacks.onError('Image protocol error.'); old.callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED'); await h.finish(success, old);
+  // Assert
+  assert.equal(h.runs.length, 2); assert.equal(h.coordinator.getSettings().resumeRequested, true); assert.deepEqual(h.writes, before);
+});
+
 for (const diagnosis of ['display', 'protocol', 'cleanup']) {
   test(`P3 Loop pending image rejection preserves ${diagnosis} priority and cancels deadlines`, options, async () => {
     // Arrange: no real process, SDK or wall-clock timer participates.
@@ -113,6 +152,200 @@ for (const wire of ['text:hello', 'progress:17/23', '<svg>opaque</svg>']) {
   });
 }
 
+// REMEMBER: page switches preserve owners/countdowns; only dormant automation is consumed.
+for (const preference of [undefined, true, false]) {
+  test(`Loop active page switch remember=${String(preference)} never replaces the child`, options, async () => {
+    // Arrange
+    const input = { ...base, ...(preference === undefined ? {} : { rememberRunningState: preference }) };
+    const h = harness(); await h.appear(input); await h.tap();
+    // Act
+    await h.session.disappear(); await h.advance(20000); const hiddenCount = h.runs.length;
+    await h.appear(input); await h.appear(input); await h.session.reconcileAvailability();
+    h.runs[0].callbacks.onUpdate(image('same-owner')); await h.session.whenIdle();
+    // Assert
+    assert.equal(hiddenCount, 1); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
+    assert.deepEqual(images(h), [image('same-owner').image]);
+    assert.deepEqual(h.writes, preference === false ? [] : [{ ...input, resumeRequested: true }]);
+  });
+}
+for (const actionOnPress of ['refresh', 'stop']) {
+  test(`Loop remember off retained active owner handles ${actionOnPress} tap after page return`, options, async () => {
+    // Arrange
+    const h = harness(), input = { ...base, rememberRunningState: false, actionOnPress };
+    await h.appear(input); await h.tap(); const run = h.runs[0];
+    await h.session.disappear(); await h.appear(input);
+    // Act
+    await h.tap(); const afterTap = { count: h.runs.length, stops: run.stops };
+    run.callbacks.onUpdate(image('after-return-tap')); await h.session.whenIdle();
+    await h.finish(success, run); await h.advance(30000);
+    const settled = h.session.getState(), automaticCount = h.runs.length;
+    await h.tap();
+    // Assert
+    assert.deepEqual(afterTap, { count: 1, stops: actionOnPress === 'stop' ? 1 : 0 });
+    assert.deepEqual(images(h), actionOnPress === 'refresh' ? [image('after-return-tap').image] : []);
+    assert.equal(automaticCount, 1); assert.equal(settled.phase, 'stopped');
+    assert.equal(settled.enabled, false); assert.equal(settled.dueMs, undefined);
+    assert.equal(h.runs.length, 2); assert.equal(h.session.getState().phase, 'running');
+    assert.deepEqual(h.writes, []); assert.deepEqual(errors(h), []);
+  });
+}
+
+for (const gateKind of ['confirmation', 'display']) {
+  test(`Loop disabling remember cancels overdue page return during ${gateKind} without resurrection`, options, async () => {
+    // Arrange
+    const gate = deferred(), entered = deferred(); let hold = false;
+    const h = harness({
+      async confirm() {
+        if (hold && gateKind === 'confirmation') { hold = false; entered.resolve(); await gate.promise; }
+        return true;
+      },
+      async presentation() {
+        if (hold && gateKind === 'display') { hold = false; entered.resolve(); await gate.promise; }
+      },
+    });
+    await h.appear(); await h.tap(); await h.finish(); await h.session.disappear(); await h.advance(6000);
+    hold = true;
+    const editing = gateKind === 'confirmation' ? h.edit({ themeColor: '#abcdef' }) : undefined;
+    const returning = h.appear(); await entered.promise;
+    // Act
+    const off = h.edit({ rememberRunningState: false });
+    const pendingCount = h.runs.length;
+    gate.resolve(); await Promise.all([editing, returning, off]); await h.session.whenIdle();
+    const cancelled = h.session.getState();
+    await h.edit({ rememberRunningState: true }); await h.appear();
+    await h.session.reconcileAvailability(); await h.advance(30000);
+    // Assert
+    assert.equal(pendingCount, 1); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
+    assert.equal(cancelled.enabled, false); assert.equal(cancelled.phase, 'stopped');
+    assert.equal(cancelled.dueMs, undefined); assert.equal(h.session.getState().enabled, false);
+    assert.deepEqual(errors(h), []);
+  });
+}
+
+for (const preference of [true, false]) for (const returningAt of [2000, 5000, 30000]) {
+  test(`Loop waiting page switch remember=${preference} at ${returningAt}ms preserves remainder or consumes resume`, options, async () => {
+    // Arrange
+    const input = { ...base, rememberRunningState: preference }, h = harness();
+    await h.appear(input); await h.tap(); await h.finish(); await h.session.disappear();
+    // Act
+    await h.advance(returningAt); const hiddenCount = h.runs.length;
+    await h.appear(input); await h.appear(input); await h.session.setConnected(true); await h.session.reconcileAvailability();
+    const returned = h.runs.length; await h.advance(Math.max(0, 5000 - returningAt));
+    // Assert
+    assert.equal(hiddenCount, 1); assert.equal(returned, preference && returningAt >= 5000 ? 2 : 1);
+    assert.equal(h.runs.length, preference ? 2 : 1); assert.equal(h.runs[0].stops, 0);
+    assert.deepEqual(h.writes, preference ? [{ ...input, resumeRequested: true }] : []);
+  });
+}
+test('Loop preference edits preserve visible deadlines while saving only eligible restart intent transitions', options, async () => {
+  // Arrange
+  const h = harness(); await h.appear(); await h.tap();
+  // Act
+  await h.edit({ rememberRunningState: false }); const activeStops = h.runs[0].stops;
+  await h.finish(); await h.advance(2000); const due = h.session.getState().dueMs;
+  await h.edit({ rememberRunningState: true }); await h.edit({ rememberRunningState: false });
+  const afterEditDue = h.session.getState().dueMs;
+  await h.advance(2999); const beforeDue = h.runs.length; await h.advance(1);
+  // Assert
+  assert.equal(activeStops, 0); assert.equal(due, 5000); assert.equal(afterEditDue, due);
+  assert.equal(beforeDue, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
+  assert.deepEqual(h.writes, [{ ...base, resumeRequested: true },
+    ...[false, true, false].map(rememberRunningState => ({ ...base, rememberRunningState, resumeRequested: rememberRunningState }))]);
+});
+for (const terminal of ['success', 'ordinary']) {
+  test(`Loop remember off hidden active ${terminal} completes locally without scheduling or resurrection`, options, async () => {
+    // Arrange
+    const input = { ...base, rememberRunningState: false }, h = harness(); await h.appear(input); await h.tap();
+    await h.session.disappear(); const display = [...h.events];
+    // Act
+    h.runs[0].callbacks.onUpdate(image('hidden-final'));
+    if (terminal === 'ordinary') h.runs[0].callbacks.onDiagnostic('PROCESS_EXITED_NONZERO');
+    await h.finish(terminal === 'success' ? success : { status: 'error', error: ordinaryError });
+    await h.advance(30000); const hidden = [...h.events]; await h.edit({ rememberRunningState: true });
+    await h.appear(); await h.advance(30000);
+    // Assert
+    assert.deepEqual(hidden, display); assert.equal(h.runs[0].stops, 0); assert.equal(h.runs.length, 1);
+    assert.equal(h.session.getState().enabled, false); assert.equal(h.session.getState().dueMs, undefined);
+  });
+}
+for (const certain of [true, false]) {
+  test(`Loop fast reconnect cleanup=${certain} gates exactly one replacement and rejects stale callbacks`, options, async () => {
+    // Arrange
+    const h = harness(); await h.appear(); await h.tap(); const old = h.runs[0], cleanup = deferred(); old.stopGate = cleanup;
+    // Act
+    const disconnecting = h.session.setConnected(false); await old.stopEntered.promise;
+    const reconnecting = h.session.setConnected(true), duplicate = h.session.setConnected(true);
+    const before = h.runs.length; cleanup.resolve(certain); await Promise.all([disconnecting, reconnecting, duplicate]); await h.session.whenIdle();
+    if (certain) { h.runs[1].callbacks.onUpdate(image('fresh-reconnected')); await h.session.whenIdle(); }
+    const settled = [...h.events]; old.callbacks.onUpdate(image('stale')); old.callbacks.onError('Image protocol error.');
+    await h.session.reconcileAvailability(); await h.advance(30000);
+    // Assert
+    assert.equal(before, 1); assert.equal(old.stops, 1); assert.equal(h.runs.length, certain ? 2 : 1);
+    if (certain) assert.deepEqual(images(h), [image('fresh-reconnected').image]);
+    assert.deepEqual(h.events, settled); assert.equal(h.session.getState().cleanupBlocked, !certain);
+    assert.deepEqual(h.writes, (certain ? [true] : [true, false]).map(resumeRequested => ({ ...base, resumeRequested })));
+  });
+}
+for (const stage of ['active', 'waiting']) {
+  test(`Loop remember off ${stage} disconnect consumes intent and enabling again never launches`, options, async () => {
+    // Arrange
+    const h = harness(); await h.appear({ ...base, rememberRunningState: false }); await h.tap();
+    if (stage === 'waiting') await h.finish();
+    // Act
+    await h.session.setConnected(false); await h.edit({ rememberRunningState: true });
+    await h.session.setConnected(true); await h.session.setConnected(true); await h.appear(); await h.advance(30000);
+    // Assert
+    assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, stage === 'active' ? 1 : 0);
+    assert.equal(h.session.getState().enabled, false); assert.equal(h.session.getState().dueMs, undefined);
+    assert.deepEqual(h.writes, [{ ...base, rememberRunningState: true }]);
+  });
+}
+test('Loop pending reconnect waits for latest complete preference confirmation without resetting intent', options, async () => {
+  // Arrange
+  const saved = deferred(), entered = deferred();
+  const h = harness({ async write() { entered.resolve(); await saved.promise; } }); await h.appear(); await h.tap();
+  await h.session.setConnected(false);
+  // Act
+  const edit = h.edit({ rememberRunningState: true, themeColor: '#abcdef' }); await entered.promise;
+  const reconnect = h.session.setConnected(true); await eventLoopCheckpoint(); const before = h.runs.length;
+  saved.resolve(); await Promise.all([edit, reconnect]); await h.session.whenIdle(); await h.session.reconcileAvailability();
+  // Assert
+  assert.equal(before, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 1);
+  assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, rememberRunningState: true, themeColor: '#abcdef', resumeRequested: true }]);
+});
+test('Loop disabling a reconnect during cleanup consumes intent and cannot be undone by enabling', options, async () => {
+  // Arrange
+  const h = harness(); await h.appear(); await h.tap(); const cleanup = deferred(); h.runs[0].stopGate = cleanup;
+  const disconnecting = h.session.setConnected(false); await h.runs[0].stopEntered.promise;
+  // Act
+  const reconnecting = h.session.setConnected(true), off = h.edit({ rememberRunningState: false });
+  cleanup.resolve(true); await Promise.all([disconnecting, reconnecting, off]);
+  await h.edit({ rememberRunningState: true }); await h.session.reconcileAvailability(); await h.advance(30000);
+  // Assert
+  assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1); assert.equal(h.session.getState().enabled, false);
+});
+
+for (const cancellation of ['manual', 'execution', 'protocol', 'persistence']) {
+  test(`Loop preference toggles cannot resurrect ${cancellation} cancellation or error`, options, async () => {
+    // Arrange
+    const h = harness(); await h.appear({ ...base, actionOnPress: 'stop' }); await h.tap();
+    if (cancellation === 'protocol') {
+      h.runs[0].callbacks.onError('Image protocol error.'); await h.finish({ status: 'error', error: 'Image protocol error.' });
+    } else if (cancellation === 'manual') await h.tap();
+    else if (cancellation === 'execution') await h.edit({ executable: '/synthetic/changed' });
+    else await h.session.persistenceFailed();
+    // Act
+    if (cancellation !== 'persistence') {
+      await h.edit({ rememberRunningState: false }); await h.edit({ rememberRunningState: true });
+    }
+    await h.session.setConnected(false); await h.session.setConnected(true); await h.appear(); await h.advance(30000);
+    // Assert
+    assert.equal(h.runs.length, 1); assert.equal(h.session.getState().dueMs, undefined);
+    if (cancellation === 'protocol') assert.equal(errors(h).at(-1)?.[2], 'IMAGE_PROTOCOL_ERROR');
+    if (cancellation === 'persistence') assert.equal(h.session.getState().persistenceBlocked, true);
+  });
+}
+
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -145,18 +378,27 @@ function clock() {
 // is executed, and no fixture treats a cached SDK snapshot as a save ACK.
 function harness(overrides = {}) {
   const time = clock(), events = [], runs = [], writes = [], confirmations = [], artwork = [];
-  let host = {};
+  let host = {}, intentStorage = false;
   const coordinator = createTimerStateCoordinator({
     platform: overrides.platform ?? 'posix',
     async writeSettings(value) {
+      // Existing gates target configuration saves; resume-only saves have independent controls.
+      const previous = { ...host }, next = { ...value };
+      delete previous.resumeRequested; delete next.resumeRequested;
+      intentStorage = assertSnapshotsEqual(previous, next);
       writes.push(structuredClone(value));
-      if (overrides.write) await overrides.write(value);
+      const write = intentStorage ? overrides.intentWrite : overrides.write;
+      if (write) await write(value);
       host = structuredClone(value);
     },
-    async readSettings() { return overrides.read ? overrides.read(host) : structuredClone(host); },
+    async readSettings() {
+      const read = intentStorage ? overrides.intentRead : overrides.read;
+      return read ? read(host) : structuredClone(host);
+    },
     setTimer: time.setTimer, clearTimer: time.clearTimer,
   });
   const session = createTimerSession({
+    saveResumeRequested: value => coordinator.setResumeRequested(value).then(() => {}),
     platform: overrides.platform ?? 'posix',
     initialConnected: overrides.initialConnected ?? true,
     now: time.now, setTimer: time.setTimer, clearTimer: time.clearTimer,
@@ -207,6 +449,7 @@ function harness(overrides = {}) {
     session, time, events, runs, writes, confirmations, coordinator, artwork,
     async appear(settings = base) {
       const accepted = coordinator.observe(settings);
+      if (accepted.accepted) host = structuredClone(settings);
       await session.appear(accepted.settings); await session.whenIdle();
     },
     async edit(changes) {
@@ -244,7 +487,7 @@ test('Windows Loop interval and press-mode edits preserve the active owner and u
   assert.equal(fresh, 0); assert.equal(stops, 0); assert.match(svg(retained), />retained<\/text>/);
   assert.equal(due, 10000); assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2);
   assert.deepEqual(h.runs[1].execution, { executable: input.executable, args: [] });
-  assert.deepEqual(h.writes, [{ ...input, themeColor: '#abcdef', intervalSeconds: 10, actionOnPress: 'stop' }]);
+  assert.deepEqual(h.writes, [{ ...input, resumeRequested: true }, { ...input, themeColor: '#abcdef', intervalSeconds: 10, actionOnPress: 'stop', resumeRequested: true }]);
   await h.session.setConnected(false); await h.session.whenIdle();
 });
 test('Windows Loop cleanup uncertainty blocks replacement but not a complete configuration save', options, async () => {
@@ -256,7 +499,7 @@ test('Windows Loop cleanup uncertainty blocks replacement but not a complete con
   const before = [...images(h)]; h.runs[0].callbacks.onUpdate(image('stale')); await h.session.whenIdle();
   // Assert
   assert.equal(h.runs.length, 1); assert.equal(h.session.getState().cleanupBlocked, true);
-  assert.deepEqual(h.writes, [{ ...input, executable: 'D:/next.EXE' }]); assert.deepEqual(images(h), before);
+  assert.deepEqual(h.writes, [{ ...input, resumeRequested: true }, { ...input, executable: 'D:/next.EXE', resumeRequested: false }]); assert.deepEqual(images(h), before);
 });
 
 // Slice 3: headline/caption cosmetics do not alter Loop's owner or completion-based deadline.
@@ -422,7 +665,7 @@ test('Loop Ready, first Loading and no-output Success use the configured suffix 
   // Assert
   assert.deepEqual(h.artwork.map(item => [item.kind, item.caption, item.footer, item.extension]),
     [['ready', 'report', 'ready', '.py'], ['waiting', 'report', 'ready', '.py'], ['ready', 'report', 'success', '.py']]);
-  assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, []);
+  assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, [{ ...base, executable: '/synthetic/report.PY', argsText: 'other.sh', resumeRequested: true }]);
 });
 
 test('Loop suffix-only replacement updates identical caption and stays disabled', options, async () => {
@@ -462,7 +705,8 @@ for (const stage of ['ready', 'waiting', 'success']) {
     assert.equal(h.artwork.at(-1).extension, '.sh'); assert.equal(h.artwork.at(-1).theme, '#abcdef');
     assert.equal(h.session.getState().enabled, before.enabled); assert.equal(h.session.getState().dueMs, before.dueMs);
     assert.equal(h.runs.length, count); assert.ok(h.runs.every(run => run.stops === 0));
-    assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]); assert.deepEqual(errors(h), []);
+    assert.deepEqual(h.writes, stage === 'ready' ? [{ ...base, themeColor: '#abcdef' }]
+      : [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]); assert.deepEqual(errors(h), []);
   });
 }
 
@@ -549,7 +793,8 @@ for (const at of [0, 999, 1000, 1001]) {
     assert.ok(cards(h).some(card => card[2] === 'setup required'));
     assert.ok(cards(h).some(card => card[1] === 'program' && card[2] === 'ready'));
     assert.equal(h.runs.length, 1); assert.equal(h.session.getState().enabled, true);
-    assert.deepEqual(h.writes, [{ executable: base.executable, argsText: '' }]);
+    assert.deepEqual(h.writes, [{ executable: base.executable, argsText: '', resumeRequested: false },
+      { executable: base.executable, argsText: '', resumeRequested: true }]);
   });
 }
 test('Timer Setup identical and theme/control-only edits preserve disabled intent and no deadline', options, async () => {
@@ -629,7 +874,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
           assert.equal(h.runs.length, count + Number(starts)); assert.equal(recognized.enabled, enabled);
           assert.equal(h.runs[0]?.stops ?? 0, stage === 'running' && !enabled ? 1 : 0);
           assert.equal(recognized.dueMs, !held && stage === 'running' && policy !== 'stop' ? due : undefined);
-          assert.deepEqual(h.writes, []);
+          const saved = stage === 'disabled' ? (starts ? [true] : []) : enabled ? [true] : [true, false];
+          assert.deepEqual(h.writes, saved.map(resumeRequested => ({ ...policySettings(policy), resumeRequested })));
         });
       }
     }
@@ -654,7 +900,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
         const enabled = at === 999 && policy !== 'stop';
         assert.equal(phase, 'starting'); assert.equal(h.session.getState().enabled, enabled);
         assert.equal(h.runs.length, Number(enabled)); assert.ok(h.runs.every(run => run.stops === 0));
-        assert.equal(h.session.getState().dueMs, undefined); assert.deepEqual(h.writes, []);
+        assert.equal(h.session.getState().dueMs, undefined);
+        assert.deepEqual(h.writes, (enabled ? [true] : [true, false]).map(resumeRequested => ({ ...policySettings(policy), resumeRequested })));
       });
     }
   }
@@ -716,7 +963,7 @@ test('short release enables an immediate launch, not key-down, with literal exec
   assert.equal(before, 0); assert.equal(h.runs.length, 1);
   assert.deepEqual(h.runs[0].execution, { executable: base.executable, args: ['two words', '$HOME', '*.png'], cwd: '/synthetic/work' });
   assert.equal(h.session.getState().enabled, true); assert.equal(h.session.getState().phase, 'running');
-  assert.deepEqual(h.writes, []); assert.equal(cards(h).at(-1)?.[0], 'waiting');
+  assert.deepEqual(h.writes, [{ ...base, argsText: "'two words' '$HOME' '*.png'", cwd: '/synthetic/work', resumeRequested: true }]); assert.equal(cards(h).at(-1)?.[0], 'waiting');
 });
 
 for (const delivery of ['release-only', 'timer-first']) {
@@ -731,7 +978,7 @@ for (const delivery of ['release-only', 'timer-first']) {
       // Assert
       assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1);
       assert.equal(h.session.getState().enabled, false); assert.equal(h.session.getState().phase, 'stopped');
-      assert.equal(cards(h).at(-1)?.[2], 'ready'); assert.deepEqual(h.writes, []);
+      assert.equal(cards(h).at(-1)?.[2], 'ready'); assert.deepEqual(h.writes, [true, false].map(resumeRequested => ({ ...base, resumeRequested })));
     });
   }
 }
@@ -832,7 +1079,7 @@ for (const interval of [undefined, 1, 5, 86400]) {
     // Assert
     assert.equal(due, 12345 + (interval ?? 60) * 1000); assert.equal(before, 1); assert.equal(h.runs.length, 2);
     assert.deepEqual(cards(h), beforeCards); assert.equal(cards(h).at(-1)?.[2], 'success');
-    assert.equal(h.runs[0].stops, 0); assert.deepEqual(h.writes, []);
+    assert.equal(h.runs[0].stops, 0); assert.deepEqual(h.writes, [{ ...settings, resumeRequested: true }]);
   });
 }
 
@@ -1164,7 +1411,7 @@ test('pending initial configuration prevents Ready and launch until authoritativ
   gate.resolve(true); await appearing; await h.session.whenIdle();
   // Assert
   assert.equal(before.count, 0); assert.deepEqual(before.events, []); assert.equal(before.state.configurationPending, true);
-  assert.equal(h.runs.length, 1); assert.equal(h.session.getState().configurationPending, false); assert.deepEqual(h.writes, []);
+  assert.equal(h.runs.length, 1); assert.equal(h.session.getState().configurationPending, false); assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
 });
 
 for (const failure of ['false', 'reject']) {
@@ -1217,7 +1464,7 @@ for (const storageFailure of ['write', 'read', 'mismatch', 'timeout']) {
     // Assert
     assert.equal(h.coordinator.isBlocked(), true); assert.equal(h.session.getState().persistenceBlocked, true);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1); assert.equal(errors(h).at(-1)?.[2], 'STATE_SAVE_FAILED');
-    assert.equal(h.writes.length, 1);
+    assert.equal(h.writes.length, 2); assert.equal(h.writes[0].resumeRequested, true);
   });
 }
 
@@ -1243,7 +1490,8 @@ for (const edit of [{ executable: '/synthetic/new' }, { argsText: "'new literal'
     const disabled = h.session.getState().enabled; const count = h.runs.length; await h.tap();
     // Assert
     assert.equal(old.stops, 1); assert.equal(disabled, false); assert.equal(count, 1); assert.equal(h.runs.length, 2);
-    assert.equal(h.writes.length, 1); assert.ok(!Object.hasOwn(h.writes[0], 'enabled') && !Object.hasOwn(h.writes[0], 'runRequested'));
+    assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, ...edit, resumeRequested: false }, { ...base, ...edit, resumeRequested: true }]);
+    assert.ok(h.writes.every(value => !Object.hasOwn(value, 'enabled') && !Object.hasOwn(value, 'runRequested')));
     assert.equal(cards(h).at(-2)?.[2], 'ready'); assert.deepEqual(errors(h), []); assert.deepEqual(images(h), []);
   });
 }
@@ -1438,7 +1686,8 @@ for (const invalidate of ['hide', 'disable', 'disconnect']) {
     // Arrange
     const held = deferred(), entered = deferred();
     const h = harness({ async presentation(kind) { if (kind === 'waiting') { entered.resolve(); await held.promise; } } });
-    await h.appear({ ...base, ...(invalidate === 'disable' ? { actionOnPress: 'stop' } : {}) }); void h.session.keyDown(); const launching = h.session.keyUp(); await entered.promise;
+    await h.appear({ ...base, ...(invalidate === 'disable' ? { actionOnPress: 'stop' } : {}),
+      ...(invalidate === 'disconnect' ? { rememberRunningState: false } : {}) }); void h.session.keyDown(); const launching = h.session.keyUp(); await entered.promise;
     // Act
     let transition;
     if (invalidate === 'hide') transition = h.session.disappear();
@@ -1454,29 +1703,31 @@ for (const invalidate of ['hide', 'disable', 'disconnect']) {
 }
 
 for (const hidden of [false, true]) {
-  test(`disconnect active owner hidden=${hidden} disables and reconnect/wake never auto-enables`, options, async () => {
+  test(`disconnect active owner hidden=${hidden} stops then resumes once only when visible`, options, async () => {
     // Arrange
     const h = harness(); await h.appear(); await h.tap(); if (hidden) await h.session.disappear();
     // Act
     await h.session.setConnected(false); await h.session.whenIdle(); await h.advance(100000);
-    await h.session.setConnected(true); await h.appear(); await h.session.reconcileAvailability(); await h.session.whenIdle();
+    await h.session.setConnected(true); await h.session.whenIdle(); const reconnected = h.runs.length;
+    await h.appear(); await h.session.reconcileAvailability(); await h.session.setConnected(true); await h.session.whenIdle();
     // Assert
-    assert.equal(h.runs[0].stops, 1); assert.equal(h.runs.length, 1); assert.equal(h.session.getState().enabled, false);
-    assert.equal(h.session.getState().dueMs, undefined); assert.equal(cards(h).at(-1)?.[2], 'ready');
+    assert.equal(reconnected, hidden ? 1 : 2); assert.equal(h.runs[0].stops, 1); assert.equal(h.runs.length, 2);
+    assert.equal(h.session.getState().enabled, true); assert.equal(h.session.getState().dueMs, undefined); assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
   });
 }
 
-test('disconnect while waiting cancels due and never resumes from old intent', options, async () => {
+test('disconnect while waiting resumes immediately instead of restarting the old interval', options, async () => {
   // Arrange
   const h = harness(); await h.appear(); await h.tap(); await h.finish();
   // Act
-  await h.session.setConnected(false); await h.advance(100000); await h.session.setConnected(true);
+  await h.session.setConnected(false); await h.advance(1000); await h.session.setConnected(true);
   await h.session.reconcileAvailability(); await h.session.whenIdle();
   // Assert
-  assert.equal(h.runs.length, 1); assert.equal(h.session.getState().enabled, false); assert.equal(h.session.getState().dueMs, undefined);
+  assert.equal(h.runs.length, 2); assert.equal(h.session.getState().enabled, true); assert.equal(h.session.getState().dueMs, undefined);
+  assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
 });
 
-test('independent Timer keys and fresh instances never share enabled intent, output or deadlines', options, async () => {
+test('independent Timer keys isolate runtime output and deadlines while fresh instances restore saved intent', options, async () => {
   // Arrange
   const first = harness(), second = harness(); await first.appear(); await second.appear(); await first.tap();
   first.runs[0].callbacks.onUpdate(image('first')); await first.session.whenIdle(); await first.finish();
@@ -1486,7 +1737,7 @@ test('independent Timer keys and fresh instances never share enabled intent, out
   const fresh = harness(); await fresh.appear(first.coordinator.getSettings());
   // Assert
   assert.deepEqual(second.events, secondEvents); assert.equal(second.runs.length, 0); assert.equal(second.session.getState().enabled, false);
-  assert.equal(fresh.runs.length, 0); assert.equal(fresh.session.getState().enabled, false); assert.equal(fresh.session.getState().dueMs, undefined);
+  assert.equal(fresh.runs.length, 1); assert.equal(fresh.session.getState().enabled, true); assert.equal(fresh.session.getState().dueMs, undefined);
   assert.deepEqual(images(fresh), []); assert.deepEqual(fresh.writes, []); assert.equal(first.runs.length, 2);
 });
 
@@ -1544,7 +1795,7 @@ test('a pending theme save during Loading must reconfirm the latest complete sna
   saved.resolve(); await launching; await editing; await h.session.whenIdle();
   // Assert
   assert.equal(before, 0); assert.equal(h.runs.length, 1); assert.equal(h.session.getState().configurationPending, false);
-  assert.deepEqual(h.writes, [{ ...base, themeColor: '#abcdef' }]); assert.equal(h.runs[0].stops, 0);
+  assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]); assert.equal(h.runs[0].stops, 0);
 });
 
 test('execution recovery cannot show Ready until both owned stop and latest save are confirmed', options, async () => {
@@ -1606,7 +1857,7 @@ test('rejected interval edit leaves the last confirmed running configuration int
   // Assert
   assert.equal(rejection.message, 'Invalid settings.'); assert.equal(rejection.diagnosticCode, 'INTERVAL_INVALID');
   assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().enabled, true);
-  assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, []);
+  assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
 });
 
 test('equivalent legacy argv migration while running neither disables nor replaces the owner', options, async () => {
@@ -1747,7 +1998,7 @@ for (const superseding of ['theme', 'argv-migration', 'new-interval']) {
     assert.equal(due, 5000 + seconds * 1000); assert.equal(repeatedDue, due);
     assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
     assert.deepEqual(h.runs[1].execution.args, ['two words', 'literal']);
-    assert.equal(h.writes.length, 2); assert.equal(h.session.getState().persistenceBlocked, false);
+    assert.equal(h.writes.length, 3); assert.equal(h.writes[0].resumeRequested, true); assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
 
@@ -1777,7 +2028,7 @@ for (const retained of [false, true]) {
     assert.equal(confirmed.due, 15000); assert.equal(confirmed.runs, 1);
     assert.equal(beforeDeadline, 1); assert.equal(atDeadline, 2); assert.equal(h.runs.length, 2);
     assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().enabled, true);
-    assert.equal(h.writes.length, 2); assert.equal(h.writes.at(-1).intervalSeconds, 10); assert.equal(h.writes.at(-1).title, 'new title');
+    assert.equal(h.writes.length, 3); assert.equal(h.writes[0].resumeRequested, true); assert.equal(h.writes.at(-1).intervalSeconds, 10); assert.equal(h.writes.at(-1).title, 'new title');
     assert.deepEqual(confirmed.images, displayed); assert.deepEqual(images(h), displayed);
     assert.deepEqual(errors(h), []); assert.equal(h.session.getState().persistenceBlocked, false);
   });
@@ -1799,7 +2050,7 @@ for (const retained of [false, true]) {
     assert.equal(originalDue, 5000); assert.equal(pendingDue, originalDue); assert.equal(confirmedDue, originalDue);
     assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
     assert.deepEqual(images(h), displayed); assert.deepEqual(errors(h), []);
-    assert.equal(h.writes.length, 1); assert.equal(h.session.getState().persistenceBlocked, false);
+    assert.equal(h.writes.length, 2); assert.equal(h.writes[0].resumeRequested, true); assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
 
@@ -1808,7 +2059,8 @@ for (const cancellation of ['hold', 'disconnect', 'execution']) {
     // Arrange
     const saved = deferred(), entered = deferred(); let writeCount = 0;
     const h = harness({ async write() { if (++writeCount === 1) { entered.resolve(); await saved.promise; } } });
-    await h.appear(); await h.tap(); await h.finish(); await h.advance(2000);
+    await h.appear({ ...base, ...(cancellation === 'disconnect' ? { rememberRunningState: false } : {}) });
+    await h.tap(); await h.finish(); await h.advance(2000);
     // Act
     const interval = h.edit({ intervalSeconds: 10 }); await entered.promise;
     const cosmetic = h.edit({ themeColor: '#abcdef' }); let cancelled;
@@ -1911,7 +2163,7 @@ for (const stage of ['setup', 'ready', 'producer']) {
     for (const event of errors(h)) assert.deepEqual(event, fixedError);
     assert.deepEqual(images(h), []); assert.deepEqual(cards(h), stage === 'producer' ? before.filter(event => ['ready', 'waiting'].includes(event[0])) : []);
     if (stage === 'producer') assert.equal(h.runs[0].stops, 1);
-    assert.equal(h.runs.length, stage === 'producer' ? 1 : 0); assert.deepEqual(h.writes, []);
+    assert.equal(h.runs.length, stage === 'producer' ? 1 : 0); assert.deepEqual(h.writes, stage === 'producer' ? [{ ...base, resumeRequested: true }] : []);
   });
 }
 
@@ -1927,7 +2179,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     // Assert
     assert.equal(before, 0); assert.equal(h.runs.length, 1); assert.equal(h.session.getState().enabled, true);
     assert.deepEqual(h.runs[0].execution, { executable: base.executable, args: [] });
-    assert.deepEqual(h.coordinator.getSettings(), policySettings(policy)); assert.deepEqual(h.writes, []);
+    assert.deepEqual(h.coordinator.getSettings(), { ...policySettings(policy), resumeRequested: true });
+    assert.deepEqual(h.writes, [{ ...policySettings(policy), resumeRequested: true }]);
   });
 
   test(`${policy ?? 'default Refresh'} waiting tap ${policy === 'stop' ? 'cancels automation' : 'refreshes immediately'}`, options, async () => {
@@ -1939,7 +2192,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     assert.equal(h.runs.length, policy === 'stop' ? 1 : 2);
     assert.equal(recognized.enabled, policy !== 'stop'); assert.equal(recognized.dueMs, undefined);
     assert.equal(recognized.phase, policy === 'stop' ? 'stopped' : 'running');
-    assert.ok(h.runs.every(run => run.stops === 0)); assert.deepEqual(h.writes, []);
+    assert.ok(h.runs.every(run => run.stops === 0));
+    assert.deepEqual(h.writes, (policy === 'stop' ? [true, false] : [true]).map(resumeRequested => ({ ...policySettings(policy), resumeRequested })));
   });
 
   test(`${policy ?? 'default Refresh'} hold during waiting cancels deadline with no preliminary refresh`, options, async () => {
@@ -1950,7 +2204,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     await h.advance(TIMER_HOLD_MS); await h.session.keyUp(); await h.session.whenIdle(); await h.advance(100000);
     // Assert
     assert.equal(before, 1); assert.equal(h.runs.length, 1); assert.equal(h.session.getState().enabled, false);
-    assert.equal(h.session.getState().dueMs, undefined); assert.deepEqual(h.writes, []);
+    assert.equal(h.session.getState().dueMs, undefined); assert.deepEqual(h.writes, [true, false].map(resumeRequested => ({ ...policySettings(policy), resumeRequested })));
   });
 
   test(`${policy ?? 'default Refresh'} hold always stops an active owner exactly once`, options, async () => {
@@ -1978,7 +2232,7 @@ for (const policy of [undefined, 'refresh']) {
     // Assert
     assert.deepEqual(ignored, state); assert.deepEqual(untouched, display);
     assert.equal(h.runs[0].stops, 0); assert.equal(count, 1); assert.equal(due, 12000);
-    assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2); assert.deepEqual(h.writes, []);
+    assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2); assert.deepEqual(h.writes, [{ ...policySettings(policy), resumeRequested: true }]);
   });
 
   test(`${policy ?? 'default Refresh'} tap recognized during stalled startup never stops or queues another launch`, options, async () => {
@@ -1993,7 +2247,7 @@ for (const policy of [undefined, 'refresh']) {
     const count = h.runs.length; await h.advance(4999); const before = h.runs.length; await h.advance(1);
     // Assert
     assert.equal(phase, 'starting'); assert.equal(count, 1); assert.equal(before, 1); assert.equal(h.runs.length, 2);
-    assert.equal(h.runs[0].stops, 0); assert.deepEqual(h.writes, []);
+    assert.equal(h.runs[0].stops, 0); assert.deepEqual(h.writes, [{ ...policySettings(policy), resumeRequested: true }]);
   });
 
   test(`${policy ?? 'default Refresh'} release after completed run recognizes waiting rather than key-down running state`, options, async () => {
@@ -2004,7 +2258,7 @@ for (const policy of [undefined, 'refresh']) {
     await h.session.keyUp(); await h.session.whenIdle();
     // Assert
     assert.equal(phase, 'waiting'); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
-    assert.equal(h.session.getState().phase, 'running'); assert.deepEqual(h.writes, []);
+    assert.equal(h.session.getState().phase, 'running'); assert.deepEqual(h.writes, [{ ...policySettings(policy), resumeRequested: true }]);
   });
 }
 
@@ -2021,7 +2275,8 @@ test('enabled Stop tap preserves recoverable Error; only the next disabled tap d
   assert.deepEqual(retained.filter(event => event[0] !== 'error'), display.filter(event => event[0] !== 'error'));
   assert.ok(retained.filter(event => event[0] === 'error').every(event => event[2] === 'IMAGE_PROTOCOL_ERROR'));
   assert.equal(errors(h).at(-1)?.[2], 'IMAGE_PROTOCOL_ERROR'); assert.equal(count, 1);
-  assert.equal(h.runs.length, 2); assert.equal(h.session.getState().protocolBlocked, false); assert.deepEqual(h.writes, []);
+  assert.equal(h.runs.length, 2); assert.equal(h.session.getState().protocolBlocked, false);
+  assert.deepEqual(h.writes, [true, false, true].map(resumeRequested => ({ ...policySettings('stop'), resumeRequested })));
 });
 
 for (const stage of ['disabled', 'waiting', 'running', 'hidden', 'suspended']) {
@@ -2040,7 +2295,10 @@ for (const stage of ['disabled', 'waiting', 'running', 'hidden', 'suspended']) {
       if (stage === 'hidden') { await h.advance(1000); await h.appear(); }
       // Assert
       assert.deepEqual(after, before); assert.equal(h.runs.length, count); assert.deepEqual(h.events.slice(0, shown.length), shown);
-      assert.ok(h.runs.every(run => run.stops === 0)); assert.deepEqual(h.writes, [{ ...policySettings(from), actionOnPress }]);
+      assert.ok(h.runs.every(run => run.stops === 0));
+      const previous = stage === 'disabled' ? [] : stage === 'suspended' ? [true, false] : [true];
+      assert.deepEqual(h.writes, [...previous.map(resumeRequested => ({ ...policySettings(from), resumeRequested })),
+        { ...policySettings(from), actionOnPress, ...(stage === 'disabled' ? {} : { resumeRequested: stage !== 'suspended' }) }]);
       if (stage === 'hidden') assert.equal(h.session.getState().dueMs, before.dueMs);
       if (stage === 'suspended') assert.equal(errors(h).at(-1)?.[2], 'IMAGE_PROTOCOL_ERROR');
     });
@@ -2056,7 +2314,9 @@ for (const from of ['refresh', 'stop']) {
     await h.edit({ actionOnPress: next }); await h.session.keyUp(); await h.session.whenIdle();
     // Assert
     assert.equal(h.runs[0].stops, next === 'stop' ? 1 : 0); assert.equal(h.session.getState().enabled, next !== 'stop');
-    assert.equal(h.runs.length, 1); assert.deepEqual(h.writes, [{ ...policySettings(from), actionOnPress: next }]);
+    assert.equal(h.runs.length, 1); assert.deepEqual(h.writes, [{ ...policySettings(from), resumeRequested: true },
+      { ...policySettings(from), actionOnPress: next, resumeRequested: true },
+      ...(next === 'stop' ? [{ ...policySettings(from), actionOnPress: next, resumeRequested: false }] : [])]);
   });
 }
 
@@ -2109,7 +2369,7 @@ for (const edit of [
     // Assert
     assert.equal(before, 1); assert.equal(state.enabled, !Object.hasOwn(edit, 'executable'));
     assert.equal(state.dueMs, Object.hasOwn(edit, 'executable') ? undefined : edit.intervalSeconds === 10 ? 12000 : 5000);
-    assert.deepEqual(h.writes, [{ ...base, ...edit }]); assert.equal(h.runs[0].stops, 0);
+    assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, ...edit, resumeRequested: !Object.hasOwn(edit, 'executable') }]); assert.equal(h.runs[0].stops, 0);
   });
 }
 
@@ -2126,7 +2386,8 @@ for (const oldResult of ['false', 'reject']) {
     // Assert
     assert.equal(h.session.getState().persistenceBlocked, false); assert.equal(h.session.getState().enabled, false);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1); assert.deepEqual(errors(h), []);
-    assert.deepEqual(h.writes, [{ ...base, actionOnPress: 'stop' }]);
+    assert.deepEqual(h.writes, [{ ...base, actionOnPress: 'stop' },
+      ...[true, false].map(resumeRequested => ({ ...base, actionOnPress: 'stop', resumeRequested }))]);
   });
 }
 
@@ -2139,7 +2400,7 @@ test('rejected policy edit preserves confirmed active owner and its full complet
   await h.finish();
   // Assert
   assert.equal(failure.diagnosticCode, 'ACTION_ON_PRESS_INVALID'); assert.deepEqual(intact, before);
-  assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, []);
+  assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().dueMs, 5000); assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }]);
 });
 
 for (const policy of ['refresh', 'stop']) {
@@ -2156,7 +2417,7 @@ for (const policy of ['refresh', 'stop']) {
       await Promise.all([appearing, pressing]); await h.session.whenIdle(); await h.tap(); await h.advance(100000);
       // Assert
       assert.equal(pending.state.configurationPending, true); assert.equal(pending.runs, 0); assert.deepEqual(pending.events, []);
-      assert.equal(h.runs.length, 0); assert.deepEqual(cards(h), []); assert.deepEqual(h.writes, []);
+      assert.equal(h.runs.length, 0); assert.deepEqual(cards(h), []); assert.deepEqual(h.writes, [{ ...initial, resumeRequested: true }]);
       assert.equal(h.session.getState().persistenceBlocked, true); assert.equal(errors(h).at(-1)?.[2], 'STATE_SAVE_FAILED');
     });
   }
@@ -2177,7 +2438,7 @@ test('pending policy edit during Loading must confirm latest complete snapshot b
   // Assert
   assert.equal(count, 0); assert.equal(pending.configurationPending, true); assert.equal(h.runs.length, 1);
   assert.equal(h.runs[0].stops, 1); assert.equal(h.session.getState().enabled, false);
-  assert.deepEqual(h.writes, [{ ...base, actionOnPress: 'stop' }]);
+  assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: false }]);
 });
 
 for (const duration of [1000, 20000]) {
@@ -2193,7 +2454,7 @@ for (const duration of [1000, 20000]) {
     // Assert
     assert.equal(hidden.count, 1); assert.deepEqual(hidden.events, shown); assert.equal(hidden.state.dueMs, due);
     assert.equal(returned, duration === 1000 ? 1 : 2); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
-    assert.equal(h.session.getState().enabled, true); assert.deepEqual(h.writes, [{ ...base, actionOnPress: 'stop' }]);
+    assert.equal(h.session.getState().enabled, true); assert.deepEqual(h.writes, [{ ...base, resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: true }]);
   });
 }
 
@@ -2263,8 +2524,8 @@ for (const terminal of ['success', 'ordinary-error']) {
       await Promise.all([completing, cosmetic, interrupted]); await h.session.whenIdle();
       await h.session.setConnected(true); await h.appear(); await h.session.reconcileAvailability(); await h.advance(100000);
       // Assert
-      assert.equal(pendingCount, 1); assert.equal(h.runs.length, interruption === 'new-generation' ? 2 : 1);
-      assert.equal(h.session.getState().enabled, interruption === 'new-generation'); assert.equal(h.session.getState().dueMs, undefined);
+      assert.equal(pendingCount, 1); assert.equal(h.runs.length, ['new-generation', 'disconnect'].includes(interruption) ? 2 : 1);
+      assert.equal(h.session.getState().enabled, ['new-generation', 'disconnect'].includes(interruption)); assert.equal(h.session.getState().dueMs, undefined);
       assert.equal(h.session.getState().persistenceBlocked, false); assert.equal(h.runs[0].stops, 0);
       if (interruption === 'new-generation') assert.equal(h.runs[1].stops, 0);
     });
@@ -2297,7 +2558,7 @@ for (const superseding of ['theme', 'argv-migration', 'new-interval']) {
     assert.equal(pending.runs, 1); assert.equal(pending.state.dueMs, undefined); assert.equal(pending.state.configurationPending, true);
     assert.equal(settledCount, 1); assert.equal(due, 5000 + seconds * 1000); assert.equal(repeatedDue, due);
     assert.equal(beforeDeadline, 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
-    assert.deepEqual(h.runs[1].execution.args, ['two words', 'literal']); assert.equal(h.writes.length, 2);
+    assert.deepEqual(h.runs[1].execution.args, ['two words', 'literal']); assert.equal(h.writes.length, 3);
     assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
@@ -2307,7 +2568,8 @@ for (const cancellation of ['hold', 'execution', 'disconnect']) {
     // Arrange
     const saved = deferred(), entered = deferred(); let writeCount = 0;
     const h = harness({ async write() { if (++writeCount === 1) { entered.resolve(); await saved.promise; } } });
-    await h.appear(); await h.tap(); await h.finish(); await h.advance(2000);
+    await h.appear({ ...base, ...(cancellation === 'disconnect' ? { rememberRunningState: false } : {}) });
+    await h.tap(); await h.finish(); await h.advance(2000);
     // Act
     const interval = h.edit({ intervalSeconds: 10 }); await entered.promise;
     const wake = h.session.reconcileAvailability(); const cosmetic = h.edit({ themeColor: '#abcdef' });
@@ -2387,7 +2649,7 @@ for (const terminal of ['success', 'ordinary-error']) {
       assert.equal(pending.state.dueMs, originalDue); assert.equal(pending.state.configurationPending, true);
       assert.equal(restored.runs, overdue ? 2 : 1); assert.equal(restored.due, overdue ? undefined : originalDue);
       assert.equal(beforeDeadline, overdue ? 2 : 1); assert.equal(h.runs.length, 2); assert.equal(h.runs[0].stops, 0);
-      assert.equal(h.session.getState().suspended, false); assert.equal(h.writes.length, 1);
+      assert.equal(h.session.getState().suspended, false); assert.equal(h.writes.length, 2);
       if (terminal === 'success') { assert.equal(cards(h).at(-1)?.[2], 'success'); assert.equal(cards(h).at(-1)?.[3], '#abcdef'); }
       else { assert.equal(errors(h).at(-1)?.[2], 'PROCESS_EXITED_NONZERO'); assert.equal(errors(h).at(-1)?.[3], '#abcdef'); }
     });
@@ -2427,8 +2689,8 @@ for (const terminal of ['success', 'ordinary-error']) {
       await Promise.all([appearing, cosmetic, interrupted]); await h.session.whenIdle();
       await h.session.setConnected(true); await h.appear(); await h.session.reconcileAvailability(); await h.advance(100000);
       // Assert
-      assert.equal(pendingCount, 1); assert.equal(h.runs.length, interruption === 'new-generation' ? 2 : 1);
-      assert.equal(h.session.getState().enabled, interruption === 'new-generation'); assert.equal(h.session.getState().dueMs, undefined);
+      assert.equal(pendingCount, 1); assert.equal(h.runs.length, ['new-generation', 'disconnect'].includes(interruption) ? 2 : 1);
+      assert.equal(h.session.getState().enabled, ['new-generation', 'disconnect'].includes(interruption)); assert.equal(h.session.getState().dueMs, undefined);
       assert.equal(h.runs[0].stops, 0); assert.equal(h.session.getState().persistenceBlocked, false);
       if (interruption === 'new-generation') assert.equal(h.runs[1].stops, 0);
     });
@@ -2462,7 +2724,7 @@ for (const terminal of ['success', 'ordinary-error']) {
     // Assert
     assert.equal(pendingCount, 1); assert.equal(h.runs.length, 1); assert.equal(h.session.getState().persistenceBlocked, true);
     assert.equal(h.coordinator.isBlocked(), true); assert.equal(h.session.getState().dueMs, undefined);
-    assert.equal(errors(h).at(-1)?.[2], 'STATE_SAVE_FAILED'); assert.equal(h.writes.length, 1);
+    assert.equal(errors(h).at(-1)?.[2], 'STATE_SAVE_FAILED'); assert.equal(h.writes.length, 2);
     assert.equal(h.session.getState().presentation, 'error');
   });
 }

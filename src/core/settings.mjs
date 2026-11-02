@@ -4,7 +4,7 @@ import { isAbsoluteExecutionPath } from './execution-paths.mjs';
 import { normalizeTitle } from './key-layout.mjs';
 
 const INVALID_SETTINGS = 'Invalid settings.';
-const SETTINGS_KEYS = new Set(['executable', 'args', 'argsText', 'cwd', 'runRequested', 'themeColor', 'title']);
+const SETTINGS_KEYS = new Set(['executable', 'args', 'argsText', 'cwd', 'runRequested', 'themeColor', 'title', 'rememberRunningState', 'resumeRequested']);
 const VALIDATION_FAILURE = Symbol('settings validation failure');
 const DIAGNOSTIC_CODES = new Set([
   'SETTINGS_NOT_OBJECT',
@@ -57,6 +57,8 @@ function validate(input, classify = false, platform) {
   if (Object.hasOwn(input, 'runRequested') && typeof readDataProperty(input, 'runRequested') !== 'boolean') {
     reject('INVALID_RUN_STATE');
   }
+  readRememberRunningState(input);
+  validateResumeRequested(input);
 
   let sourceArgs;
   if (Object.hasOwn(input, 'argsText')) {
@@ -135,6 +137,30 @@ export function validateTitleEdit(value) {
   return normalizeTitle(value) ? value : undefined;
 }
 
+/** Omission enables remembering without a write. */
+export function readRememberRunningState(input) {
+  try {
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) reject('SETTINGS_NOT_OBJECT');
+    if (!Object.hasOwn(input, 'rememberRunningState')) return true;
+    const value = readDataProperty(input, 'rememberRunningState');
+    if (typeof value !== 'boolean') reject('INVALID_SETTINGS');
+    return value;
+  } catch (failure) { throw invalidSettings(getDiagnosticCode(failure)); }
+}
+
+function validateResumeRequested(input) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) reject('SETTINGS_NOT_OBJECT');
+  if (!Object.hasOwn(input, 'resumeRequested')) return false;
+  const value = readDataProperty(input, 'resumeRequested');
+  if (typeof value !== 'boolean') reject('INVALID_RUN_STATE');
+  return value;
+}
+
+/** Plugin-owned saved intent; omission means stopped without a normalization write. */
+export function readResumeRequested(input) {
+  try { return validateResumeRequested(input); } catch (failure) { throw invalidSettings(getDiagnosticCode(failure)); }
+}
+
 /** Validate platform execution paths without filesystem access; an empty cwd is omitted. */
 export function validateSettings(input, platform) {
   try {
@@ -192,7 +218,7 @@ export function isThemeOnlyChange(first, second) {
 /** Compare execution only; cosmetics, text migration, and persisted intent are not execution edits. */
 export function sameExecutionSettings(first, second, platform) {
   try {
-    if (sameStoredFields(first, second, new Set(['themeColor', 'title', 'runRequested']))) return true;
+    if (sameStoredFields(first, second, new Set(['themeColor', 'title', 'runRequested', 'rememberRunningState', 'resumeRequested']))) return true;
     const a = validateSettings(first, platform);
     const b = validateSettings(second, platform);
     return a.executable === b.executable && a.cwd === b.cwd
@@ -240,6 +266,9 @@ export function getInspectorConfiguration(input, platform) {
     }
   } catch (failure) {
     result.diagnosticCode = getDiagnosticCode(failure);
+  }
+  try { result.rememberRunningState = readRememberRunningState(input); } catch (error) {
+    result.diagnosticCode ??= settingsDiagnosticCode(error);
   }
   return result;
 }

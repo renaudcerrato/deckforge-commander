@@ -31,6 +31,7 @@ function fixture(input = initial, dependencies = {}) {
   });
   coordinator.observe(input);
   session = createActionSession({
+    saveResumeRequested: value => coordinator.setResumeRequested(value).then(() => {}),
     initialConnected: true,
     async confirmLaunchSettings(expected) {
       await coordinator.whenIdle();
@@ -126,7 +127,7 @@ for (const superseded of [false, true]) {
     assert.equal(before, 0); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
     assert.equal(expected.at(-1).themeColor, superseded ? '#fedcba' : '#abcdef');
     assert.ok(expected.every(value => value.runRequested === false));
-    assert.deepEqual(h.host.writes.map(value => value.themeColor), superseded ? ['#abcdef', '#fedcba'] : ['#abcdef']);
+    assert.deepEqual(h.host.writes.map(value => value.themeColor), superseded ? ['#969696', '#abcdef', '#fedcba'] : ['#969696', '#abcdef']);
     assert.deepEqual(h.errors, []); assert.equal(h.coordinator.isBlocked(), false); assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
@@ -150,7 +151,7 @@ for (const failure of ['reject', 'mismatch']) {
     // Assert
     assert.deepEqual(h.runs, []); assert.equal(h.coordinator.isBlocked(), true); assert.equal(h.session.getState().persistenceBlocked, true);
     assert.deepEqual(h.errors.at(-1), ['Run state save failed.', 'STATE_SAVE_FAILED']);
-    assert.deepEqual(h.host.writes.map(value => value.runRequested), [false]);
+    assert.deepEqual(h.host.writes.map(value => value.runRequested), [false, false]);
   });
 }
 
@@ -166,7 +167,7 @@ test('suffix-only replacement waits for complete confirmed settings before publi
   // Assert
   assert.deepEqual(before, [['report', '.py']]);
   assert.deepEqual(h.artwork.map(item => [item.caption, item.extension]), [['report', '.py'], ['report', '.sh']]);
-  assert.deepEqual(h.host.writes, [{ ...configured, executable: '/synthetic/report.sh' }]);
+  assert.deepEqual(h.host.writes, [{ ...configured, executable: '/synthetic/report.sh', resumeRequested: false }]);
   assert.deepEqual(h.runs, []); assert.equal(h.session.getState().runRequested, false);
 });
 
@@ -185,7 +186,7 @@ test('failed suffix replacement confirmation retains Error and cannot publish th
   assert.deepEqual(h.errors.at(-1), ['Run state save failed.', 'STATE_SAVE_FAILED']); assert.deepEqual(h.runs, []);
 });
 
-// Success footer requires final-frame settlement, never a settings intent write or readback.
+// Success footer still requires final-frame settlement; terminal intent clearing uses authority separately.
 async function exitedFixture() {
   const h = fixture();
   await h.session.appear(initial); await h.session.press();
@@ -195,7 +196,7 @@ async function exitedFixture() {
 }
 
 for (const output of [false, true]) {
-  test(`natural zero exit ${output ? 'with final output' : 'without output'} publishes exited without settings writes or readback`, options, async () => {
+  test(`natural zero exit ${output ? 'with final output' : 'without output'} clears saved intent and publishes exited without launch confirmation`, options, async () => {
     // Arrange
     const h = fixture(); await h.session.appear(initial); await h.session.press();
     const beforeConfirmations = h.confirmations.length;
@@ -209,8 +210,8 @@ for (const output of [false, true]) {
     assert.equal(h.artwork.at(-1).footer, 'exited');
     assert.equal(h.artwork.at(-1).caption, 'program');
     assert.equal(h.confirmations.length, beforeConfirmations);
-    assert.deepEqual(h.host.settings, initial);
-    assert.deepEqual(h.host.writes, []);
+    assert.deepEqual(h.host.settings, { ...initial, resumeRequested: false });
+    assert.deepEqual(h.host.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
     assert.equal(Object.hasOwn(h.host.settings, 'idleFooter'), false);
     assert.equal(fresh.artwork.at(-1).footer, 'ready');
     assert.deepEqual(fresh.runs, []);
@@ -431,7 +432,7 @@ test('Setup becomes Ready only after matching execution-edit readback and never 
   assert.equal(h.artwork.at(-1).footer, 'ready'); assert.equal(h.artwork.at(-1).caption, 'report');
   assert.equal(h.session.getState().recoveryPending, false); assert.equal(h.session.getState().runRequested, false);
   assert.deepEqual(h.runs, []); assert.deepEqual(h.errors, []);
-  assert.deepEqual(h.host.settings, { executable: '/synthetic/report.py', argsText: '' });
+  assert.deepEqual(h.host.settings, { executable: '/synthetic/report.py', argsText: '', resumeRequested: false });
 });
 test('explicit press during Setup execution-edit confirmation starts once only after matching configuration readback', options, async () => {
   // Arrange
@@ -441,7 +442,8 @@ test('explicit press during Setup execution-edit confirmation starts once only a
   const operation = h.edit({ executable: '/synthetic/report.py' });
   const editedSnapshot = await editRead.entered.promise;
   const beforePress = { state: h.session.getState(), launches: h.runs.length };
-  const startedRead = h.controlConfirmation(), pressing = h.session.press();
+  // Hold the Start save's host readback, not the earlier recovery confirmation.
+  const startedRead = h.controlRead(), pressing = h.session.press();
   const beforeEditConfirmation = h.runs.length;
   editRead.gate.resolve(editedSnapshot);
   const startedSnapshot = await startedRead.entered.promise;
@@ -460,9 +462,9 @@ test('explicit press during Setup execution-edit confirmation starts once only a
   assert.equal(beforeStartedConfirmation.state.cleanupBlocked, false);
   assert.equal(beforeStartedConfirmation.state.persistenceBlocked, false);
   assert.equal(beforeStartedConfirmation.state.protocolBlocked, false);
-  assert.deepEqual(editedSnapshot, { executable: '/synthetic/report.py', argsText: '' });
-  assert.deepEqual(startedSnapshot, editedSnapshot);
-  assert.deepEqual(h.host.writes, [editedSnapshot]);
+  assert.deepEqual(editedSnapshot, { executable: '/synthetic/report.py', argsText: '', resumeRequested: false });
+  assert.deepEqual(startedSnapshot, { ...editedSnapshot, resumeRequested: true });
+  assert.deepEqual(h.host.writes, [editedSnapshot, startedSnapshot]);
   const startedConfirmation = h.confirmations.at(-1);
   assert.equal(startedConfirmation?.confirmed, true);
   assert.deepEqual(startedConfirmation.snapshot, startedSnapshot);
@@ -737,7 +739,7 @@ test('new persistence diagnosis during execution confirmation cannot be cleared 
   assert.equal(h.artwork.slice(before).some(item => item.kind === 'ready'), false);
   assert.equal(h.errors.at(-1)[1], 'STATE_SAVE_FAILED');
   assert.equal(h.runs.length, 1);
-  assert.deepEqual(h.host.writes, [snapshot]);
+  assert.deepEqual(h.host.writes, [{ ...initial, resumeRequested: true }, { ...initial, resumeRequested: false }, snapshot]);
 });
 test('new genuine Start and its current error cannot be cleared by a stale execution-edit confirmation or late host echo', options, async () => {
   // Arrange

@@ -23,17 +23,17 @@ export interface TimerSessionState {
 }
 
 export interface TimerSession {
-	/** Fresh sessions start disabled. Same-session returns restore their retained outcome. */
+	/** Fresh sessions adopt eligible saved resume intent without writing. */
 	appear(settings: unknown): Promise<void>;
 	/** Duplicate/stale events are ignored. Idle setup consumes the gesture, even across configuration edits. */
 	keyDown(): Promise<void>;
 	/** Short release uses the latest press policy; setup taps/holds and active Refresh taps enqueue no launch or stop. */
 	keyUp(): Promise<void>;
-	/** Caller owns complete configuration writes; this module never persists session intent. */
+	/** Caller owns complete configuration writes; plugin intent saves use the injected authority. */
 	applySettings(settings: unknown): Promise<void>;
 	/** Pause future launches, retain due time, and allow an owned process to finish hidden. */
 	disappear(): Promise<void>;
-	/** Disconnect disables and safely stops, including while hidden. Reconnect never enables. */
+	/** Disconnect safely stops. Remembered enabled intent resumes once when connected and visible. */
 	setConnected(connected: boolean): Promise<void>;
 	reconcileAvailability(): Promise<void>;
 	/** Irrecoverable for this session, like cleanup uncertainty; reload is outside this module. */
@@ -62,6 +62,8 @@ export interface TimerSessionDependencies {
 	 * False/rejection for the still-current snapshot permanently blocks this session.
 	 */
 	awaitConfiguration: (expected: StoredSettings) => Promise<boolean>;
+	/** Update authority synchronously on entry; resolve after complete-snapshot save confirmation. */
+	saveResumeRequested?: (value: boolean) => Promise<void>;
 	/** All display callbacks must recheck isCurrent inside their async SDK boundary. */
 	setImage: (image: string, isCurrent: () => boolean) => void | Promise<void>;
 	setTitle: (title: string, isCurrent: () => boolean) => void | Promise<void>;

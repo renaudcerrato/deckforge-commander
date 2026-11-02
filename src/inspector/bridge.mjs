@@ -1,4 +1,4 @@
-import { getInspectorConfiguration, validateTitleEdit } from '../core/settings.mjs';
+import { getInspectorConfiguration, validateTitleEdit, readRememberRunningState } from '../core/settings.mjs';
 import { isAbsoluteExecutionPath } from '../core/execution-paths.mjs';
 import { copyRunSettings } from '../core/run-state.mjs';
 import { normalizeThemeColor } from '../core/theme.mjs';
@@ -121,6 +121,7 @@ export function createInspectorBridge({
     try {
       const project = bindingValid && action === TIMER_ACTION_UUID ? getTimerInspectorConfiguration : getInspectorConfiguration;
       const configuration = project(copyRunSettings(settings), platform);
+      if (!bindingValid || (action !== RUN_ACTION_UUID && action !== TIMER_ACTION_UUID)) delete configuration.rememberRunningState;
       const protectedKeys = protectedFields();
       const code = configuration.diagnosticCode;
       const field = code?.startsWith('ARGS_') || code === 'INVALID_ARGUMENT' ? 'argsText'
@@ -192,6 +193,13 @@ export function createInspectorBridge({
     // Check Timer metadata descriptors before JSON copying, without reading accessors.
     // Timer edits require a recognized current SDK binding, never a remembered UUID.
     try {
+      const remember = Object.getOwnPropertyDescriptor(changes, 'rememberRunningState');
+      if (remember) {
+        if (!bindingValid || (action !== RUN_ACTION_UUID && action !== TIMER_ACTION_UUID)) {
+          failEdit('INVALID_SETTINGS'); return false;
+        }
+        readRememberRunningState(changes);
+      }
       const interval = Object.getOwnPropertyDescriptor(changes, 'intervalSeconds');
       if (interval) {
         if (!bindingValid || action !== TIMER_ACTION_UUID) { failEdit('INVALID_SETTINGS'); return false; }
@@ -213,6 +221,10 @@ export function createInspectorBridge({
     }
     if (Object.keys(edit).length === 0) return false;
     for (const [key, value] of Object.entries(edit)) {
+      if (key === 'rememberRunningState' && bindingValid && (action === RUN_ACTION_UUID || action === TIMER_ACTION_UUID)) {
+        if (typeof value !== 'boolean') { failEdit('INVALID_SETTINGS'); return false; }
+        continue;
+      }
       if (key === 'title') {
         try { validateTitleEdit(value); } catch { failEdit('TITLE_INVALID'); return false; }
         continue;
@@ -248,7 +260,7 @@ export function createInspectorBridge({
     if (transportFailed) return true;
     let changed = false;
     for (const [key, value] of Object.entries(edit)) {
-      if ((key === 'themeColor' || key === 'intervalSeconds' || key === 'actionOnPress') && dirtyValues.get(key) === value) continue;
+      if ((key === 'themeColor' || key === 'intervalSeconds' || key === 'actionOnPress' || key === 'rememberRunningState') && dirtyValues.get(key) === value) continue;
       versions.set(key, (versions.get(key) ?? 0) + 1);
       dirtyValues.set(key, value);
       changed = true;

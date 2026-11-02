@@ -20,6 +20,8 @@ type TimerSettings = {
 	title?: SettingsJson;
 	intervalSeconds?: number;
 	actionOnPress?: TimerActionOnPress;
+	rememberRunningState?: boolean;
+	resumeRequested?: boolean;
 };
 
 type TimerTiming = Pick<TimerSessionDependencies, "now" | "setTimer" | "clearTimer">;

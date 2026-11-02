@@ -96,11 +96,14 @@ function parseIntervalText(value) {
 export function createInspectorController({
   executable, argsText, cwd, title, themeColor, status, bridge,
   intervalPreset, intervalSeconds, actionOnPress, timerControls, customInterval,
+  rememberRunningState, rememberControls,
 }) {
   let hydrating = false;
   let selectedExecutable = '';
   let selectedTheme = DEFAULT_THEME_COLOR;
   let timerBinding;
+  let rememberEnabled = false;
+  let lastRemember;
   let lastValidSeconds;
   let lastValidPolicy;
   let customSelected = false;
@@ -139,6 +142,10 @@ export function createInspectorController({
       cwd.requestUpdate?.();
     }
     const enabled = snapshot?.bindingValid === true && snapshot.actionUuid === TIMER_ACTION_UUID;
+    rememberEnabled = snapshot?.bindingValid === true
+      && (snapshot.actionUuid === RUN_ACTION_UUID || snapshot.actionUuid === TIMER_ACTION_UUID);
+    if (rememberControls) rememberControls.hidden = !rememberEnabled;
+    if (!rememberEnabled) { lastRemember = undefined; assign(rememberRunningState, false); }
     const same = enabled && timerBinding && timerBinding.version === snapshot.version
       && timerBinding.context === snapshot.context && timerBinding.inspectorId === snapshot.inspectorId;
     const sameStatusBinding = statusBinding && statusBinding.version === snapshot?.version
@@ -218,6 +225,10 @@ export function createInspectorController({
       assign(themeColor, selectedTheme);
     }
     hydrateInterval(configuration, protectedFields);
+    if (rememberEnabled && !protectedFields.has('rememberRunningState')) {
+      lastRemember = typeof configuration.rememberRunningState === 'boolean' ? configuration.rememberRunningState : undefined;
+      assign(rememberRunningState, lastRemember ?? false);
+    }
     if (timerBinding && !protectedFields.has('actionOnPress')) {
       const policy = configuration.actionOnPress;
       lastValidPolicy = policy === 'refresh' || policy === 'stop' ? policy : undefined;
@@ -264,6 +275,14 @@ export function createInspectorController({
     if (policy !== lastValidPolicy && bridge.edit({ actionOnPress: policy }, { immediate: true })) {
       lastValidPolicy = policy;
     } else if (policy === lastValidPolicy) renderStatus();
+  });
+
+  listen(rememberRunningState, () => {
+    syncActionBinding();
+    if (!rememberEnabled) return;
+    const value = rememberRunningState.value;
+    if (typeof value !== 'boolean') { showError('INVALID_SETTINGS'); return; }
+    if (value !== lastRemember && bridge.edit({ rememberRunningState: value }, { immediate: true })) lastRemember = value;
   });
 
   listen(intervalPreset, () => {
@@ -351,6 +370,8 @@ function install(window, document) {
       actionOnPress: document.getElementById('actionOnPress'),
       timerControls: document.getElementById('timer-controls'),
       customInterval: document.getElementById('custom-interval'),
+      rememberRunningState: document.getElementById('rememberRunningState'),
+      rememberControls: document.getElementById('remember-controls'),
       status: document.getElementById('settings-status'),
       bridge,
     });

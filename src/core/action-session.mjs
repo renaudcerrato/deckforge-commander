@@ -1,4 +1,4 @@
-import { classifySettings, settingsDiagnosticCode, sameExecutionSettings, validateSettings } from './settings.mjs';
+import { classifySettings, settingsDiagnosticCode, sameExecutionSettings, validateSettings, readRememberRunningState, readResumeRequested } from './settings.mjs';
 import { copyRunSettings } from './run-state.mjs';
 import { createLatestFrameQueue } from './latest-frame-queue.mjs';
 import { getReadyTitle, getExecutableExtension } from './key-layout.mjs';
@@ -24,9 +24,10 @@ const LAUNCH_REASON_DIAGNOSTICS = new Set([
 export function createActionSession({
   startRun, setImage, setTitle, onError, initialConnected = false, onPresentation = () => {},
   confirmLaunchSettings = async () => true,
+  saveResumeRequested = async () => {},
   platform,
 }) {
-  if ([startRun, setImage, setTitle, onError, onPresentation, confirmLaunchSettings]
+  if ([startRun, setImage, setTitle, onError, onPresentation, confirmLaunchSettings, saveResumeRequested]
     .some(callback => typeof callback !== 'function')) {
     throw new TypeError('Action session dependencies must be functions.');
   }
@@ -45,6 +46,7 @@ export function createActionSession({
   let generation;
   let startAttempt;
   let startProvenance;
+  let restorePending = false;
   let intentVersion = 0;
   let displayVersion = 0;
   let presentationVersion = 0;
@@ -68,6 +70,7 @@ export function createActionSession({
   const queues = new Set();
   const errorDisplays = new Set();
   const presentations = new Set();
+  const intentWrites = new Set();
 
   function schedule(operation) {
     const result = tail.then(operation, operation);
@@ -76,9 +79,27 @@ export function createActionSession({
   }
 
   function available() { return visible && connected; }
+  function remembersRunning() {
+    try { return readRememberRunningState(desiredSettings); } catch { return false; }
+  }
+  function persistResume(value) {
+    if (!hasSettings || persistenceBlocked) return;
+    try {
+      if (!value && Object.getOwnPropertyDescriptor(desiredSettings, 'resumeRequested')?.value !== true) return;
+      if (readResumeRequested(desiredSettings) === value) return;
+      desiredSettings = { ...copyRunSettings(desiredSettings), resumeRequested: value };
+      const pending = Promise.resolve(saveResumeRequested(value)).catch(() => { void persistenceFailed(); });
+      intentWrites.add(pending);
+      void pending.then(() => intentWrites.delete(pending));
+    } catch { void persistenceFailed(); }
+  }
   function ownsRun(run) { return generation === run && run.intentVersion === intentVersion; }
   function isSilentResume() {
     return requested && startProvenance?.intent === intentVersion && startProvenance.resuming;
+  }
+  function shouldConsumeResume() {
+    return requested && !remembersRunning()
+      && (!available() || ((restorePending || isSilentResume()) && !generation?.executionActive));
   }
   function currentDisplay(run) {
     return available() && generation === run && run.displayValid && run.displayVersion === displayVersion;
@@ -329,6 +350,11 @@ export function createActionSession({
     const changed = hasSettings && !unchangedSnapshot && !sameExecutionSettings(desiredSettings, next, platform);
     desiredSettings = next;
     captionChanged = previousCaption !== caption();
+    if (!hasSettings && classification?.kind === 'configured') {
+      requested = readResumeRequested(next) && remembersRunning();
+      restorePending = requested;
+      if (requested) ++intentVersion;
+    }
     hasSettings = true;
     return changed;
   }
@@ -343,6 +369,7 @@ export function createActionSession({
 
   function latchCleanup() {
     cleanupBlocked = true;
+    persistResume(false);
     retainError('Process cleanup uncertain.', 'CLEANUP_BLOCKED');
     if (cleanupReported) return;
     cleanupReported = true;
@@ -375,9 +402,11 @@ export function createActionSession({
     if (run.intentStopped) return;
     run.intentStopped = true;
     requested = false;
+    restorePending = false;
     startProvenance = undefined;
     run.executionActive = false;
     run.intentVersion = ++intentVersion;
+    persistResume(false);
   }
 
   function errorCode(run) {
@@ -522,6 +551,7 @@ export function createActionSession({
   }
 
   function startGeneration(execution, intent, display) {
+    restorePending = false;
     const run = {
       intentVersion: intent, displayVersion: display, displayValid: true, executionActive: true,
       completed: false, stopRequested: false, errors: new Set(), run: undefined, queue: undefined,
@@ -628,11 +658,14 @@ export function createActionSession({
   function stopForIntent(diagnosticCode, recoverExecution = false) {
     resetIdleFooter();
     requested = false;
+    restorePending = false;
     startAttempt = undefined;
     startProvenance = undefined;
     const intent = ++intentVersion;
     const display = ++displayVersion;
     invalidateDisplay();
+    if (generation) void requestRunStop(generation, 'intent');
+    persistResume(false);
     phase = 'stopping';
     const recovery = recoverExecution
       ? { intent, settings: desiredSettings, diagnosis: diagnosisVersion }
@@ -654,12 +687,13 @@ export function createActionSession({
     });
   }
 
-  function prepareStart() {
+  function prepareStart(saveIntent = false) {
     if (!classification) return stopForIntent(configurationDiagnostic ?? 'INVALID_SETTINGS');
     let execution;
     try { execution = validateSettings(desiredSettings, platform); } catch (error) {
       return stopForIntent(settingsDiagnosticCode(error));
     }
+    if (saveIntent) persistResume(remembersRunning());
     const intent = intentVersion;
     // An entered Start belongs to this intent even before configuration confirmation or spawn completes.
     // Initial unavailability alone never establishes resume provenance.
@@ -719,6 +753,7 @@ export function createActionSession({
   }
 
   function pause() {
+    if (!remembersRunning()) return stopForIntent();
     // Arm suppression before appear can refresh cosmetics from a retained built-in.
     if (requested && startProvenance?.intent === intentVersion) {
       startProvenance = { intent: intentVersion, resuming: true };
@@ -755,8 +790,9 @@ export function createActionSession({
 
   function appear(settings) {
     const changed = updateSettings(settings);
+    const cancelResume = shouldConsumeResume();
     visible = true;
-    if (changed) return stopForIntent(undefined, true);
+    if (changed || cancelResume) return stopForIntent(undefined, changed);
     if (cosmeticChanged || captionChanged) void refreshAppearance(!cosmeticChanged);
     return reconcileAvailability();
   }
@@ -777,13 +813,16 @@ export function createActionSession({
     editRecovery = undefined;
     resetIdleFooter();
     requested = true;
+    restorePending = false;
     startProvenance = undefined;
     ++intentVersion;
-    return prepareStart();
+    return prepareStart(true);
   }
 
   function applySettings(settings) {
     const changed = updateSettings(settings);
+    if (shouldConsumeResume()) return stopForIntent();
+    if (!changed && requested && remembersRunning()) persistResume(true);
     if (!changed) return cosmeticChanged || captionChanged ? refreshAppearance(!cosmeticChanged) : tail;
     return stopForIntent(undefined, true);
   }
@@ -800,6 +839,7 @@ export function createActionSession({
     editRecovery = undefined;
     retainError('Run state save failed.', 'STATE_SAVE_FAILED');
     requested = false;
+    restorePending = false;
     startAttempt = undefined;
     startProvenance = undefined;
     ++intentVersion;
@@ -819,8 +859,8 @@ export function createActionSession({
       const current = tail;
       await current;
       await Promise.all([...queues].map(queue => queue.whenIdle()));
-      await Promise.all([...errorDisplays, ...presentations]);
-      if (current === tail && errorDisplays.size === 0 && presentations.size === 0) return;
+      await Promise.all([...errorDisplays, ...presentations, ...intentWrites]);
+      if (current === tail && errorDisplays.size === 0 && presentations.size === 0 && intentWrites.size === 0) return;
     }
   }
 

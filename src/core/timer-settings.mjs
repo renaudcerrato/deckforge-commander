@@ -1,5 +1,5 @@
 import {
-  classifySettings, getInspectorConfiguration, sameExecutionSettings, settingsDiagnosticCode, validateSettings, validateExecutionEdit, validateTitleEdit,
+  classifySettings, getInspectorConfiguration, sameExecutionSettings, settingsDiagnosticCode, validateSettings, validateExecutionEdit, validateTitleEdit, readRememberRunningState,
 } from './settings.mjs';
 import { normalizeThemeColor } from './theme.mjs';
 import { copySettings, createSettingsAuthority } from './settings-authority.mjs';
@@ -9,7 +9,7 @@ export const MIN_INTERVAL_SECONDS = 1;
 export const MAX_INTERVAL_SECONDS = 86_400;
 export const DEFAULT_ACTION_ON_PRESS = 'refresh';
 
-const SETTINGS_KEYS = new Set(['executable', 'args', 'argsText', 'cwd', 'themeColor', 'title', 'intervalSeconds', 'actionOnPress']);
+const SETTINGS_KEYS = new Set(['executable', 'args', 'argsText', 'cwd', 'themeColor', 'title', 'intervalSeconds', 'actionOnPress', 'rememberRunningState', 'resumeRequested']);
 const EXECUTION_EDIT_KEYS = new Set(['executable', 'argsText', 'cwd']);
 
 function invalidSettings(code = 'INVALID_SETTINGS') {
@@ -112,6 +112,16 @@ export function sameTimerInterval(first, second) {
   try { return readIntervalSeconds(first) === readIntervalSeconds(second); } catch { return false; }
 }
 
+/** Save decisions compare execution, not preserved unknown JSON or Loop metadata. */
+function executionFields(input) {
+  const projection = {};
+  for (const key of ['executable', 'args', 'argsText', 'cwd']) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (descriptor) Object.defineProperty(projection, key, descriptor);
+  }
+  return projection;
+}
+
 /** Read-only controls; invalid stored metadata never displays a guessed default. */
 export function getTimerInspectorConfiguration(input, platform) {
   const configuration = getInspectorConfiguration(input, platform);
@@ -128,7 +138,7 @@ export function getTimerInspectorConfiguration(input, platform) {
   return configuration;
 }
 
-/** Narrow PI edits preserve complete JSON/legacy data and never synthesize persistent intent. */
+/** PI edits preserve complete JSON and atomically cancel saved intent for execution/off edits. */
 export function applyTimerConfigurationEdit(settings, changes, platform) {
   const next = copySettings(settings);
   // Validate before the JSON copy so non-finite numeric intervals have the same
@@ -154,6 +164,8 @@ export function applyTimerConfigurationEdit(settings, changes, platform) {
       next.intervalSeconds = validateInterval(edit.intervalSeconds);
     } else if (key === 'actionOnPress') {
       next.actionOnPress = validateActionOnPress(edit.actionOnPress);
+    } else if (key === 'rememberRunningState') {
+      next.rememberRunningState = readRememberRunningState(edit);
     } else {
       validateExecutionEdit(key, edit[key], platform);
       next[key] = edit[key];
@@ -161,6 +173,8 @@ export function applyTimerConfigurationEdit(settings, changes, platform) {
   }
   if (keys.some(key => EXECUTION_EDIT_KEYS.has(key))
     && !Object.hasOwn(next, 'argsText') && !Object.hasOwn(next, 'args')) next.argsText = '';
+  if (!sameExecutionSettings(executionFields(settings), executionFields(next), platform)
+    || edit.rememberRunningState === false) next.resumeRequested = false;
   return next;
 }
 
@@ -179,7 +193,7 @@ function saveError() {
   return error;
 }
 
-/** Configuration persistence only: no enabled state, scheduling, process cleanup, or intent writes. */
+/** Complete snapshot authority; only the plugin can update saved resume intent. */
 export function createTimerStateCoordinator({
   writeSettings, readSettings, onFailure = () => {}, timeoutMs = 5_000,
   setTimer = setTimeout, clearTimer = clearTimeout,
@@ -195,5 +209,14 @@ export function createTimerStateCoordinator({
     try { return save(applyTimerConfigurationEdit(getSettings(), changes, platform)); } catch (error) { return Promise.reject(error); }
   }
 
-  return { observe, getSettings, editConfiguration, whenIdle, isBlocked, getRevision };
+  function setResumeRequested(value) {
+    if (typeof value !== 'boolean') return Promise.reject(invalidSettings('INVALID_RUN_STATE'));
+    try {
+      const next = getSettings();
+      next.resumeRequested = value && readRememberRunningState(next);
+      return save(next);
+    } catch (error) { return Promise.reject(error); }
+  }
+
+  return { observe, getSettings, editConfiguration, setResumeRequested, whenIdle, isBlocked, getRevision };
 }

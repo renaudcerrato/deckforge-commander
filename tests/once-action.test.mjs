@@ -133,7 +133,7 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
       if (kind !== 'Stream') await adapter.onKeyUp({ action: r, payload: { settings } });
       await h.idle();
       // Assert
-      assert.deepEqual(r.writes, []);
+      assert.deepEqual(r.writes, kind === 'Run' || label === 'malformed' ? [] : [{ ...settings, resumeRequested: true }]);
       if (label === 'malformed') {
         assert.deepEqual(h.launches, []);
         assert.ok(h.logs.includes('SETTINGS_REJECTED_ON_APPEAR: ARGS_TEXT_INVALID'), JSON.stringify(h.logs));
@@ -196,7 +196,9 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
       for (const code of outcome === 'success' ? ['PROCESS_STDOUT_FIRST_DATA', 'PROCESS_STDERR_FIRST_DATA', 'PROCESS_EXITED_SUCCESSFULLY']
         : ['PROCESS_LAUNCH_FAILED', 'PROCESS_LAUNCH_REASON_ENOENT']) assert.ok(h.logs.includes(code));
       assert.equal(JSON.stringify(h.logs).includes('PRIVATE'), false);
-      assert.deepEqual(h.logs, beforeUntrustedTrace); assert.equal(h.replies.length, repliesBefore); assert.deepEqual(r.writes, []);
+      assert.deepEqual(h.logs, beforeUntrustedTrace); assert.equal(h.replies.length, repliesBefore);
+      const intentWrites = kind === 'Run' ? [] : kind === 'Loop' && outcome === 'success' ? [true] : [true, false];
+      assert.deepEqual(r.writes, intentWrites.map(resumeRequested => ({ ...settings, resumeRequested })));
       if (outcome === 'success') {
         // Privacy does not require a long captioned headline to avoid ellipsis.
         const artwork = createPrimitiveArtwork(producerUpdate);
@@ -258,7 +260,7 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     assert.equal(launched.env.ELGATO_ACTION_THEME_COLOR, '#969696');
     assert.equal(Object.hasOwn(launched.env, 'elgato_action_context'), false);
     assert.equal(cosmeticStops, 0); assert.equal(launched.stops, 1); assert.equal(h.launches.length, 1);
-    assert.deepEqual(r.writes.at(-1), { ...settings, executable: 'D:/synthetic/new.EXE', themeColor: '#abcdef' });
+    assert.deepEqual(r.writes.at(-1), { ...settings, executable: 'D:/synthetic/new.EXE', themeColor: '#abcdef', ...(kind === 'Run' ? {} : { resumeRequested: false }) });
     assert.equal(Object.hasOwn(r.writes.at(-1), 'platform'), false);
     assert.match(svg(images(r)[0]), />é report<\/text>/); assert.match(svg(images(r)[0]), />\.exe<\/text>/);
   });
@@ -430,6 +432,8 @@ test('actual Run Setup gesture stays consumed through PI selection; next deliber
   assert.equal(h.replies.at(-1).status, 'saved');
 });
 for (const input of [{ ...base, runRequested: true }, { ...base, intervalSeconds: 1 }, { ...base, actionOnPress: 'stop' },
+  { ...base, rememberRunningState: true }, { ...base, rememberRunningState: false },
+  { ...base, resumeRequested: true }, { ...base, resumeRequested: false },
   { ...base, executable: 'relative' }, { ...base, argsText: "'unterminated" }]) {
   test('actual Run invalid execution or foreign controls show Error without launch, hydration repair or retry', options, async t => {
     // Arrange
@@ -621,7 +625,8 @@ for (const [suffix, expected] of [
     assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
   });
 }
-for (const changes of [{ intervalSeconds: 10 }, { actionOnPress: 'stop' }, { runRequested: true }, { executable: '' }]) {
+for (const changes of [{ intervalSeconds: 10 }, { actionOnPress: 'stop' }, { runRequested: true },
+  { rememberRunningState: true }, { rememberRunningState: false }, { resumeRequested: true }, { resumeRequested: false }, { executable: '' }]) {
   test('actual Run PI rejects foreign controls and empty executable without replacing busy owner', options, async t => {
     // Arrange
     const h = harness(t), r = runtime(); await h.appear(r); await h.claim(r); await h.tap(r);
@@ -758,7 +763,10 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
       // Assert
       assert.deepEqual(snapshot, a); assert.match(artwork, />moved A<\/text>.*>ready<\/text>/);
       assert.equal(h.launches.length, before + 1);
-      assert.deepEqual(target.writes, []); assert.deepEqual(source.writes, []);
+      const previous = destination === 'previously occupied' && kind !== 'Run'
+        ? [true, false].map(resumeRequested => ({ ...base, title: 'old B', resumeRequested })) : [];
+      assert.deepEqual(target.writes, [...previous, ...(kind === 'Run' ? [] : [{ ...a, resumeRequested: true }])]);
+      assert.deepEqual(source.writes, []);
     });
   }
 
@@ -825,7 +833,9 @@ for (const [from, to] of [['Stream', 'Loop'], ['Loop', 'Run'], ['Run', 'Stream']
     const afterRelease = h.launches.length;
     if (afterRelease === 1) await next.tap(moved);
     assert.equal(h.launches.length, 2); assert.equal(launch.stops, 1);
-    assert.equal(h.launches[1].env.ELGATO_ACTION_UUID, next.uuid); assert.deepEqual(r.writes, []);
+    assert.equal(h.launches[1].env.ELGATO_ACTION_UUID, next.uuid);
+    assert.deepEqual(r.writes, [...(from === 'Run' ? [] : [{ ...base, title: from, resumeRequested: true }]),
+      ...(to === 'Run' ? [] : [{ ...base, title: to, resumeRequested: true }])]);
   });
 }
 
@@ -886,7 +896,9 @@ for (const kind of ['Loop', 'Run']) {
     await f.tap(moved);
     // Assert: cleanup and persistence uncertainty are separate safety gates.
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
-    assert.deepEqual(r.writes, [{ ...b, argsText: 'B-local' }]); assert.equal(h.replies.at(-1).status, 'saved');
+    assert.deepEqual(r.writes, kind === 'Loop'
+      ? [{ ...a, resumeRequested: true }, { ...b, argsText: 'B-local', resumeRequested: false }]
+      : [{ ...b, argsText: 'B-local' }]); assert.equal(h.replies.at(-1).status, 'saved');
     assert.equal(images(moved).at(-1), createErrorArtwork('CLEANUP_BLOCKED'));
   });
 }

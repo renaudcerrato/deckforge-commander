@@ -9,7 +9,7 @@ export declare const DEFAULT_ACTION_ON_PRESS: 'refresh';
 
 export type TimerActionOnPress = 'refresh' | 'stop';
 
-/** No persistent enabled state or Run intent belongs to Timer settings. */
+/** Saved resume intent is plugin-owned; legacy Stream runRequested remains invalid. */
 export interface TimerSettingsInput {
 	executable: string;
 	args?: string[] | string;
@@ -21,6 +21,8 @@ export interface TimerSettingsInput {
 	intervalSeconds?: number;
 	/** Omission reads as Refresh without writing; only the two exact enum strings are valid. */
 	actionOnPress?: TimerActionOnPress;
+	rememberRunningState?: boolean;
+	resumeRequested?: boolean;
 }
 
 export interface TimerConfiguration {
@@ -44,14 +46,16 @@ export interface TimerConfigurationEdit {
 	title?: string;
 	intervalSeconds?: number;
 	actionOnPress?: TimerActionOnPress;
+	rememberRunningState?: boolean;
 }
 
 export interface TimerStateCoordinator {
 	/** Shared authority's adopt-once, detached, no-hydration-write contract. */
 	observe: SettingsAuthority['observe'];
 	getSettings(): StoredSettings;
-	/** Only allowlisted control edits; no complete replacement or persisted intent API. */
+	/** Only allowlisted PI control edits; no complete replacement or PI intent edits. */
 	editConfiguration(changes: unknown): Promise<SaveResult>;
+	setResumeRequested(value: boolean): Promise<SaveResult>;
 	whenIdle(): Promise<void>;
 	isBlocked(): boolean;
 	getRevision(): number;

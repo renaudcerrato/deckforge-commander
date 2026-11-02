@@ -21,6 +21,7 @@ function sessionHarness(overrides = {}) {
   });
   state.observe(settings);
   const session = createActionSession({
+    saveResumeRequested: value => state.setResumeRequested(value).then(() => {}),
     async confirmLaunchSettings(expected) {
       await state.whenIdle();
       return !state.isBlocked() && equalJson(expected, state.getSettings());
@@ -35,7 +36,7 @@ function sessionHarness(overrides = {}) {
     async setTitle() {}, onError: (message, code) => errors.push([message, code]),
     ...overrides,
   });
-  return { session, runs, saves, images, errors };
+  return { session, runs, saves, images, errors, getSettings: state.getSettings };
 }
 
 // Session-local intent: a copied legacy flag is data, never availability authority.
@@ -128,9 +129,9 @@ test('visible disconnect pauses execution and reconnect resumes remembered Start
   assert.equal(paused.visible, true);
   assert.equal(paused.runRequested, true);
   assert.equal(paused.connected, false);
-  assert.equal(h.runs[0].stops, 1);
-  assert.equal(h.runs.length, 2);
-  assert.deepEqual(h.saves, []);
+    assert.equal(h.runs[0].stops, 1);
+    assert.equal(h.runs.length, 2);
+    assert.deepEqual(h.saves, [{ ...settings, resumeRequested: true }]);
 });
 
 test('reconnect while hidden preserves Started but never launches until appearance', options, async () => {
@@ -145,7 +146,7 @@ test('reconnect while hidden preserves Started but never launches until appearan
   device.isConnected = false; e.emit('disconnect', device); await e.manager.whenIdle();
   device.isConnected = true; e.emit('connect', device); e.emit('wake'); await e.manager.whenIdle();
   const before = h.runs.length;
-  await h.session.appear(settings);
+  await h.session.appear(h.getSettings());
   // Assert
   assert.equal(before, 1);
   assert.equal(h.runs.length, 2);
@@ -161,14 +162,14 @@ for (const order of ['wake-first', 'appearance-first']) {
     await h.session.appear(settings);
     await h.session.press();
     // Act
-    if (order === 'wake-first') { e.emit('wake'); await e.manager.whenIdle(); await h.session.appear(settings); }
-    else { await h.session.appear(settings); e.emit('wake'); await e.manager.whenIdle(); }
-    e.emit('wake'); e.emit('wake'); await h.session.appear(settings);
+    if (order === 'wake-first') { e.emit('wake'); await e.manager.whenIdle(); await h.session.appear(h.getSettings()); }
+    else { await h.session.appear(h.getSettings()); e.emit('wake'); await e.manager.whenIdle(); }
+    e.emit('wake'); e.emit('wake'); await h.session.appear(h.getSettings());
     await e.manager.whenIdle();
     // Assert
     assert.equal(h.runs.length, 1);
     assert.equal(h.runs[0].stops, 0);
-    assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.saves, [{ ...settings, resumeRequested: true }]);
   });
 }
 
@@ -180,8 +181,8 @@ for (const order of ['wake-first', 'appearance-first']) {
     await e.manager.track('key', { session: h.session, getDevice: () => device });
     await h.session.appear(settings); await h.session.press(); await h.session.disappear();
     // Act
-    if (order === 'wake-first') { e.emit('wake'); await e.manager.whenIdle(); await h.session.appear(settings); }
-    else { await h.session.appear(settings); e.emit('wake'); await e.manager.whenIdle(); }
+    if (order === 'wake-first') { e.emit('wake'); await e.manager.whenIdle(); await h.session.appear(h.getSettings()); }
+    else { await h.session.appear(h.getSettings()); e.emit('wake'); await e.manager.whenIdle(); }
     e.emit('wake'); await e.manager.whenIdle();
     // Assert
     assert.equal(h.runs.length, 2);
@@ -212,7 +213,7 @@ for (const terminal of ['manual', 'success', 'nonzero', 'signal', 'launch']) {
     // Assert
     assert.equal(h.runs.length, 1);
     assert.equal(h.session.getState().runRequested, false);
-    assert.deepEqual(h.saves, []);
+    assert.deepEqual(h.saves, [{ ...settings, resumeRequested: true }, { ...settings, resumeRequested: false }]);
   });
 }
 
@@ -277,7 +278,7 @@ test('owning device events leave independent keys and devices untouched', option
   assert.equal(first.runs[0].stops, 1);
   assert.equal(second.runs[0].stops, 0);
   assert.equal(second.session.getState().connected, true);
-  assert.deepEqual(second.saves, []);
+  assert.deepEqual(second.saves, [{ ...settings, resumeRequested: true }]);
 });
 
 for (const device of [undefined, {}, { id: '', isConnected: true }, { id: 'unknown', isConnected: 'true' }, { id: 'virtual', type: 'virtual', isConnected: false }]) {
@@ -338,5 +339,5 @@ test('listener-only disposal is idempotent and does not imply OS/process shutdow
   // Assert
   assert.deepEqual([...e.disposals].sort(), ['connect', 'disconnect', 'wake']);
   assert.equal(h.runs[0].stops, 0);
-  assert.deepEqual(h.saves, []);
+  assert.deepEqual(h.saves, [{ ...settings, resumeRequested: true }]);
 });

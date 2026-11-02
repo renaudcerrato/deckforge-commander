@@ -65,6 +65,18 @@ function harness(overrides = {}) {
   return { bridge, controller, fields, sockets, timers, errors, statuses, connections, normal, connect, ready, reply, last, tick };
 }
 
+for (const resumeRequested of [true, false]) {
+  test(`Stream inspector cannot edit saved intent ${resumeRequested} even inside a mixed configuration edit`, () => {
+    // Arrange
+    const h = harness(); h.ready({ ...initial, resumeRequested: true }); const before = h.normal().length;
+    // Act
+    const accepted = h.bridge.edit({ title: 'not saved', resumeRequested }, { immediate: true });
+    // Assert
+    assert.equal(accepted, false); assert.equal(h.normal().length, before); assert.equal(h.errors.at(-1), 'INVALID_SETTINGS');
+    h.controller.dispose(); h.bridge.disconnect();
+  });
+}
+
 test('repeat import results update controls successively; duplicate and reordered outcomes cannot revert them', () => {
   // Arrange: sequence ordering is a safety contract, not arrival-time deduplication.
   const h = harness(); h.ready(); const { request } = registerImport(h);

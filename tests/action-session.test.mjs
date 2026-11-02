@@ -13,6 +13,31 @@ const execution = { executable: settings.executable, args: settings.args };
 const update = name => parseOutputUpdate(`<svg>${name}</svg>`);
 const displayed = name => [['title', ''], ['image', update(name).image]];
 
+// RESTART: initial adoption restores host intent without a normalization save.
+for (const resumeRequested of [undefined, false, true]) for (const rememberRunningState of [true, false]) {
+  test(`Stream first snapshot resume=${String(resumeRequested)} remember=${rememberRunningState} gates restoration`, options, async () => {
+    // Arrange
+    const saved = [], h = harness({ saveResumeRequested(value) { saved.push(value); } });
+    const input = { ...settings, rememberRunningState, ...(resumeRequested === undefined ? {} : { resumeRequested }) };
+    // Act
+    await h.session.appear(input); await h.session.appear(input); await h.session.setConnected(true); await h.session.reconcileAvailability(); await h.session.whenIdle();
+    // Assert
+    assert.equal(h.runs.length, Number(resumeRequested === true && rememberRunningState)); assert.deepEqual(saved, []);
+    assert.equal(input.runRequested, true);
+  });
+}
+test('Stream stale terminal callbacks cannot clear a later manually started saved intent', options, async () => {
+  // Arrange
+  const saved = [], h = harness({ saveResumeRequested(value) { saved.push(value); } }); await h.start(settings); const old = h.runs[0];
+  // Act
+  await h.session.press(); await h.session.press(); const before = [...saved];
+  old.callbacks.onDiagnostic('PROCESS_EXITED_SUCCESSFULLY'); old.callbacks.onError('Image protocol error.'); old.resolve({ status: 'success' });
+  await h.session.whenIdle();
+  // Assert
+  assert.deepEqual(before, [true, false, true]); assert.deepEqual(saved, before); assert.equal(h.runs.length, 2);
+  assert.equal(h.session.getState().runRequested, true);
+});
+
 test('P1 Stream drains an active producer skipped at title when its queued cosmetic also becomes terminal-stale', options, async () => {
   // Arrange: neither gated title completion is an image handoff.
   const producerTitle = deferred(), producerEntered = deferred(), cosmeticTitle = deferred(), cosmeticEntered = deferred();
@@ -55,7 +80,7 @@ for (const superseded of [false, true]) {
     // Assert: stale rejection reconfirms latest complete JSON, current rejection stays blocked.
     assert.equal(h.session.getState().persistenceBlocked, !superseded);
     assert.equal(h.session.getState().recoveryPending, false);
-    assert.deepEqual(snapshots, superseded ? [settings, next, themed] : [settings, next]);
+    assert.deepEqual(snapshots, superseded ? [{ ...settings, resumeRequested: true }, next, themed] : [{ ...settings, resumeRequested: true }, next]);
     assert.deepEqual(h.errors, superseded ? [] : ['Run state save failed.']);
     assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1);
   });
@@ -688,6 +713,60 @@ test('replacement generation cannot replay a disposed old producer alternate or 
   assert.equal(h.session.getState().runRequested, true);
   assert.equal(h.session.getState().presentation, 'streaming');
 });
+// REMEMBER: availability is not a new Start, and disabling cannot resurrect consumed intent.
+for (const loss of ['hide', 'disconnect']) for (const preference of [undefined, true, false]) {
+  test(`Stream ${loss} remember=${String(preference)} restores only eligible session intent`, options, async () => {
+    // Arrange
+    const input = { ...settings, ...(preference === undefined ? {} : { rememberRunningState: preference }) };
+    const h = displayHarness(); await h.start(input);
+    // Act
+    await (loss === 'hide' ? h.session.disappear() : h.session.setConnected(false));
+    const paused = h.session.getState(), beforeReturn = h.handoffs.length;
+    await (loss === 'hide' ? h.session.appear(input) : h.session.setConnected(true));
+    await h.session.reconcileAvailability(); await h.session.whenIdle();
+    const returned = h.runs.length;
+    await h.session.applySettings({ ...input, rememberRunningState: true }); await h.session.reconcileAvailability();
+    // Assert
+    assert.equal(paused.runRequested, preference !== false); assert.equal(h.runs[0].stops, 1);
+    assert.equal(returned, preference === false ? 1 : 2); assert.equal(h.runs.length, returned);
+    if (preference !== false) assert.deepEqual(h.handoffs.slice(beforeReturn), []);
+    assert.equal(input.runRequested, true); assert.deepEqual(h.errors, []);
+  });
+}
+test('Stream disabling remember while active preserves execution and output until availability loss', options, async () => {
+  // Arrange
+  const h = harness(); await h.start(settings); h.runs[0].callbacks.onUpdate(update('retained')); await h.session.whenIdle();
+  const before = [...h.display];
+  // Act
+  await h.session.applySettings({ ...settings, rememberRunningState: false });
+  const active = { runs: h.runs.length, stops: h.runs[0].stops, intent: h.session.getState().runRequested, display: [...h.display] };
+  await h.session.disappear(); await h.session.appear({ ...settings, rememberRunningState: false });
+  // Assert
+  assert.deepEqual(active, { runs: 1, stops: 0, intent: true, display: before });
+  assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1); assert.equal(h.session.getState().runRequested, false);
+});
+for (const stage of ['hidden', 'confirmation']) {
+  test(`Stream disabling remember during ${stage} consumes automatic resume even if later enabled`, options, async () => {
+    // Arrange
+    const gate = deferred(), entered = deferred(); let holdConfirmation = false;
+    const h = harness({ async confirmLaunchSettings() {
+      if (holdConfirmation) { holdConfirmation = false; entered.resolve(); return gate.promise; } return true;
+    } });
+    await h.start(settings); await h.session.disappear();
+    let returning;
+    if (stage === 'confirmation') {
+      holdConfirmation = true; returning = h.session.appear(settings); await entered.promise;
+    }
+    // Act
+    const off = h.session.applySettings({ ...settings, rememberRunningState: false });
+    gate.resolve(true); await Promise.all([off, returning]);
+    await h.session.applySettings({ ...settings, rememberRunningState: true });
+    await h.session.appear({ ...settings, rememberRunningState: true }); await h.session.reconcileAvailability(); await h.session.whenIdle();
+    // Assert
+    assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 1); assert.equal(h.session.getState().runRequested, false);
+  });
+}
+
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -795,6 +874,7 @@ for (const loss of ['hide', 'disconnect']) {
         return Promise.resolve(true);
       } });
       await h.start(settings);
+      const started = { ...settings, resumeRequested: true };
       const old = h.runs[0]; old.stopGate = cleanup;
       const before = [...h.handoffs];
 
@@ -802,11 +882,11 @@ for (const loss of ['hide', 'disconnect']) {
       const pause = loss === 'hide' ? h.session.disappear() : h.session.setConnected(false);
       await old.stopStarted.promise;
       if (!fast) { cleanup.resolve(true); await pause; }
-      const resume = loss === 'hide' ? h.session.appear(settings) : h.session.setConnected(true);
+      const resume = loss === 'hide' ? h.session.appear(started) : h.session.setConnected(true);
       const repeated = h.session.reconcileAvailability();
       const beforeCleanup = h.runs.length;
       cleanup.resolve(true); await readEntered.promise;
-      const themed = { ...settings, themeColor: '#abcdef' };
+      const themed = { ...started, themeColor: '#abcdef' };
       const edit = h.session.applySettings(themed);
       oldRead.resolve(true); await latestEntered.promise;
       const beforeLatest = { runs: h.runs.length, handoffs: [...h.handoffs] };
@@ -817,7 +897,7 @@ for (const loss of ['hide', 'disconnect']) {
       assert.equal(beforeCleanup, 1);
       assert.deepEqual(beforeLatest, { runs: 1, handoffs: before });
       assert.deepEqual(h.handoffs, before);
-      assert.deepEqual(expected, [settings, settings, themed]);
+      assert.deepEqual(expected, [started, started, themed]);
       assert.deepEqual(h.runs.map(run => run.stops), [1, 0]);
       assert.equal(h.session.getState().runRequested, true);
       assert.deepEqual(h.errors, []);
@@ -1061,7 +1141,7 @@ for (const outcome of ['confirmed', 'false', 'reject']) {
     await starting; await h.session.whenIdle();
     // Assert
     assert.deepEqual(before, { launches: 0, presentation: 'waiting' });
-    assert.deepEqual(expected, [configured]);
+    assert.deepEqual(expected, [{ ...configured, resumeRequested: true }]);
     assert.equal(h.runs.length, outcome === 'confirmed' ? 1 : 0);
     assert.equal(h.session.getState().persistenceBlocked, outcome !== 'confirmed');
     assert.deepEqual(h.errors, outcome === 'confirmed' ? [] : ['Run state save failed.']);
@@ -1080,13 +1160,13 @@ for (const older of ['false', 'reject', 'true']) {
     const configured = { ...settings, runRequested: false, themeColor: '#123456' }; await h.session.appear(configured);
     const starting = h.session.press(); await firstEntered.promise;
     // Act
-    const editing = h.session.applySettings({ ...configured, themeColor: '#abcdef' });
+    const editing = h.session.applySettings({ ...configured, themeColor: '#abcdef', resumeRequested: true });
     if (older === 'reject') first.reject(Error('superseded synthetic read')); else first.resolve(older === 'true');
     await secondEntered.promise; const before = h.runs.length;
     second.resolve(true); await Promise.all([starting, editing]); await h.session.whenIdle();
     // Assert: a cosmetic supersession retains explicit Start, even if desired configuration says Stopped.
     assert.equal(before, 0); assert.equal(h.runs.length, 1); assert.equal(h.runs[0].stops, 0);
-    assert.deepEqual(expected, [configured, { ...configured, themeColor: '#abcdef' }]);
+    assert.deepEqual(expected, [{ ...configured, resumeRequested: true }, { ...configured, themeColor: '#abcdef', resumeRequested: true }]);
     assert.deepEqual(h.errors, []); assert.equal(h.session.getState().persistenceBlocked, false);
   });
 }
@@ -2193,18 +2273,19 @@ for (const pauseKind of ['hide', 'disconnect']) {
       },
     });
     await h.start(settings);
+    const started = { ...settings, resumeRequested: true };
     const old = h.runs[0], cleanup = deferred(); old.stopGate = cleanup;
     const pause = pauseKind === 'hide' ? h.session.disappear() : h.session.setConnected(false);
     await old.stopStarted.promise; cleanup.resolve(true); await pause;
     // Act: old.done still owns the intent while the existing final settings check waits.
-    const resume = pauseKind === 'hide' ? h.session.appear(settings) : h.session.setConnected(true);
+    const resume = pauseKind === 'hide' ? h.session.appear(started) : h.session.setConnected(true);
     await confirmationEntered.promise;
     const countBeforeFailure = h.runs.length;
     old.callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED');
     const immediatelyFailed = h.session.getState();
     old.resolve({ status: 'stopped' });
     confirmation.resolve(true); await resume; await h.session.whenIdle();
-    await h.session.reconcileAvailability(); await h.session.appear(settings);
+    await h.session.reconcileAvailability(); await h.session.appear({ ...settings, resumeRequested: false });
     const beforeGenuinePress = { runs: h.runs.length, state: h.session.getState(), rendered: [...rendered], errors: [...h.errors], diagnostics: [...h.diagnostics] };
     await h.session.press();
     old.callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED');
@@ -2217,7 +2298,7 @@ for (const pauseKind of ['hide', 'disconnect']) {
     assert.equal(immediatelyFailed.phase, 'stopped');
     assert.equal(immediatelyFailed.runRequested, false);
     assert.equal(immediatelyFailed.presentation, 'error');
-    assert.deepEqual(expected.slice(0, 2), [settings, settings]);
+    assert.deepEqual(expected.slice(0, 2), [started, started]);
     assert.equal(beforeGenuinePress.runs, 1);
     assert.equal(beforeGenuinePress.state.phase, 'stopped');
     assert.equal(beforeGenuinePress.state.presentation, 'error');

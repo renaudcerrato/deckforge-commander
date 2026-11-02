@@ -153,6 +153,252 @@ function harness(t) {
   };
 }
 
+// RESTART: separate loader graphs model fresh plugins, not cleanup of old-session children.
+for (const kind of ['Stream', 'Loop']) {
+  for (const stage of ['active', 'waiting']) {
+    if (kind === 'Stream' && stage === 'waiting') continue;
+    test(`fresh ${kind} restores host intent from ${stage} into a different context without hydration writes`, options, async t => {
+      // Arrange
+      const live = harness(t), adapter = kind === 'Loop' ? live.action : live.newRun();
+      const input = { executable: base.executable, argsText: '', ...(kind === 'Stream' ? { runRequested: true } : { intervalSeconds: 5 }) };
+      const original = runtime(`restart-${kind}-${stage}-original`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+      await live.appear(original, adapter);
+      if (kind === 'Loop') await live.tap(original); else await adapter.onKeyDown({ action: original, payload: { settings: input } });
+      await live.idle(); if (stage === 'waiting') { await live.finish(); await live.advance(2000); }
+      const saved = await original.getSettings(), fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+      const restored = runtime(`restart-${kind}-${stage}-changed-context`, saved, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+      // Act
+      await fresh.appear(restored, nextAdapter); fresh.emit('connect', restored.device); fresh.emit('wake');
+      await fresh.appear(restored, nextAdapter); await fresh.idle();
+      // Assert
+      assert.equal(saved.resumeRequested, true); assert.equal(fresh.launches.length, 1); assert.deepEqual(restored.writes, []);
+      assert.equal(fresh.launches[0].env.ELGATO_ACTION_CONTEXT, restored.id);
+      assert.deepEqual(fresh.launches[0].settings, { executable: input.executable, args: [] });
+      assert.equal(Object.keys(fresh.launches[0].env).some(key => /resumeRequested|RESUME_REQUESTED/.test(key)), false);
+      assert.deepEqual(original.writes, [{ ...input, resumeRequested: true }]);
+      assert.equal(live.launches[0].stops, 0); // No claim about cross-session cleanup is made.
+    });
+  }
+  for (const state of ['missing', 'false', 'off', 'legacy-only', 'invalid']) {
+    test(`fresh ${kind} ${state} intent never grants automatic execution or hydration repair`, options, async t => {
+      // Arrange
+      const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+      const input = { executable: state === 'invalid' ? 'relative' : base.executable, argsText: '',
+        ...(state === 'false' ? { resumeRequested: false } : state === 'off' ? { resumeRequested: true, rememberRunningState: false } : {}),
+        ...(state === 'invalid' ? { resumeRequested: true } : {}),
+        ...(kind === 'Stream' && state === 'legacy-only' ? { runRequested: true } : {}) };
+      const r = runtime(`restart-negative-${kind}-${state}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+      // Act
+      await h.appear(r, adapter); h.emit('connect', r.device); h.emit('wake'); await h.appear(r, adapter); await h.advance(100000);
+      // Assert
+      assert.deepEqual(h.launches, []); assert.deepEqual(r.writes, []); assert.deepEqual(await r.getSettings(), input);
+    });
+  }
+  test(`${kind} accepted manual Start confirms saved intent before process launch`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, argsText: '' }, r = runtime(`intent-gate-${kind}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+    const entered = deferred(), gate = deferred(), originalSave = r.setSettings;
+    r.setSettings = async next => { entered.resolve(structuredClone(next)); await gate.promise; await originalSave(next); };
+    await h.appear(r, adapter);
+    // Act
+    let starting;
+    if (kind === 'Loop') { await h.down(r, input); starting = h.up(r); }
+    else starting = adapter.onKeyDown({ action: r, payload: { settings: input } });
+    const attempted = await entered.promise, before = h.launches.length;
+    gate.resolve(); await starting; await h.idle();
+    // Assert
+    assert.deepEqual(attempted, { ...input, resumeRequested: true }); assert.equal(before, 0); assert.equal(h.launches.length, 1);
+    assert.deepEqual(r.writes, [{ ...input, resumeRequested: true }]);
+  });
+  test(`${kind} manual Stop reaches cleanup while its saved-intent clear is held`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, argsText: '', resumeRequested: true, ...(kind === 'Loop' ? { actionOnPress: 'stop' } : {}) };
+    const r = runtime(`stop-storage-${kind}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+    await h.appear(r, adapter); const entered = deferred(), gate = deferred(), save = r.setSettings;
+    r.setSettings = async next => { entered.resolve(structuredClone(next)); await gate.promise; await save(next); };
+    // Act
+    let stopping;
+    if (kind === 'Loop') { await h.down(r, input); stopping = h.up(r); }
+    else stopping = adapter.onKeyDown({ action: r, payload: { settings: input } });
+    const attempted = await entered.promise; await h.launches[0].stopEntered.promise;
+    const whileHeld = { stops: h.launches[0].stops, host: await r.getSettings() };
+    gate.resolve(); await stopping; await h.idle();
+    const fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+    const restored = runtime(`stopped-restart-${kind}`, await r.getSettings(), kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+    await fresh.appear(restored, nextAdapter);
+    // Assert
+    assert.equal(whileHeld.stops, 1); assert.equal(whileHeld.host.resumeRequested, true); assert.equal(attempted.resumeRequested, false);
+    assert.deepEqual(r.writes, [{ ...input, resumeRequested: false }]); assert.deepEqual(fresh.launches, []); assert.deepEqual(restored.writes, []);
+  });
+}
+for (const kind of ['Stream', 'Loop']) for (const terminal of ['success', 'ordinary', 'protocol', 'launch']) {
+  test(`${kind} ${terminal} terminal state persists only eligible restart intent`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, argsText: '', resumeRequested: true };
+    const r = runtime(`terminal-${kind}-${terminal}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await h.appear(r, adapter);
+    // Act
+    if (terminal === 'ordinary') h.launches[0].callbacks.onDiagnostic('PROCESS_EXITED_NONZERO');
+    const message = terminal === 'ordinary' ? ordinaryError : terminal === 'protocol' ? 'Image protocol error.' : 'Program launch failed.';
+    if (terminal !== 'success') h.launches[0].callbacks.onError(message);
+    await h.finish(terminal === 'success' ? { status: 'success' } : { status: 'error', error: message }); await h.idle();
+    const saved = await r.getSettings(), eligible = kind === 'Loop' && ['success', 'ordinary'].includes(terminal);
+    const fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+    const restored = runtime(`terminal-restart-${kind}-${terminal}`, saved, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+    await fresh.appear(restored, nextAdapter); await fresh.idle();
+    // Assert
+    assert.equal(saved.resumeRequested, eligible); assert.equal(fresh.launches.length, Number(eligible));
+    assert.deepEqual(r.writes, eligible ? [] : [{ ...input, resumeRequested: false }]); assert.deepEqual(restored.writes, []);
+  });
+}
+
+for (const kind of ['Stream', 'Loop']) {
+  test(`${kind} saved true waits for connection and visibility without hydration writes`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, argsText: '', resumeRequested: true };
+    const r = runtime(`availability-restore-${kind}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); r.device.isConnected = false;
+    // Act
+    await h.appear(r, adapter); const disconnected = h.launches.length; await adapter.onWillDisappear({ action: r });
+    r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.idle(); const hidden = h.launches.length;
+    await h.appear(r, adapter); h.emit('connect', r.device); await h.appear(r, adapter); await h.idle();
+    // Assert
+    assert.equal(disconnected, 0); assert.equal(hidden, 0); assert.equal(h.launches.length, 1); assert.deepEqual(r.writes, []);
+  });
+  for (const retained of [true, false]) {
+    test(`${kind} failed Stop save blocks locally but restart uses actual host retained=${retained}`, options, async t => {
+      // Arrange
+      const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+      const input = { executable: base.executable, argsText: '', resumeRequested: true, ...(kind === 'Loop' ? { actionOnPress: 'stop' } : {}) };
+      const r = runtime(`failed-clear-${kind}-${retained}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await h.appear(r, adapter);
+      const save = r.setSettings;
+      r.setSettings = async next => { if (!retained) await save(next); throw Error('synthetic storage failure'); };
+      // Act
+      if (kind === 'Loop') await h.tap(r); else await adapter.onKeyDown({ action: r, payload: { settings: input } });
+      await h.idle(); const saved = await r.getSettings();
+      h.emit('connect', r.device); h.emit('wake'); await h.appear(r, adapter); await h.idle();
+      const fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+      const restored = runtime(`failed-clear-restart-${kind}-${retained}`, saved, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+      await fresh.appear(restored, nextAdapter); await fresh.idle();
+      // Assert
+      assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
+      assert.equal(saved.resumeRequested, retained); assert.equal(fresh.launches.length, Number(retained)); assert.deepEqual(restored.writes, []);
+    });
+  }
+  for (const resumeRequested of [true, false]) {
+    test(`${kind} backend rejects inspector-owned saved intent ${resumeRequested} without replacing the child`, options, async t => {
+      // Arrange
+      const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+      const input = { executable: base.executable, argsText: '', resumeRequested: true };
+      const r = runtime(`forged-intent-${kind}-${resumeRequested}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await h.appear(r, adapter);
+      await h.send(r, 'canvas:hello', 1, {}, adapter); await h.send(r, 'canvas:claim', 2, { token: h.replies.at(-1).token }, adapter);
+      // Act
+      await h.send(r, 'canvas:edit', 3, { changes: { resumeRequested, title: 'not saved' } }, adapter); await h.idle();
+      // Assert
+      assert.equal(h.replies.at(-1).status, 'error'); assert.deepEqual(r.writes, []);
+      assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0); assert.deepEqual(await r.getSettings(), input);
+    });
+  }
+}
+
+for (const kind of ['Stream', 'Loop']) {
+  for (const changes of [{ executable: '/synthetic/changed.sh' }, { rememberRunningState: false }]) {
+    test(`${kind} ${Object.keys(changes)[0]} edit atomically clears restart intent without later resurrection`, options, async t => {
+      // Arrange
+      const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+      const input = { executable: base.executable, argsText: '', resumeRequested: true };
+      const r = runtime(`clear-edit-${kind}-${Object.keys(changes)[0]}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await h.appear(r, adapter);
+      await h.send(r, 'canvas:hello', 1, {}, adapter); await h.send(r, 'canvas:claim', 2, { token: h.replies.at(-1).token }, adapter);
+      // Act
+      await h.send(r, 'canvas:edit', 3, { changes }, adapter); await h.idle(); const saved = await r.getSettings();
+      const fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+      const restored = runtime(`clear-edit-restart-${kind}-${Object.keys(changes)[0]}`, saved, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+      await fresh.appear(restored, nextAdapter); await fresh.advance(100000);
+      // Assert
+      assert.deepEqual(r.writes, [{ ...input, ...changes, resumeRequested: false }]); assert.equal(h.replies.at(-1).status, 'saved');
+      assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, Object.hasOwn(changes, 'executable') ? 1 : 0);
+      assert.deepEqual(fresh.launches, []); assert.deepEqual(restored.writes, []);
+    });
+  }
+  test(`${kind} enabling remembering for still-live intent confirms the PI reply and saves eligible true`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, argsText: '', resumeRequested: true };
+    const r = runtime(`live-reenable-${kind}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await h.appear(r, adapter);
+    await h.send(r, 'canvas:hello', 1, {}, adapter); await h.send(r, 'canvas:claim', 2, { token: h.replies.at(-1).token }, adapter);
+    await h.send(r, 'canvas:edit', 3, { changes: { rememberRunningState: false } }, adapter);
+    // Act
+    await h.send(r, 'canvas:edit', 4, { changes: { rememberRunningState: true } }, adapter); await h.idle();
+    const saved = await r.getSettings(), reply = h.replies.at(-1);
+    const fresh = harness(t), nextAdapter = kind === 'Loop' ? fresh.action : fresh.newRun();
+    const restored = runtime(`live-reenable-restart-${kind}`, saved, kind === 'Loop' ? TIMER_UUID : RUN_UUID); await fresh.appear(restored, nextAdapter);
+    // Assert
+    assert.deepEqual(saved, { ...input, rememberRunningState: true }); assert.equal(reply.requestId, 4); assert.equal(reply.status, 'saved');
+    assert.deepEqual(reply.settings, saved); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
+    assert.equal(fresh.launches.length, 1); assert.deepEqual(restored.writes, []);
+  });
+}
+
+// REMEMBER: use real adapters/authorities; only host I/O, processes and time are synthetic.
+for (const kind of ['Stream', 'Loop']) {
+  test(`actual ${kind} remember preference saves a complete snapshot without interrupting its owner`, options, async t => {
+    // Arrange
+    const h = harness(t), adapter = kind === 'Loop' ? h.action : h.newRun();
+    const input = { executable: base.executable, args: ['legacy', ''],
+      ...(kind === 'Loop' ? { intervalSeconds: 5 } : { runRequested: true }) };
+    const r = runtime(`remember-${kind}`, input, kind === 'Loop' ? TIMER_UUID : RUN_UUID);
+    await h.appear(r, adapter);
+    await h.send(r, 'canvas:hello', 1, {}, adapter);
+    await h.send(r, 'canvas:claim', 2, { token: h.replies.at(-1).token }, adapter);
+    if (kind === 'Loop') await h.tap(r); else await adapter.onKeyDown({ action: r, payload: { settings: input } });
+    await h.idle(); const update = parseOutputUpdate('text:retained'); h.launches[0].callbacks.onUpdate(update); await h.idle();
+    const display = [...r.display];
+    // Act
+    await h.send(r, 'canvas:edit', 3, { changes: { rememberRunningState: false } }, adapter); await h.idle();
+    const active = { launches: h.launches.length, stops: h.launches[0].stops, display: [...r.display] };
+    await adapter.onWillDisappear({ action: r }); await h.appear(r, adapter);
+    r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
+    r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.idle();
+    // Assert
+    assert.deepEqual(active, { launches: 1, stops: 0, display });
+    assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
+    assert.deepEqual(r.writes, [{ ...input, resumeRequested: true }, { ...input, rememberRunningState: false, resumeRequested: false }]);
+  });
+}
+for (const preference of [true, false]) {
+  test(`actual Loop remember=${preference} page return preserves countdown or consumes dormant automation`, options, async t => {
+    // Arrange
+    const h = harness(t), r = runtime(`remember-page-${preference}`, { ...base, rememberRunningState: preference });
+    await h.appear(r); await h.tap(r); await h.finish(); await h.advance(2000);
+    // Act
+    await h.action.onWillDisappear({ action: r }); await h.advance(1000);
+    const hidden = h.launches.length; await h.appear(r); h.emit('wake'); await h.appear(r); await h.idle();
+    await h.advance(1999); const beforeDue = h.launches.length; await h.advance(1);
+    // Assert
+    assert.equal(hidden, 1); assert.equal(beforeDue, 1); assert.equal(h.launches.length, preference ? 2 : 1);
+    assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes, preference ? [{ ...base, rememberRunningState: true, resumeRequested: true }] : []);
+  });
+}
+test('actual Loop enabled copy restores saved intent independently without inheriting output', options, async t => {
+  // Arrange
+  const h = harness(t), original = runtime('remember-original', { ...base, rememberRunningState: true });
+  await h.appear(original); await h.tap(original);
+  const originalOutput = parseOutputUpdate('<svg>distinctive-original-only</svg>');
+  h.launches[0].callbacks.onUpdate(originalOutput); await h.idle(); await h.finish();
+  const copied = runtime('remember-copy', await original.getSettings());
+  // Act
+  await h.appear(copied); h.emit('connect', copied.device); h.emit('wake'); await h.idle();
+  await h.advance(5000);
+  // Assert
+  assert.equal(h.launches.length, 3);
+  assert.ok(images(original).includes(originalOutput.image));
+  assert.equal(images(copied).includes(originalOutput.image), false);
+  assert.deepEqual(h.launches.map(launch => launch.env.ELGATO_ACTION_CONTEXT), [original.id, copied.id, original.id]);
+  assert.deepEqual(original.writes, [{ ...base, rememberRunningState: true, resumeRequested: true }]); assert.deepEqual(copied.writes, []);
+});
+
 // Slice 3: real Loop display adapters forward badges only for built-in non-error cards.
 // Slice 4: actual Loop adapter keeps hard-line content independent of configuration and deadlines.
 test('actual Loop hard lines survive rejected schema and confirmed key-local cosmetics without deadline change', options, async t => {
@@ -177,7 +423,7 @@ test('actual Loop hard lines survive rejected schema and confirmed key-local cos
   assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), Array(3).fill('#abcdef'));
   assert.equal(record.value, 'A\n\nB'); assert.deepEqual(other.display, untouched); assert.deepEqual(other.writes, []);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-  assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]);
   await h.advance(3999); assert.equal(h.launches.length, 1);
   await h.advance(1); assert.equal(h.launches.length, 2);
 });
@@ -207,7 +453,7 @@ test('actual Loop final hard-line SDK handoff drains before deadline and rejects
   await h.advance(4999); assert.equal(h.launches.length, 1);
   await h.advance(1); h.launches[0].callbacks.onUpdate(parseOutputUpdate(String.raw`text:stale\ncallback`)); await h.idle();
   // Assert
-  assert.equal(retained.at(-1), artwork); assert.deepEqual(images(r), retained); assert.deepEqual(r.writes, []);
+  assert.equal(retained.at(-1), artwork); assert.deepEqual(images(r), retained); assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
   assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
 });
 
@@ -220,7 +466,8 @@ for (const [themeColor, expected] of [[undefined, '#969696'], ['#ABCDEF', '#abcd
     await h.appear(r); const beforePress = h.launches.length; await h.tap(r);
     // Assert
     assert.equal(beforePress, 0); assert.equal(h.launches.length, 1);
-    assert.equal(h.launches[0].env.ELGATO_ACTION_THEME_COLOR, expected); assert.deepEqual(r.writes, []);
+    assert.equal(h.launches[0].env.ELGATO_ACTION_THEME_COLOR, expected);
+    assert.deepEqual(r.writes, [{ ...base, ...(themeColor === undefined ? {} : { themeColor }), resumeRequested: true }]);
     assert.equal(h.logs.some(value => value.includes('ELGATO_ACTION_THEME_COLOR') || value.includes('STALE_SYNTHETIC')), false);
   });
 }
@@ -246,8 +493,9 @@ for (const terminal of ['success', 'nonzero', 'signal']) {
     assert.deepEqual(afterEdit, { count: 2, stops: 0 }); assert.deepEqual(h.launches[0].env, original);
     assert.equal(afterWaitingEdit, 2);
     assert.equal(h.launches.length, 3); assert.equal(h.launches[2].env.ELGATO_ACTION_THEME_COLOR, '#fedcba');
-    assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#654321'); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
-    assert.deepEqual(r.writes.map(value => value.themeColor), ['#abcdef', '#fedcba']);
+    assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#654321'); assert.deepEqual(other.display, otherDisplay);
+    assert.deepEqual(other.writes, [{ ...base, themeColor: '#654321', resumeRequested: true }]);
+    assert.deepEqual(r.writes.map(value => value.themeColor), ['#123456', '#abcdef', '#fedcba']);
     assert.equal(h.replies.some(reply => JSON.stringify(reply).includes('ELGATO_') || JSON.stringify(reply).includes('SYNTHETIC_PRIVATE_ENV')), false);
     assert.equal(h.logs.some(value => value.includes('#fedcba') || value.includes('SYNTHETIC_PRIVATE_ENV')), false);
   });
@@ -289,7 +537,7 @@ test('actual Loop Loading and Success badges track theme without changing deadli
   assert.ok(images(r).some(image => />\.py<\/text>.*>loading\.\.\.<\/text>/.test(svg(image))));
   assert.match(svg(images(r).at(-1)), /text-anchor="end"[^>]*fill="#abcdef">\.py<\/text>.*>success<\/text>/);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-  assert.deepEqual(r.writes, [{ ...base, executable: '/synthetic/report.PY', themeColor: '#abcdef' }]);
+  assert.deepEqual(r.writes, [{ ...base, executable: '/synthetic/report.PY', resumeRequested: true }, { ...base, executable: '/synthetic/report.PY', themeColor: '#abcdef', resumeRequested: true }]);
   await h.advance(3999); assert.equal(h.launches.length, 1);
   await h.advance(1); assert.equal(h.launches.length, 2);
 });
@@ -351,7 +599,7 @@ test('actual Loop Setup gesture remains consumed through confirmed PI executable
   assert.equal(before, 0);
   assert.match(ready, />program<\/text>.*>ready<\/text>/);
   assert.equal(h.launches.length, 1);
-  assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '' }]);
+  assert.deepEqual(r.writes, [false, true].map(resumeRequested => ({ executable: base.executable, argsText: '', resumeRequested })));
 });
 test('actual Loop empty executable PI edit leaves Setup unchanged without writes or recovery', options, async t => {
   // Arrange
@@ -376,7 +624,7 @@ test('actual Loop delayed Setup cannot overwrite newer confirmed Ready after PI 
   assert.equal(images(r).some(image => svg(image).includes('setup required')), false);
   assert.match(svg(images(r).at(-1)), />program<\/text>.*>ready<\/text>/);
   await h.advance(100000);
-  assert.deepEqual(h.launches, []); assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '' }]);
+  assert.deepEqual(h.launches, []); assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '', resumeRequested: false }]);
 });
 
 // Objective: actual adapter routing preserves short policy at 999ms and recognizes
@@ -405,7 +653,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
           assert.equal(beforeRelease.stops, Number(stage === 'running' && held && deliver));
           assert.equal(h.launches.length, count + Number(starts));
           assert.equal(h.launches[0]?.stops ?? 0, stage === 'running' && !enabled ? 1 : 0);
-          assert.deepEqual(r.writes, []);
+          const saved = stage === 'disabled' ? (starts ? [true] : []) : enabled ? [true] : [true, false];
+          assert.deepEqual(r.writes, saved.map(resumeRequested => ({ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested })));
         });
       }
     }
@@ -429,7 +678,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
         // Assert
         const enabled = at === 999 && policy !== 'stop';
         assert.equal(h.launches.length, Number(enabled)); assert.ok(h.launches.every(launch => launch.stops === 0));
-        assert.deepEqual(r.writes, []);
+        assert.deepEqual(r.writes, (enabled ? [true] : [true, false]).map(resumeRequested => ({ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested })));
       });
     }
   }
@@ -514,7 +763,7 @@ test('key-down cannot launch; short key-up launches once with literal execution 
     ELGATO_KEY_COLUMN: '0', ELGATO_KEY_ROW: '2', ELGATO_APP_VERSION: '7.6', ELGATO_APP_LANGUAGE: 'fr',
     ELGATO_APP_PLATFORM: 'mac', ELGATO_APP_PLATFORM_VERSION: '26' });
   assert.match(svg(images(r).at(-1)), />Loop<\/text>.*>program<\/text>.*>loading\.\.\.<\/text>/);
-  assert.deepEqual(r.display.at(-2), ['title', '']); assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.display.at(-2), ['title', '']); assert.deepEqual(r.writes, [{ ...initial, resumeRequested: true }]);
   assert.equal(h.logs.some(value => value.includes('two words') || value.includes('SYNTHETIC_PRIVATE_ENV')), false);
 });
 
@@ -526,7 +775,7 @@ test('accepted host settings remain authoritative through late host, appearance 
   await h.action.onDidReceiveSettings({ action: r, payload: { settings: foreign } });
   await h.appear(r, h.action, foreign); await h.down(r, foreign); await h.up(r); await h.idle();
   // Assert
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
   assert.deepEqual(h.launches[0].settings, { executable: base.executable, args: [] });
   assert.equal(h.launches.length, 1);
 });
@@ -544,7 +793,7 @@ test('keys and new Singleton instances share neither enabled intent nor display/
   assert.deepEqual(second.display, untouched); assert.equal(h.launches.length, 2);
   assert.ok(h.launches.every(launch => launch.env.ELGATO_ACTION_CONTEXT === first.id));
   assert.match(svg(images(fresh).at(-1)), />ready<\/text>/);
-  assert.deepEqual(first.writes, []); assert.deepEqual(second.writes, []); assert.deepEqual(fresh.writes, []);
+  assert.deepEqual(first.writes, [{ ...base, resumeRequested: true }]); assert.deepEqual(second.writes, []); assert.deepEqual(fresh.writes, []);
 });
 
 // Objective: completion pacing is based on the cleanup-completed runner contract, not launch time.
@@ -562,7 +811,7 @@ for (const interval of [undefined, 5]) {
     assert.equal(during, 1);
     assert.equal(before, 1); assert.equal(h.launches.length, 2); assert.deepEqual(r.display, retained);
     assert.match(svg(images(r).at(-1)), />Loop<\/text>.*>program<\/text>.*>success<\/text>/);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [{ executable: base.executable, argsText: '', ...(interval === undefined ? {} : { intervalSeconds: interval }), resumeRequested: true }]);
   });
 }
 
@@ -578,7 +827,7 @@ for (const record of ['text:accepted', 'progress:45|label:Accepted', 'data:image
     assert.equal(shown, update.kind === 'image' ? update.image : createPrimitiveArtwork(update));
     assert.deepEqual(r.display, display); assert.deepEqual(r.display.at(-2), ['title', '']);
     assert.equal(h.launches.length, 2);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
   });
 }
 
@@ -606,7 +855,7 @@ for (const diagnostic of ['PROCESS_EXITED_NONZERO', 'PROCESS_TERMINATED_BY_SIGNA
     assert.equal(before, 1); assert.equal(h.launches.length, 2); assert.deepEqual(r.display, retained);
     assert.equal(images(r).at(-1), createErrorArtwork(diagnostic));
     assert.deepEqual(r.display.at(-2), ['title', '']);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
   });
 }
 
@@ -633,7 +882,7 @@ for (const fatal of ['launch', 'protocol', 'display']) {
     assert.equal(count, 1); assert.equal(h.launches.length, 2);
     assert.equal(h.launches[0].stops, fatal === 'display' ? 1 : 0);
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_EXCEPTION') || value.includes('SYNTHETIC_PRIVATE_OUTPUT')), false);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [true, false, true].map(resumeRequested => ({ ...base, resumeRequested })));
   });
 }
 
@@ -647,7 +896,7 @@ for (const delivery of [false, true]) {
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
     assert.match(svg(images(r).at(-1)), />ready<\/text>/);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [true, false].map(resumeRequested => ({ ...base, resumeRequested })));
   });
 }
 
@@ -693,7 +942,7 @@ test('running tap stops once, rejects stale callbacks and cannot overlap a held 
   // Assert
   assert.equal(before, 1); assert.equal(old.stops, 1); assert.deepEqual(unchanged, settled);
   assert.equal(h.launches.length, 2);
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [true, false, true].map(resumeRequested => ({ ...base, actionOnPress: 'stop', resumeRequested })));
 });
 
 test('cleanup uncertainty remains permanent across taps, edits, appearance and reconnect', options, async t => {
@@ -744,7 +993,7 @@ for (const rejection of ['foreign context', 'unclaimed edit', 'wrong token', 'st
     });
     await h.idle();
     // Assert
-    assert.deepEqual(r.writes, []); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
     if (invalid[rejection]) {
       assert.equal(h.replies.length, before + 1); assert.equal(h.replies.at(-1).status, 'error');
       assert.equal(JSON.stringify(h.replies.at(-1)).includes('SYNTHETIC_PRIVATE_SETTING'), false);
@@ -766,7 +1015,7 @@ test('waiting interval edit resets full period only after matching host readback
   await h.advance(9999); const before = h.launches.length; await h.advance(1);
   // Assert
   assert.equal(count, 1); assert.equal(before, 1); assert.equal(h.launches.length, 2);
-  assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, intervalSeconds: 10, resumeRequested: true }]);
   assert.equal(h.replies.at(-1).status, 'saved');
 });
 
@@ -777,7 +1026,7 @@ test('running interval edit does not interrupt owner and uses new interval at co
   await h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10 } }); await h.advance(7000); await h.finish();
   // Assert
   assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
-  assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, intervalSeconds: 10, resumeRequested: true }]);
   await h.advance(9999); assert.equal(h.launches.length, 1);
   await h.advance(1); assert.equal(h.launches.length, 2);
 });
@@ -802,7 +1051,7 @@ test('newest interval/theme snapshot gates launch while older read rejection is 
   // Assert
   assert.equal(count, 1); assert.equal(h.launches.length, 2);
   assert.equal(h.launches[1].env.ELGATO_ACTION_THEME_COLOR, '#abcdef');
-  assert.deepEqual(r.writes, [{ ...base, intervalSeconds: 10 }, { ...base, intervalSeconds: 10, themeColor: '#abcdef' }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, intervalSeconds: 10, resumeRequested: true }, { ...base, intervalSeconds: 10, themeColor: '#abcdef', resumeRequested: true }]);
   assert.equal(h.replies.at(-1).requestId, 4); assert.equal(h.replies.at(-1).status, 'saved');
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_OLD_READ')), false);
 });
@@ -825,7 +1074,7 @@ test('pending execution edit stops owner but cannot show Ready or launch before 
   assert.equal(pending.count, 1); assert.equal(pending.ready, readyCount);
   assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
   assert.match(svg(images(r).at(-1)), />ready<\/text>/);
-  assert.deepEqual(r.writes, [{ ...initial, argsText: 'SYNTHETIC_PRIVATE_ARG', cwd: '/synthetic/new-cwd' }]);
+  assert.deepEqual(r.writes, [{ ...initial, resumeRequested: true }, { ...initial, argsText: 'SYNTHETIC_PRIVATE_ARG', cwd: '/synthetic/new-cwd', resumeRequested: false }]);
   assert.ok(r.writes.every(value => !Object.hasOwn(value, 'enabled') && !Object.hasOwn(value, 'runRequested')));
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_ARG')), false);
 });
@@ -843,7 +1092,7 @@ for (const explicit of [false, true]) {
     if (explicit) { assert.ok(rendered.includes('fill="#ff0000"')); assert.ok(rendered.includes('fill="#0000ff"')); }
     else assert.deepEqual([...rendered.matchAll(/<text\b[^>]*fill="([^"]*)"/g)].map(match => match[1]), ['#abcdef', '#abcdef']);
     assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
-    assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]);
     await h.advance(3999); assert.equal(h.launches.length, 1);
     await h.advance(1); assert.equal(h.launches.length, 2);
   });
@@ -870,7 +1119,7 @@ test('complete matching storage tolerates property order without an authority or
   await h.send(r, 'canvas:edit', 3, { changes: { intervalSeconds: 10, themeColor: '#abcdef' } }); await h.tap(r); await h.finish();
   // Assert
   assert.equal(h.launches.length, 1); assert.equal(h.replies.at(-1).status, 'saved');
-  assert.deepEqual(r.writes, [{ ...initial, intervalSeconds: 10, themeColor: '#abcdef' }]);
+  assert.deepEqual(r.writes, [{ ...initial, intervalSeconds: 10, themeColor: '#abcdef' }, { ...initial, intervalSeconds: 10, themeColor: '#abcdef', resumeRequested: true }]);
   await h.advance(9999); assert.equal(h.launches.length, 1);
   await h.advance(1); assert.equal(h.launches.length, 2);
 });
@@ -888,7 +1137,7 @@ for (const failure of ['write', 'read', 'mismatch']) {
     r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('wake'); await h.appear(r, h.action, base); await h.advance(100000);
     // Assert
-    assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1); assert.equal(r.writes.length, 1);
+    assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1); assert.equal(r.writes.length, 2);
     assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
     assert.equal(h.replies.at(-1).status, 'error'); assert.equal(h.replies.at(-1).diagnosticCode, 'STATE_SAVE_FAILED');
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_STORAGE')), false);
@@ -903,7 +1152,7 @@ for (const returningAt of [2000, 30000]) {
     const original = { ...h.launches[0].env }; await h.action.onWillDisappear({ action: r }); const hiddenDisplay = [...r.display];
     // Act
     await h.advance(returningAt); const hiddenCount = h.launches.length;
-    const replacement = runtime(r.id); delete replacement.device.name; delete replacement.device.size; replacement.coordinates = undefined;
+    const replacement = runtime(r.id, await r.getSettings()); delete replacement.device.name; delete replacement.device.size; replacement.coordinates = undefined;
     delete h.sdk.info.application.language;
     await h.appear(replacement); h.emit('wake'); h.emit('connect', replacement.device); await h.appear(replacement); await h.idle();
     const returnedCount = h.launches.length; if (returningAt < 5000) await h.advance(5000 - returningAt);
@@ -915,7 +1164,7 @@ for (const returningAt of [2000, 30000]) {
       assert.equal(Object.hasOwn(h.launches[1].env, key), false);
     }
     assert.match(svg(images(replacement).at(-1)), />success<\/text>/);
-    assert.deepEqual(r.writes, []); assert.deepEqual(replacement.writes, []);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]); assert.deepEqual(replacement.writes, []);
   });
 }
 
@@ -935,7 +1184,7 @@ for (const terminal of ['success', 'ordinary', 'protocol']) {
     assert.deepEqual(hiddenDone, hiddenDisplay); assert.equal(h.launches[0].stops, 0); assert.equal(h.launches.length, 1);
     assert.equal(images(r).at(-1), terminal === 'success' ? createPrimitiveArtwork(update)
       : createErrorArtwork(terminal === 'protocol' ? 'IMAGE_PROTOCOL_ERROR' : 'PROCESS_EXITED_NONZERO'));
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, (terminal === 'protocol' ? [true, false] : [true]).map(resumeRequested => ({ ...base, resumeRequested })));
     await h.advance(3999); assert.equal(h.launches.length, 1);
     await h.advance(1); assert.equal(h.launches.length, terminal === 'protocol' ? 1 : 2);
   });
@@ -956,7 +1205,7 @@ test('hidden running output restores latest frame without stopping or restarting
 });
 
 for (const hidden of [false, true]) {
-  test(`disconnect hidden=${hidden} disables/stops Timer; foreign events and reconnect never enable`, options, async t => {
+  test(`disconnect hidden=${hidden} stops Loop; foreign events do nothing and eligible reconnect resumes once`, options, async t => {
     // Arrange
     const h = harness(t), r = runtime(); await h.appear(r); await h.tap(r);
     if (hidden) await h.action.onWillDisappear({ action: r });
@@ -964,10 +1213,10 @@ for (const hidden of [false, true]) {
     h.emit('disconnect', { id: 'synthetic-foreign-device', isConnected: false }); await h.idle(); const foreignStops = h.launches[0].stops;
     r.device.isConnected = false; h.emit('disconnect', r.device); await h.idle();
     r.device.isConnected = true; h.emit('connect', r.device); h.emit('connect', r.device); h.emit('wake'); await h.idle();
-    await h.appear(r); await h.advance(100000);
+    const beforeAppearance = h.launches.length; await h.appear(r); await h.advance(100000);
     // Assert
-    assert.equal(foreignStops, 0); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-    assert.match(svg(images(r).at(-1)), />ready<\/text>/); assert.deepEqual(r.writes, []);
+    assert.equal(foreignStops, 0); assert.equal(beforeAppearance, hidden ? 1 : 2);
+    assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 2); assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
     assert.deepEqual(h.registrations, ['connect', 'disconnect', 'wake']);
   });
 }
@@ -985,10 +1234,12 @@ test('real Run and Timer adapters retain separate intent/hide policies and all e
   timer.device.isConnected = false; run.device.isConnected = false; h.emit('disconnect', timer.device); await h.idle();
   timer.device.isConnected = true; run.device.isConnected = true; h.emit('connect', timer.device); h.emit('wake'); await h.idle();
   // Assert
-  assert.deepEqual(hiddenStops, [0, 1]); assert.equal(h.launches.length, 4);
+  assert.deepEqual(hiddenStops, [0, 1]); assert.equal(h.launches.length, 5);
   assert.equal(h.launches[0].env.ELGATO_ACTION_UUID, TIMER_UUID); assert.equal(h.launches[1].env.ELGATO_ACTION_UUID, RUN_UUID);
-  assert.equal(h.launches[2].env.ELGATO_ACTION_UUID, RUN_UUID); assert.equal(h.launches[3].env.ELGATO_ACTION_UUID, RUN_UUID);
-  assert.deepEqual(timer.writes, []); assert.deepEqual(run.writes, []);
+  assert.equal(h.launches[2].env.ELGATO_ACTION_UUID, RUN_UUID);
+  assert.deepEqual(h.launches.slice(3).map(launch => launch.env.ELGATO_ACTION_UUID).sort(), [RUN_UUID, TIMER_UUID].sort());
+  assert.deepEqual(timer.writes, [{ ...base, resumeRequested: true }]);
+  assert.deepEqual(run.writes, [{ executable: base.executable, args: [], runRequested: false, resumeRequested: true }]);
   assert.deepEqual(h.registrations, ['connect', 'disconnect', 'wake', 'connect', 'disconnect', 'wake']);
 });
 
@@ -1011,7 +1262,7 @@ for (const invalidate of ['hide', 'stop', 'disconnect']) {
     assert.equal(h.launches.length, 0);
     assert.ok(images(r).slice(before).every(image => !/>loading\.\.\.<\/text>/.test(svg(image))));
     assert.ok(r.display.filter(([kind]) => kind === 'title').every(([, title]) => title === ''));
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, (invalidate === 'stop' ? [true, false] : [true]).map(resumeRequested => ({ ...base, ...(invalidate === 'stop' ? { actionOnPress: 'stop' } : {}), resumeRequested })));
     await h.appear(r); await h.advance(100000);
     assert.equal(h.launches.length, invalidate === 'hide' ? 1 : 0);
   });
@@ -1083,7 +1334,7 @@ for (const position of ['above', 'below']) for (const [suffix, colors] of [['', 
     assert.match(rendered, /font-size="48"/); assert.match(rendered, /font-size="14.25"/); assert.match(rendered, /stroke="#abcdef"/);
     assert.equal(JSON.stringify(record), before); assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-    assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]);
     await h.advance(3999); assert.equal(h.launches.length, 1);
     await h.advance(1); assert.equal(h.launches.length, 2);
   });
@@ -1110,7 +1361,7 @@ for (const [suffix, caption] of [['', '1.6%'], [';display:17 done', '17 done']])
     assert.equal(/stroke-dasharray="([^"]*)"/.exec(rendered)[1], /stroke-dasharray="([^"]*)"/.exec(svg(accepted))[1]);
     assert.deepEqual(other.display, otherDisplay); assert.deepEqual(other.writes, []);
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 0);
-    assert.deepEqual(r.writes, [{ ...base, themeColor: '#abcdef' }]);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, themeColor: '#abcdef', resumeRequested: true }]);
     await h.advance(3999); assert.equal(h.launches.length, 1);
     await h.advance(1); assert.equal(h.launches.length, 2);
   });
@@ -1129,7 +1380,8 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, policy === 'stop' ? 1 : 0);
     if (policy !== 'stop') assert.deepEqual(r.display, display);
     assert.deepEqual(h.launches[0].settings, { executable: base.executable, args: [] });
-    assert.deepEqual(await r.getSettings(), initial); assert.deepEqual(r.writes, []);
+    assert.deepEqual(await r.getSettings(), { ...initial, resumeRequested: policy !== 'stop' });
+    assert.deepEqual(r.writes, (policy === 'stop' ? [true, false] : [true]).map(resumeRequested => ({ ...initial, resumeRequested })));
   });
 
   test(`adapter ${policy ?? 'default Refresh'} waiting tap ${policy === 'stop' ? 'disables' : 'refreshes'} without per-tick writes`, options, async t => {
@@ -1140,7 +1392,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     await h.tap(r); await h.advance(100000);
     // Assert
     assert.equal(h.launches.length, policy === 'stop' ? 1 : 2); assert.ok(h.launches.every(launch => launch.stops === 0));
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, (policy === 'stop' ? [true, false] : [true]).map(resumeRequested => ({ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested })));
   });
 
   test(`adapter ${policy ?? 'default Refresh'} hold stops active owner regardless of short-tap policy`, options, async t => {
@@ -1152,7 +1404,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     await h.advance(TIMER_HOLD_MS); await h.up(r); await h.up(r); await h.idle(); await h.advance(100000);
     // Assert
     assert.equal(before, 0); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [true, false].map(resumeRequested => ({ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested })));
   });
 }
 
@@ -1166,7 +1418,7 @@ for (const policy of [undefined, 'refresh']) {
     await h.advance(4999); const before = h.launches.length; await h.advance(1);
     // Assert
     assert.equal(count, 1); assert.equal(before, 1); assert.equal(h.launches.length, 2);
-    assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes, []);
+    assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes, [{ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested: true }]);
   });
 }
 
@@ -1185,8 +1437,10 @@ for (const stage of ['disabled', 'waiting', 'running', 'hidden', 'suspended']) {
     await h.send(r, 'canvas:edit', 4, { changes: { actionOnPress: 'stop' } }); await h.idle();
     // Assert
     assert.deepEqual(r.display, shown); assert.equal(h.launches.length, count); assert.ok(h.launches.every(launch => launch.stops === 0));
-    assert.deepEqual(r.writes, [{ ...initial, actionOnPress: 'stop' }]);
-    assert.deepEqual(h.replies.at(-1).settings, r.writes[0]); assert.equal(h.replies.at(-1).status, 'saved');
+    const previous = stage === 'disabled' ? [] : stage === 'suspended' ? [true, false] : [true];
+    assert.deepEqual(r.writes, [...previous.map(resumeRequested => ({ ...initial, resumeRequested })),
+      { ...initial, actionOnPress: 'stop', ...(stage === 'disabled' ? {} : { resumeRequested: stage !== 'suspended' }) }]);
+    assert.deepEqual(h.replies.at(-1).settings, r.writes.at(-1)); assert.equal(h.replies.at(-1).status, 'saved');
     if (stage === 'suspended') assert.equal(images(r).at(-1), createErrorArtwork('IMAGE_PROTOCOL_ERROR'));
     if (stage === 'hidden') await h.appear(r);
     if (stage === 'waiting' || stage === 'hidden') {
@@ -1223,7 +1477,7 @@ test('actual Run backend rejects Timer policy while its ordinary key toggle rema
   assert.equal(rejection.status, 'error'); assert.deepEqual(before, []);
   assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
   assert.equal(h.launches[0].env.ELGATO_ACTION_UUID, RUN_UUID);
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [true, false].map(resumeRequested => ({ ...initial, resumeRequested })));
 });
 
 test('backend policy received between key-down and key-up controls recognized active release', options, async t => {
@@ -1233,7 +1487,7 @@ test('backend policy received between key-down and key-up controls recognized ac
   await h.send(r, 'canvas:edit', 3, { changes: { actionOnPress: 'stop' } }); await h.up(r); await h.idle();
   // Assert
   await h.advance(100000); assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
-  assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, ...[true, false].map(resumeRequested => ({ ...base, actionOnPress: 'stop', resumeRequested }))]);
 });
 
 for (const failure of ['write', 'read', 'mismatch']) {
@@ -1248,7 +1502,7 @@ for (const failure of ['write', 'read', 'mismatch']) {
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].stops, 1);
     assert.equal(images(r).at(-1), createErrorArtwork('STATE_SAVE_FAILED'));
-    assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: true }]);
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_POLICY_PRIVATE')), false);
   });
 }
@@ -1267,7 +1521,7 @@ test('backend pending policy confirmation preserves due time and blocks overdue 
   // Assert
   assert.equal(count, 1);
   assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
-  assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: true }]);
 });
 
 for (const policy of [undefined, 'refresh', 'stop']) {
@@ -1287,7 +1541,7 @@ for (const policy of [undefined, 'refresh', 'stop']) {
     assert.equal(count, policy === 'stop' ? 0 : 1);
     assert.equal(afterCompletion, count); assert.equal(before, count);
     await h.advance(1); assert.equal(h.launches.length, policy === 'stop' ? 0 : 2);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, (policy === 'stop' ? [true, false] : [true]).map(resumeRequested => ({ ...base, ...(policy === undefined ? {} : { actionOnPress: policy }), resumeRequested })));
   });
 }
 
@@ -1298,7 +1552,7 @@ test('adapter release after owned completion uses waiting state rather than the 
   await h.finish(); const completed = images(r).at(-1); await h.up(r); await h.idle();
   // Assert
   assert.match(svg(completed), />success<\/text>/); assert.equal(h.launches.length, 2); assert.equal(h.launches[0].stops, 0);
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }]);
 });
 
 for (const oldResult of ['mismatch', 'reject']) {
@@ -1314,7 +1568,7 @@ for (const oldResult of ['mismatch', 'reject']) {
     await Promise.all([older, newer]); await h.idle();
     // Assert
     assert.equal(h.launches.length, 1);
-    assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }, { ...base, actionOnPress: 'refresh', intervalSeconds: 10, themeColor: '#abcdef' }]);
+    assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, { ...base, actionOnPress: 'stop', resumeRequested: true }, { ...base, actionOnPress: 'refresh', intervalSeconds: 10, themeColor: '#abcdef', resumeRequested: true }]);
     assert.equal(h.replies.at(-1).requestId, 4); assert.equal(h.replies.at(-1).status, 'saved');
     assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_POLICY_READ')), false);
     await h.advance(9999); assert.equal(h.launches.length, 1);
@@ -1338,11 +1592,11 @@ test('adapter hold during pending policy save safely stops but waits for confirm
   // Assert
   assert.equal(count, 1);
   assert.equal(readyPending, ready); assert.equal(h.launches[0].stops, 1); assert.equal(h.launches.length, 1);
-  assert.deepEqual(r.writes, [{ ...base, actionOnPress: 'stop' }]);
+  assert.deepEqual(r.writes, [{ ...base, resumeRequested: true }, ...[true, false].map(resumeRequested => ({ ...base, actionOnPress: 'stop', resumeRequested }))]);
   assert.match(svg(images(r).at(-1)), />ready<\/text>/);
 });
 
-test('move-integrity Loop theme-only swapped owner loses old deadline output and protocol error without saves', options, async t => {
+test('move-integrity Loop restores moved saved intent without inheriting old output, deadline or protocol error', options, async t => {
   // Arrange
   const h = harness(t), a = { ...base, themeColor: '#123456' }, b = { ...base, themeColor: '#abcdef' };
   const c1 = runtime('loop-move-C1', a), c2 = runtime('loop-move-C2', b);
@@ -1352,13 +1606,17 @@ test('move-integrity Loop theme-only swapped owner loses old deadline output and
   await h.finish({ status: 'error', error: 'Image protocol error.' }, h.launches[1]);
   // Act
   await h.action.onWillDisappear({ action: { ...c2 } }); await h.action.onWillDisappear({ action: { ...c1 } });
-  const next2 = slotWrapper(c2, a), next1 = slotWrapper(c1, b);
+  const savedA = await c1.getSettings(), savedB = await c2.getSettings();
+  const next2 = slotWrapper(c2, savedA), next1 = slotWrapper(c1, savedB);
   await h.appear(next2); await h.appear(next1); await h.advance(100000);
   await h.claim(next1); const shown1 = h.replies.at(-1).settings;
   await h.claim(next2, 'other-move-pi'); const shown2 = h.replies.at(-1).settings;
+  const writesBeforeLate = structuredClone(c2.writes);
+  h.launches[1].callbacks.onError('Image protocol error.'); h.launches[1].callbacks.onDiagnostic('PROCESS_LAUNCH_FAILED'); await h.idle();
   // Assert
-  assert.equal(h.launches.length, 2);
-  assert.deepEqual({ shown1, shown2 }, { shown1: b, shown2: a });
-  assert.match(svg(images(next1).at(-1)), />ready<\/text>/); assert.match(svg(images(next2).at(-1)), />ready<\/text>/);
-  assert.deepEqual(c1.writes, []); assert.deepEqual(c2.writes, []);
+  assert.equal(h.launches.length, 3); assert.equal(h.launches[2].env.ELGATO_ACTION_CONTEXT, c2.id);
+  assert.deepEqual({ shown1, shown2 }, { shown1: savedB, shown2: savedA });
+  assert.match(svg(images(next1).at(-1)), />ready<\/text>/); assert.match(svg(images(next2).at(-1)), />loading\.\.\.<\/text>/);
+  assert.deepEqual(c1.writes, [{ ...a, resumeRequested: true }]); assert.deepEqual(c2.writes, [true, false].map(resumeRequested => ({ ...b, resumeRequested })));
+  assert.deepEqual(c2.writes, writesBeforeLate); assert.equal((await next2.getSettings()).resumeRequested, true);
 });

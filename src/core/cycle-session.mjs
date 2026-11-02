@@ -2,7 +2,7 @@ import {
   classifyTimerSettings, sameTimerExecutionSettings, sameTimerInterval, timerSettingsDiagnosticCode, readActionOnPress,
 } from './timer-settings.mjs';
 import { classifyOnceSettings, sameOnceExecutionSettings } from './once-settings.mjs';
-import { settingsDiagnosticCode, sameSettingsExceptTitle } from './settings.mjs';
+import { settingsDiagnosticCode, sameSettingsExceptTitle, readRememberRunningState, readResumeRequested } from './settings.mjs';
 import { copySettings } from './settings-authority.mjs';
 import { settingsThemeColor } from './theme.mjs';
 import { getReadyTitle, getExecutableExtension } from './key-layout.mjs';
@@ -49,16 +49,17 @@ const ERROR_PRIORITY = new Map([
   ['Frame send failed.', 3], ['Image protocol error.', 4], ['Process cleanup uncertain.', 5],
 ]);
 
-/** Session-only intent. Configuration authority, process ownership and image handoff are injected. */
+/** Lifecycle state is local; Loop resume intent uses the injected complete-settings authority. */
 export function createCycleSession({
   startRun, setImage, setTitle, onError, awaitConfiguration, onPresentation = () => {},
   initialConnected = false, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout,
   platform,
+  saveResumeRequested = async () => {},
 }, policy) {
   if (policy !== LOOP_CYCLE_POLICY && policy !== ONCE_CYCLE_POLICY) {
     throw new TypeError('Cycle session requires a trusted policy.');
   }
-  if ([startRun, setImage, setTitle, onError, awaitConfiguration, onPresentation, now, setTimer, clearTimer]
+  if ([startRun, setImage, setTitle, onError, awaitConfiguration, onPresentation, now, setTimer, clearTimer, saveResumeRequested]
     .some(callback => typeof callback !== 'function')) {
     throw new TypeError(policy.dependencyError);
   }
@@ -74,12 +75,15 @@ export function createCycleSession({
   let generation, outcome, queue, gesture;
   let gestureVersion = 0, deadlineVersion = 0, deadlineTimer, dueMs;
   let intervalResetIntent;
+  let immediateResumePending = false;
+  let pageResumePending = false;
   let presentation = 'none';
   let producerEnqueuedDisplay = -1, producerEnqueuedVersion = -1;
   let cosmeticEnqueuedDisplay = -1, cosmeticEnqueuedVersion = -1, cosmeticEnqueuedTheme = -1;
   let renderedDisplay = -1, renderedOutcome = -1, renderedCosmetics = -1;
   let renderedCaption, renderedExtension;
   let tail = Promise.resolve();
+  const intentWrites = new Set();
 
   function schedule(operation) {
     const pending = tail.then(operation, operation);
@@ -88,6 +92,33 @@ export function createCycleSession({
   }
 
   function available() { return visible && connected; }
+  function remembersRunning() {
+    try { return policy.repeat && readRememberRunningState(configuration?.snapshot); } catch { return false; }
+  }
+
+  function persistResume(value) {
+    if (!policy.repeat || !configuration?.snapshot || persistenceBlocked) return;
+    try {
+      if (!value && Object.getOwnPropertyDescriptor(configuration.snapshot, 'resumeRequested')?.value !== true) return;
+      if (readResumeRequested(configuration.snapshot) === value) return;
+      const snapshot = { ...copySettings(configuration.snapshot), resumeRequested: value };
+      const pending = Promise.resolve(saveResumeRequested(value)).catch(() => { void persistenceFailed(); });
+      intentWrites.add(pending);
+      void pending.then(() => intentWrites.delete(pending));
+      // Internal writes use the same complete-snapshot launch gate as configuration edits.
+      adoptSettings(snapshot);
+    } catch { void persistenceFailed(); }
+  }
+
+  function consumeAutomaticResume() {
+    enabled = false;
+    immediateResumePending = false;
+    pageResumePending = false;
+    ++launchVersion;
+    cancelDeadline();
+    if (!generation && phase === 'starting') phase = 'stopped';
+    if (!generation && phase === 'waiting') phase = 'stopped';
+  }
   function suspended() { return Boolean(fatalError || cleanupBlocked || persistenceBlocked || protocolBlocked); }
   function owns(run) { return generation === run && !run.finished; }
   function caption() { return getReadyTitle(configuration?.snapshot?.executable, platform, configuration?.snapshot?.title); }
@@ -122,6 +153,7 @@ export function createCycleSession({
     if (fatal) {
       fatalError = error;
       intervalResetIntent = undefined;
+      if (enabled) persistResume(false);
     }
     retain(error);
   }
@@ -247,10 +279,9 @@ export function createCycleSession({
     return run.stopping;
   }
 
-  async function stopOwned(reason) {
+  async function stopOwned(reason, frames = queue) {
     const run = generation;
     if (!run || run.finished) return !cleanupBlocked;
-    const frames = queue;
     frames?.dispose();
     const certain = await requestStop(run, reason);
     if (!certain) latchCleanup();
@@ -289,6 +320,10 @@ export function createCycleSession({
     if (themeChanged) ++cosmeticVersion;
     const record = { snapshot, validation, setup, diagnostic, revision: ++configurationRevision, confirmed: false };
     configuration = record;
+    if (!previous && policy.repeat && validation) {
+      enabled = readResumeRequested(snapshot) && remembersRunning();
+      immediateResumePending = enabled;
+    }
     record.confirmation = Promise.resolve().then(async () => {
       if (!snapshot || persistenceBlocked) return false;
       let confirmed = false;
@@ -340,6 +375,7 @@ export function createCycleSession({
     const deadline = deadlineVersion, intent = intentVersion;
     const remaining = Math.max(0, dueMs - now());
     if (remaining === 0) { void beginLaunch(); return; }
+    pageResumePending = false;
     deadlineTimer = setTimer(() => {
       if (deadline !== deadlineVersion || intent !== intentVersion || !available() || !enabled || suspended()) return;
       deadlineTimer = undefined;
@@ -369,6 +405,7 @@ export function createCycleSession({
     if (message !== 'Program exited unsuccessfully.' || !known) {
       fatalError = Object.freeze({ kind: 'error', message, code: codeFor(run, message), fatal: true });
       cancelDeadline();
+      persistResume(false);
     }
     // The owned terminal path publishes only after cleanup and accepted producer drain.
     if (message === 'Frame send failed.') void failDisplay();
@@ -445,6 +482,10 @@ export function createCycleSession({
     if (!owns(run)) return;
     run.unknownError = true;
     run.active = false;
+    // Suspend immediately, but publish only after cleanup and accepted-frame drain.
+    fatalError ??= Object.freeze({ kind: 'error', message: 'Program exited unsuccessfully.',
+      code: codeFor(run, 'Program exited unsuccessfully.'), fatal: true });
+    persistResume(false);
     phase = 'stopping';
     cancelDeadline();
     // Rejection proves no cleanup result. Stop without granting a natural completion fact.
@@ -466,6 +507,8 @@ export function createCycleSession({
   }
 
   function startGeneration(execution, intent) {
+    immediateResumePending = false;
+    pageResumePending = false;
     const run = { intent, active: true, terminal: false, finished: false, acceptedOutput: false };
     generation = run;
     // An ordinary prior Error remains displayed until valid output or this run's terminal result.
@@ -513,6 +556,8 @@ export function createCycleSession({
   }
 
   function disable({ recover = false } = {}) {
+    immediateResumePending = false;
+    pageResumePending = false;
     enabled = false;
     ++intentVersion;
     ++launchVersion;
@@ -521,6 +566,7 @@ export function createCycleSession({
     const intent = intentVersion;
     if (generation) generation.stopReason ??= 'intent';
     if (generation) void requestStop(generation, 'intent');
+    persistResume(false);
     phase = 'stopping';
     const oldFrames = invalidateDisplay();
     return schedule(async () => {
@@ -556,6 +602,7 @@ export function createCycleSession({
     queue?.dispose();
     if (generation) generation.stopReason ??= 'display';
     if (generation) void requestStop(generation, 'display');
+    persistResume(false);
     phase = 'stopping';
     return schedule(async () => {
       await stopOwned('display');
@@ -592,12 +639,14 @@ export function createCycleSession({
     if (idleSetup()) return tail;
     let actionOnPress;
     try { actionOnPress = policy.repeat ? policy.readPress(configuration?.snapshot) : 'refresh'; } catch { return tail; }
-    if (enabled) {
+    if (enabled || generation) {
       // Safety stops do not wait for a pending configuration confirmation or clear fatal errors.
       if (actionOnPress === 'stop') return disable();
       // Decide at recognition, before appending any operation: never defer an active Refresh tap.
       if (['starting', 'running'].includes(phase)) return tail;
     }
+    pageResumePending = false;
+    immediateResumePending = false;
     if (suspended()) {
       const intent = ++intentVersion;
       ++launchVersion;
@@ -616,6 +665,7 @@ export function createCycleSession({
         protocolBlocked = false;
         displayFailurePending = false;
         enabled = true;
+        persistResume(remembersRunning());
         phase = 'stopped';
         invalidateDisplay();
         retain(undefined);
@@ -626,6 +676,7 @@ export function createCycleSession({
     }
     enabled = true;
     ++intentVersion;
+    persistResume(remembersRunning());
     if (policy.repeat) dueMs = now();
     return beginLaunch();
   }
@@ -676,6 +727,8 @@ export function createCycleSession({
 
   function applySettings(input) {
     const changes = adoptSettings(input);
+    if (policy.repeat && !remembersRunning() && (!available() || immediateResumePending || pageResumePending)) consumeAutomaticResume();
+    if (!changes.executionChanged && enabled && !suspended() && remembersRunning()) persistResume(true);
     const record = configuration;
     const intent = intentVersion;
     if (changes.titleOnly) {
@@ -762,6 +815,7 @@ export function createCycleSession({
         || !configuration?.validation) return;
       if (intervalResetIntent !== undefined && !fulfillIntervalReset(intent)) return;
       phase = 'waiting';
+      if (immediateResumePending) dueMs = now();
       dueMs ??= now();
       armDeadline();
     });
@@ -769,6 +823,8 @@ export function createCycleSession({
 
   function appear(input) {
     const returning = !visible;
+    // Keep page-return provenance until its overdue launch or restored visible countdown.
+    if (returning && policy.repeat && enabled && !generation && !suspended()) pageResumePending = true;
     visible = true;
     if (returning) invalidateDisplay();
     void applySettings(input);
@@ -781,6 +837,7 @@ export function createCycleSession({
     cancelGesture();
     cancelDeadline(true);
     ++launchVersion;
+    if (policy.repeat && !remembersRunning()) consumeAutomaticResume();
     const old = invalidateDisplay();
     if (!policy.repeat && !generation && (enabled || phase === 'starting')) {
       // Hiding a pending one-shot consumes it. Availability return is display-only.
@@ -799,6 +856,21 @@ export function createCycleSession({
     connected = next;
     if (!connected) {
       cancelGesture();
+      if (policy.repeat && remembersRunning() && enabled && !suspended()) {
+        immediateResumePending = true;
+        ++launchVersion;
+        cancelDeadline();
+        if (generation) void requestStop(generation, 'availability');
+        phase = 'stopping';
+        const old = invalidateDisplay();
+        const intent = intentVersion;
+        return schedule(async () => {
+          await old?.whenIdle();
+          // A quick reconnect may already own a new display queue; drain only the disconnected one.
+          await stopOwned('availability', old ?? null);
+          if (intent === intentVersion) phase = 'stopped';
+        });
+      }
       if (policy.preserveStoppedOutcome && !generation && !enabled && phase === 'stopped') {
         // A completed one-shot has no process or pending request to stop. Keep its local outcome.
         ++intentVersion;
@@ -818,7 +890,8 @@ export function createCycleSession({
       await pending;
       await record?.confirmation;
       await frames?.whenIdle();
-      if (pending === tail && record === configuration && frames === queue) return;
+      await Promise.all([...intentWrites]);
+      if (pending === tail && record === configuration && frames === queue && intentWrites.size === 0) return;
     }
   }
 

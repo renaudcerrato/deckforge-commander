@@ -988,6 +988,8 @@ test('Once fresh independent sessions cannot inherit completed output or transie
   assert.equal(first.session.getState().presentation, 'streaming'); assert.deepEqual(fresh.writes, []);
 });
 for (const input of [{ ...base, runRequested: true }, { ...base, intervalSeconds: 1 },
+  { ...base, rememberRunningState: true }, { ...base, rememberRunningState: false },
+  { ...base, resumeRequested: true }, { ...base, resumeRequested: false },
   { ...base, actionOnPress: 'stop' }, { executable: 'relative', argsText: '' }]) {
   test('Once stored foreign intent/controls or invalid execution never grant a launch', options, async () => {
     // Arrange

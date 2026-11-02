@@ -16,56 +16,71 @@
         #themeColor::-webkit-color-swatch-wrapper { padding: 0; }
         #themeColor::-webkit-color-swatch { border: 0; border-radius: 2px; }
         #themeColor::-moz-color-swatch { border: 0; border-radius: 2px; }
+        .settings-section { margin-top: 24px; }
+        .settings-section:first-of-type { margin-top: 16px; }
+        .settings-section > h2 { margin: 0 20px 12px; padding-bottom: 8px; border-bottom: 1px solid #4a4a4a; color: #d0d0d0; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
         .project-footer { margin: 20px 0 12px; color: #969696; text-align: center; font-size: 12px; line-height: 1.5; }
-        #timer-controls[hidden], #custom-interval[hidden] { display: none !important; }
+        #timer-controls[hidden], #custom-interval[hidden], #remember-controls[hidden] { display: none !important; }
     </style>
     <script src="sdpi-components.js"></script>
     <script src="run.js"></script>
 </head>
 <body>
-    <sdpi-item label="Executable">
-        <sdpi-file id="executable"></sdpi-file>
-    </sdpi-item>
-    <sdpi-item>
-        <a id="ask-chatgpt" href="#">Ask ChatGPT to create your script</a>
-    </sdpi-item>
-    <sdpi-item label="Title (optional)">
-        <sdpi-textfield id="title" placeholder="DeckForge Commander"></sdpi-textfield>
-    </sdpi-item>
-    <sdpi-item label="Arguments">
-        <sdpi-textfield id="argsText"></sdpi-textfield>
-        <small>Quote arguments containing spaces, for example --mode "daily report".</small>
-    </sdpi-item>
-    <sdpi-item label="Working directory (optional)">
-        <sdpi-textfield id="cwd" placeholder="/absolute/path/to/working-directory"></sdpi-textfield>
-    </sdpi-item>
-    <div id="timer-controls" hidden>
-        <sdpi-item label="Action on press">
-            <sdpi-select id="actionOnPress">
-                <option value="refresh">start / refresh (long press to stop)</option>
-                <option value="stop">start / stop</option>
-            </sdpi-select>
+    <section class="settings-section" aria-labelledby="program-heading">
+        <h2 id="program-heading">Program</h2>
+        <sdpi-item label="Executable">
+            <sdpi-file id="executable"></sdpi-file>
         </sdpi-item>
-        <sdpi-item label="Interval">
-            <sdpi-select id="intervalPreset">
-                <option value="1">1s</option>
-                <option value="10">10s</option>
-                <option value="30">30s</option>
-                <option value="60">1mn</option>
-                <option value="600">10mn</option>
-                <option value="1800">30mn</option>
-                <option value="3600">1h</option>
-                <option value="custom">Custom</option>
-            </sdpi-select>
+        <sdpi-item>
+            <a id="ask-chatgpt" href="#">Ask ChatGPT to create your script</a>
         </sdpi-item>
-        <sdpi-item id="custom-interval" label="Interval (seconds)" hidden>
-            <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
-            <small>Enter whole seconds from 1 to 86400.</small>
+        <sdpi-item label="Arguments">
+            <sdpi-textfield id="argsText"></sdpi-textfield>
+            <small>Quote arguments containing spaces, for example --mode "daily report".</small>
         </sdpi-item>
-    </div>
-    <sdpi-item label="Theme color">
-        <input id="themeColor" type="color" value="#606060" aria-label="Artwork theme color" />
-    </sdpi-item>
+        <sdpi-item label="Working directory (optional)">
+            <sdpi-textfield id="cwd" placeholder="/absolute/path/to/working-directory"></sdpi-textfield>
+        </sdpi-item>
+    </section>
+    <section id="remember-controls" class="settings-section" aria-labelledby="behavior-heading" hidden>
+        <h2 id="behavior-heading">Behavior</h2>
+        <div id="timer-controls" hidden>
+            <sdpi-item label="Run every">
+                <sdpi-select id="intervalPreset">
+                    <option value="1">1s</option>
+                    <option value="10">10s</option>
+                    <option value="30">30s</option>
+                    <option value="60">1mn</option>
+                    <option value="600">10mn</option>
+                    <option value="1800">30mn</option>
+                    <option value="3600">1h</option>
+                    <option value="custom">Custom</option>
+                </sdpi-select>
+            </sdpi-item>
+            <sdpi-item id="custom-interval" label="Interval (seconds)" hidden>
+                <sdpi-textfield id="intervalSeconds"></sdpi-textfield>
+                <small>Enter whole seconds from 1 to 86400.</small>
+            </sdpi-item>
+            <sdpi-item label="On Press">
+                <sdpi-select id="actionOnPress">
+                    <option value="refresh">start / refresh (long press to stop)</option>
+                    <option value="stop">start / stop</option>
+                </sdpi-select>
+            </sdpi-item>
+        </div>
+        <sdpi-item>
+            <sdpi-checkbox id="rememberRunningState" label="Resume after sleep, reconnect, or restart"></sdpi-checkbox>
+        </sdpi-item>
+    </section>
+    <section class="settings-section" aria-labelledby="appearance-heading">
+        <h2 id="appearance-heading">Appearance</h2>
+        <sdpi-item label="Title (optional)">
+            <sdpi-textfield id="title" placeholder="DeckForge Commander"></sdpi-textfield>
+        </sdpi-item>
+        <sdpi-item label="Theme color">
+            <input id="themeColor" type="color" value="#606060" aria-label="Artwork theme color" />
+        </sdpi-item>
+    </section>
     <p id="settings-status" role="status" aria-live="polite"></p>
     <footer class="project-footer">
         DeckForge Commander · <a id="github-project" href="https://github.com/renaudcerrato/deckforge-commander">GitHub ↗</a>

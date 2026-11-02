@@ -74,7 +74,144 @@ function harness({ built = false, loading = false } = {}) {
     chained: () => chained, edits: () => edits(sockets.at(-1)) };
 }
 
+// REMEMBER: SDPI checkbox value and protocol edits are booleans, without autosave bindings.
+for (const built of [false, true]) {
+  test(`${built ? 'built' : 'source'} Loop preference edits never send plugin-owned saved intent`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose); h.ready({ ...initial, resumeRequested: true });
+    // Act
+    h.f.rememberRunningState.value = false; const request = h.last();
+    // Assert
+    assert.deepEqual(JSON.parse(JSON.stringify(request.changes)), { rememberRunningState: false });
+    assert.equal(Object.hasOwn(request.changes, 'resumeRequested'), false);
+  });
+}
+for (const resumeRequested of [true, false]) {
+  test(`Loop bridge rejects plugin-owned saved intent ${resumeRequested}`, t => {
+    // Arrange
+    const h = harness(); t.after(h.dispose); h.ready({ ...initial, resumeRequested: true });
+    // Act
+    const accepted = h.bridge.edit({ resumeRequested }, { immediate: true });
+    // Assert
+    assert.equal(accepted, false); assert.deepEqual(h.edits(), []); assert.equal(h.errors.at(-1), 'INVALID_SETTINGS');
+  });
+}
+for (const built of [false, true]) for (const action of [RUN_ACTION_UUID, TIMER_ACTION_UUID]) {
+  test(`${built ? 'built' : 'source'} ${action} programmatic checkbox hydration changes true to false without saving`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose);
+    h.bind({ ...initial, rememberRunningState: true }, action);
+    assert.equal(h.f.rememberRunningState.value, true); assert.deepEqual(h.edits(), []);
+    // Act: the plugin's handshake snapshot replaces stale registration settings.
+    h.open(); h.claim({ ...initial, rememberRunningState: false });
+    // Assert
+    assert.equal(h.f.rememberRunningState.value, false); assert.deepEqual(h.edits(), []);
+    assert.equal(h.f.status.textContent, '');
+  });
+  for (const preference of [undefined, true, false]) {
+    test(`${built ? 'built' : 'source'} ${action} remember ${String(preference)} hydrates without edits`, t => {
+      // Arrange
+      const h = harness({ built }); t.after(h.dispose);
+      const input = { ...initial, ...(preference === undefined ? {} : { rememberRunningState: preference }) };
+      // Act
+      h.ready(input, action);
+      // Assert
+      assert.equal(isHiddenByAncestry(h.f.rememberRunningState), false);
+      assert.equal(h.f.rememberRunningState.value, preference ?? true); assert.deepEqual(h.edits(), []);
+      assert.equal(h.f.status.textContent, '');
+      assert.equal(Object.hasOwn(input, 'rememberRunningState'), preference !== undefined);
+      // Act: unchanged assignment is separate from observing hydration.
+      h.f.rememberRunningState.value = preference ?? true;
+      // Assert
+      assert.deepEqual(h.edits(), []); assert.equal(h.f.status.textContent, '');
+    });
+  }
+  test(`${built ? 'built' : 'source'} ${action} immediate remember edits reject stale and foreign replies`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose); h.ready(initial, action);
+    // Act
+    h.f.rememberRunningState.value = false; const off = h.last();
+    h.f.rememberRunningState.value = true; const on = h.last();
+    h.reply({ ...off, type: 'canvas:reply', status: 'saved', settings: { ...initial, rememberRunningState: false } });
+    h.reply({ ...on, context: 'foreign', type: 'canvas:reply', status: 'saved', settings: { ...initial, rememberRunningState: false } });
+    const pending = { value: h.f.rememberRunningState.value, status: h.f.status.textContent };
+    h.reply({ ...on, type: 'canvas:reply', status: 'saved', settings: { ...initial, rememberRunningState: true } });
+    h.f.rememberRunningState.value = true;
+    // Assert
+    assert.deepEqual(JSON.parse(JSON.stringify(off.changes)), { rememberRunningState: false });
+    assert.deepEqual(JSON.parse(JSON.stringify(on.changes)), { rememberRunningState: true });
+    assert.equal(h.edits().length, 2); assert.deepEqual(pending, { value: true, status: 'Saving…' });
+    assert.equal(h.f.status.textContent, '');
+  });
+  test(`${built ? 'built' : 'source'} ${action} invalid stored remember never guesses or repairs`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose);
+    // Act
+    h.ready({ ...initial, rememberRunningState: 'false' }, action);
+    // Assert
+    assert.equal(h.f.rememberRunningState.value, false);
+    assert.equal(h.f.status.textContent, 'Settings need correction.'); assert.deepEqual(h.edits(), []);
+  });
+  test(`${built ? 'built' : 'source'} ${action} invalid local remember value never sends an edit`, t => {
+    // Arrange: valid stored settings cannot supply the local validation error.
+    const h = harness({ built }); t.after(h.dispose); h.ready(initial, action);
+    assert.equal(h.f.status.textContent, '');
+    // Act
+    h.f.rememberRunningState.value = 'not-a-boolean';
+    // Assert
+    assert.equal(h.f.status.textContent, 'Settings need correction.'); assert.deepEqual(h.edits(), []);
+  });
+  test(`${built ? 'built' : 'source'} ${action} remember binding reset hides Run and rejects old acknowledgment`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose); h.ready(initial, action);
+    h.f.rememberRunningState.value = false; const old = h.last(), socket = h.sockets[0];
+    // Act
+    h.ready({ executable: initial.executable, argsText: '' }, ONCE_ACTION_UUID, 'new-run');
+    const resetValue = h.f.rememberRunningState.value;
+    h.f.rememberRunningState.value = true;
+    h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: { ...initial, rememberRunningState: false } }, socket);
+    // Assert
+    assert.equal(isHiddenByAncestry(h.f.rememberRunningState), true); assert.deepEqual(h.edits(), []);
+    assert.equal(resetValue, false);
+    assert.equal(h.sockets[0].closed, true); assert.equal(h.f.status.textContent, '');
+  });
+}
+for (const binding of ['unbound', 'Run', 'unknown']) {
+  test(`remember bridge rejects boolean edit for ${binding} without transport`, t => {
+    // Arrange
+    const h = harness(); t.after(h.dispose);
+    if (binding !== 'unbound') h.ready(initial, binding === 'Run' ? ONCE_ACTION_UUID : 'unknown');
+    assert.equal(isHiddenByAncestry(h.f.rememberRunningState), true);
+    assert.equal(h.f.rememberRunningState.value, false);
+    // Act
+    const accepted = h.bridge.edit({ rememberRunningState: false }, { immediate: true });
+    // Assert
+    assert.equal(accepted, false); assert.equal(h.errors.at(-1), 'INVALID_SETTINGS');
+    assert.ok(h.sockets.every(socket => edits(socket).length === 0));
+  });
+}
+for (const value of ['false', 0, 1, null, {}, []]) {
+  test(`remember bridge rejects nonboolean ${JSON.stringify(value)} atomically`, t => {
+    // Arrange
+    const h = harness(); t.after(h.dispose); h.ready();
+    // Act
+    const accepted = h.bridge.edit({ rememberRunningState: value, title: 'not saved' }, { immediate: true });
+    // Assert
+    assert.equal(accepted, false); assert.deepEqual(h.edits(), []); assert.equal(h.errors.at(-1), 'INVALID_SETTINGS');
+  });
+}
+
 // Plain errors: transport diagnostics never become visible suffixes or raw reply text.
+test('remember bridge rejects selected accessors without reading values or sending mixed edits', t => {
+  // Arrange
+  const h = harness(); t.after(h.dispose); h.ready(); let calls = 0;
+  const changes = { title: 'not saved', get rememberRunningState() { calls++; throw Error('synthetic private value'); } };
+  // Act
+  const accepted = h.bridge.edit(changes, { immediate: true });
+  // Assert
+  assert.equal(accepted, false); assert.equal(calls, 0); assert.deepEqual(h.edits(), []);
+  assert.equal(h.f.status.textContent, 'Settings need correction.');
+});
 for (const built of [false, true]) for (const [name, action] of [
   ['Stream', RUN_ACTION_UUID], ['Loop', TIMER_ACTION_UUID], ['Run', ONCE_ACTION_UUID],
 ]) for (const [label, diagnostics, expected] of [
@@ -104,6 +241,17 @@ for (const built of [false, true]) for (const [name, action] of [
 
 // UUID-1: public identities select Loop-only controls; historical names are not aliases.
 for (const built of [false, true]) {
+  test(`${built ? 'built' : 'source'} unbound inspector hides the whole Behavior section but keeps Program and Appearance visible`, t => {
+    // Arrange
+    const h = harness({ built }); t.after(h.dispose);
+    // Act
+    const hidden = isHiddenByAncestry(h.f.behaviorHeading);
+    // Assert
+    assert.equal(h.f.behaviorHeading.textContent, 'Behavior'); assert.equal(hidden, true);
+    assert.equal(h.f.rememberControls.hidden, true); assert.equal(isHiddenByAncestry(h.f.rememberRunningState), true);
+    assert.equal(isHiddenByAncestry(h.f.programHeading), false); assert.equal(isHiddenByAncestry(h.f.appearanceHeading), false);
+    assert.deepEqual(h.sockets, []);
+  });
   for (const [action, loop, valid] of [
     ['git.renaudcerrato.deckforge.stream', false, true],
     ['git.renaudcerrato.deckforge.loop', true, true],
@@ -122,6 +270,12 @@ for (const built of [false, true]) {
       const changes = h.edits().map(message => message.payload.changes);
       // Assert
       assert.equal(h.f.timerControls.hidden, !loop);
+      const behaviorVisible = loop || action === RUN_ACTION_UUID;
+      assert.equal(h.f.behaviorHeading.textContent, 'Behavior');
+      assert.equal(isHiddenByAncestry(h.f.behaviorHeading), !behaviorVisible);
+      assert.equal(h.f.rememberControls.hidden, !behaviorVisible);
+      assert.equal(isHiddenByAncestry(h.f.rememberRunningState), !behaviorVisible);
+      assert.equal(isHiddenByAncestry(h.f.programHeading), false); assert.equal(isHiddenByAncestry(h.f.appearanceHeading), false);
       assert.equal(isHiddenByAncestry(h.f.actionOnPress), !loop);
       assert.equal(isHiddenByAncestry(h.f.intervalPreset), !loop);
       assert.equal(isHiddenByAncestry(h.f.intervalSeconds), true);
@@ -158,6 +312,10 @@ for (const built of [false, true]) {
       h.reply({ ...old, type: 'canvas:reply', status: 'saved', settings: initial }, socket);
       // Assert: stale callbacks cannot reveal controls belonging to a retired binding.
       assert.equal(customShown, true); assert.equal(presetHidesCustom, true);
+      const behaviorVisible = reset === 'Stream' || reset === 'Loop reopen';
+      assert.equal(isHiddenByAncestry(h.f.behaviorHeading), !behaviorVisible);
+      assert.equal(h.f.rememberControls.hidden, !behaviorVisible);
+      assert.equal(isHiddenByAncestry(h.f.rememberRunningState), !behaviorVisible);
       assert.equal(isHiddenByAncestry(h.f.actionOnPress), reset !== 'Loop reopen');
       assert.equal(isHiddenByAncestry(h.f.intervalPreset), reset !== 'Loop reopen');
       assert.equal(isHiddenByAncestry(h.f.intervalSeconds), true);
@@ -733,7 +891,7 @@ for (const input of ['preset', 'custom']) {
     const request = h.last(); await b.deliver();
     // Assert: fake matched host reporting is not a durability or hardware claim.
     assert.deepEqual(request.changes, { intervalSeconds: 10 });
-    assert.deepEqual(b.writes, [{ ...initial, args: ['retained legacy'], intervalSeconds: 10 }]);
+    assert.deepEqual(b.writes, [{ ...initial, args: ['retained legacy'], resumeRequested: true }, { ...initial, args: ['retained legacy'], intervalSeconds: 10, resumeRequested: true }]);
     assert.equal(Object.hasOwn(b.writes[0], 'runRequested'), false); assert.equal(Object.hasOwn(b.writes[0], 'enabled'), false);
     assert.equal(b.replies.at(-1).status, 'saved'); assert.equal(h.f.status.textContent, '');
     assert.equal(b.launches.length, 1); assert.equal(Object.hasOwn(b.launches[0], 'intervalSeconds'), false);
@@ -1024,7 +1182,11 @@ for (const built of [false, true]) for (const phase of ['disabled', 'running', '
     // Assert
     assert.deepEqual(request.changes, { actionOnPress: 'stop' });
     assert.deepEqual(after, before);
-    assert.equal(b.writes.length, 1); assert.deepEqual(b.writes[0], { ...initial, args: ['retained legacy'], actionOnPress: 'stop' });
+    const configured = { ...initial, args: ['retained legacy'], actionOnPress: 'stop' };
+    assert.deepEqual(b.writes, phase === 'disabled'
+      ? [configured, { ...configured, resumeRequested: true }]
+      : [{ ...initial, args: ['retained legacy'], resumeRequested: true },
+        { ...configured, resumeRequested: true }, { ...configured, resumeRequested: false }]);
     assert.equal(b.replies.at(-1).status, 'saved'); assert.equal(h.f.status.textContent, '');
     assert.equal(b.runs[0]?.stops ?? 0, phase === 'running' ? 1 : 0);
     assert.equal(b.launches.length, launches + (phase === 'disabled' ? 1 : 0));
@@ -1045,7 +1207,7 @@ for (const built of [false, true]) {
       h.f.actionOnPress.value = policy; await b.deliver(); await b.advance(58999);
       // Assert: the edit neither launches early nor resets the established delay.
       assert.equal(b.launches.length, 1); assert.equal(b.runs[0].stops, 0); assert.deepEqual(b.display, displayed);
-      assert.deepEqual(b.writes, [{ ...initial, actionOnPress: policy }]); assert.equal(h.f.status.textContent, '');
+      assert.deepEqual(b.writes, [{ ...settings, resumeRequested: true }, { ...initial, actionOnPress: policy, resumeRequested: true }]); assert.equal(h.f.status.textContent, '');
       await b.advance(1); assert.equal(b.launches.length, 2); assert.deepEqual(b.display, displayed);
     });
   }
@@ -1059,7 +1221,7 @@ for (const built of [false, true]) {
     // Assert
     assert.match(decodeURIComponent(before.at(-1)), />Error<\/text>/);
     assert.deepEqual(b.display, before); assert.equal(b.launches.length, 1);
-    assert.deepEqual(b.writes, [{ ...initial, actionOnPress: 'stop' }]); assert.equal(h.f.status.textContent, '');
+    assert.deepEqual(b.writes, [{ ...initial, resumeRequested: true }, { ...initial, actionOnPress: 'stop', resumeRequested: true }]); assert.equal(h.f.status.textContent, '');
     await b.advance(58999); assert.equal(b.launches.length, 1);
     await b.advance(1); assert.equal(b.launches.length, 2); assert.deepEqual(b.display, before);
   });
@@ -1072,7 +1234,7 @@ for (const built of [false, true]) {
     const active = b.launches.length; await b.finish();
     // Assert
     assert.equal(active, 1); assert.equal(b.launches.length, 1); assert.equal(b.runs[0].stops, 0);
-    assert.deepEqual(b.writes, [{ ...initial, actionOnPress: 'refresh' }]); assert.equal(h.f.status.textContent, '');
+    assert.deepEqual(b.writes, [{ ...settings, resumeRequested: true }, { ...initial, actionOnPress: 'refresh', resumeRequested: true }]); assert.equal(h.f.status.textContent, '');
     await b.advance(59999); assert.equal(b.launches.length, 1);
     await b.advance(1); assert.equal(b.launches.length, 2);
   });

@@ -1,7 +1,80 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifySettings, validateSettings, sameExecutionSettings, getInspectorConfiguration, settingsDiagnosticCode, sameSettingsExceptTheme, isThemeOnlyChange } from '../src/core/settings.mjs';
+import { classifySettings, validateSettings, sameExecutionSettings, getInspectorConfiguration, settingsDiagnosticCode, sameSettingsExceptTheme, isThemeOnlyChange, readResumeRequested } from '../src/core/settings.mjs';
 import { parseArguments } from '../src/core/arguments.mjs';
+
+// RESTART: saved intent is a strict plugin-owned boolean, never execution input.
+for (const value of [undefined, false, true]) {
+  test(`Stream saved intent ${String(value)} defaults read-only and preserves legacy intent`, () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', argsText: '', runRequested: true,
+      ...(value === undefined ? {} : { resumeRequested: value }) }, before = structuredClone(input);
+    // Act
+    const requested = readResumeRequested(input), classified = classifySettings(input, 'posix');
+    const equivalent = sameExecutionSettings(input, { ...input, resumeRequested: !value }, 'posix');
+    // Assert
+    assert.equal(requested, value ?? false); assert.deepEqual(classified.execution, { executable: input.executable, args: [] });
+    assert.equal(equivalent, true); assert.deepEqual(input, before);
+  });
+}
+for (const value of [undefined, null, 'true', 'false', 0, 1, [], {}]) {
+  test(`Stream rejects present nonboolean saved intent ${String(value)}`, () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', argsText: '', resumeRequested: value };
+    // Act
+    const read = () => readResumeRequested(input), classify = () => classifySettings(input, 'posix');
+    // Assert
+    assert.throws(read, { message: 'Invalid settings.', diagnosticCode: 'INVALID_RUN_STATE' });
+    assert.throws(classify, { message: 'Invalid settings.', diagnosticCode: 'INVALID_RUN_STATE' });
+  });
+}
+test('saved intent accessor cannot execute during classification', () => {
+  // Arrange
+  let calls = 0;
+  const input = { executable: '/synthetic/program', argsText: '', get resumeRequested() { calls++; return true; } };
+  // Act
+  const classify = () => classifySettings(input, 'posix');
+  // Assert
+  assert.throws(classify, { message: 'Invalid settings.' }); assert.equal(calls, 0);
+});
+
+// REMEMBER: configuration is strict, read-only and absent from the executable DTO.
+for (const preference of [undefined, true, false]) {
+  test(`Stream remember ${String(preference)} defaults read-only and never changes execution`, () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', argsText: '', runRequested: true,
+      ...(preference === undefined ? {} : { rememberRunningState: preference }) };
+    const original = structuredClone(input);
+    // Act
+    const classified = classifySettings(input, 'posix'), view = getInspectorConfiguration(input, 'posix');
+    const same = sameExecutionSettings(input, { ...input, rememberRunningState: !preference }, 'posix');
+    // Assert
+    assert.deepEqual(classified.execution, { executable: input.executable, args: [] });
+    assert.equal(view.rememberRunningState, preference ?? true); assert.equal(same, true);
+    assert.deepEqual(input, original); assert.equal(input.runRequested, true);
+  });
+}
+for (const value of [null, 'true', 'false', 0, 1, {}, []]) {
+  test(`Stream rejects nonboolean remember ${JSON.stringify(value)} without a guessed preference`, () => {
+    // Arrange
+    const input = { executable: '/synthetic/program', argsText: '', rememberRunningState: value };
+    // Act
+    const view = getInspectorConfiguration(input, 'posix');
+    const classify = () => classifySettings(input, 'posix');
+    // Assert
+    assert.throws(classify, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' });
+    assert.equal(view.rememberRunningState, undefined); assert.equal(view.diagnosticCode, 'INVALID_SETTINGS');
+  });
+}
+test('Stream remember accessor is rejected without invoking user code', () => {
+  // Arrange
+  let calls = 0;
+  const input = { executable: '/synthetic/program', argsText: '', get rememberRunningState() { calls++; return true; } };
+  // Act
+  const operation = () => classifySettings(input, 'posix');
+  // Assert
+  assert.throws(operation, { message: 'Invalid settings.', diagnosticCode: 'INVALID_SETTINGS' }); assert.equal(calls, 0);
+});
 
 // TITLE-1: stored cosmetic metadata never changes execution or invents saved defaults.
 for (const title of ['a/b\\c.txt é', '', ' \t\u202e ', null, 42, {}, ['caption'], 'bad\0title', 'x'.repeat(8193)]) {
@@ -84,7 +157,7 @@ test('new inspector configuration synchronously displays empty arguments', () =>
   // Act
   const result = getInspectorConfiguration(input);
   // Assert
-  assert.deepEqual(result, { executable: '', cwd: '', argsText: '', themeColor: '#969696', title: '' });
+  assert.deepEqual(result, { executable: '', cwd: '', argsText: '', themeColor: '#969696', title: '', rememberRunningState: true });
   assert.deepEqual(input, {});
 });
 

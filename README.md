@@ -46,20 +46,15 @@ Choose how your program runs:
 </tbody>
 </table>
 
-- **Stream:** Tap to start or stop. Runs until stopped or the program exits; can restart after reconnect if still requested.
-- **Loop:** Tap to start or refresh; hold one second to stop. Repeats after each completion and the selected delay. Remains disabled after reconnect.
+- **Stream:** Tap to start or stop. Runs until stopped or the program exits.
+- **Loop:** Tap to start or refresh; hold one second to stop. Repeats after each completion and the selected delay.
 - **Run:** Tap to execute once; hold one second to stop. Busy taps are ignored. Retains successful output and never restarts automatically.
 
 **Run and Loop** keep a successful run's final output visible, if any. Loop retains it between runs; no-output success shows `success`.
 
-<details>
-<summary>Switching pages, disconnecting, and restarting</summary>
+Stop keys before copying or exporting them to prevent automatic starts.
 
-- **Switching pages or profiles:** Stream stops and may restart when you return if you had left it running. Loop and Run may finish their current program, but start nothing new while hidden.
-- **Disconnecting the device:** All running programs stop. After reconnecting, Stream may restart if you had left it running; Loop and Run require another press.
-- **Restarting the plugin:** All keys start stopped, regardless of their previous state.
-
-</details>
+Programs may keep running after a plugin restart.
 
 ## Requirements
 
