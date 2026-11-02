@@ -274,20 +274,26 @@ function adapterHarness() {
     async emit(name, device) { listeners.get(name)?.({ device }); await progress(); } };
 }
 
-function runtime(id = 'synthetic-key', initialSettings = { executable: '/synthetic/program', args: [], runRequested: true }) {
-  let settings = structuredClone(initialSettings);
-  const display = [], writes = [];
+function runtime(id = 'synthetic-key', initialSettings = { executable: '/synthetic/program', args: [], runRequested: true }, slot) {
+  // SDK wrappers for one key share host storage, not wrapper-local settings.
+  slot ??= { value: structuredClone(initialSettings), writes: [] };
+  const display = [], writes = slot.writes;
   return {
+    slot, initialSettings: structuredClone(initialSettings),
     id, manifestId: 'synthetic-action', device: { id: 'synthetic-device', name: 'synthetic-name', type: 999, size: { columns: 0, rows: 3 }, isConnected: true },
     coordinates: { column: 0, row: 2 }, isKey: () => true,
     display, writes,
-    async setSettings(next) { settings = next; writes.push(structuredClone(next)); }, async getSettings() { return settings; },
+    async setSettings(next) { slot.value = structuredClone(next); writes.push(structuredClone(next)); },
+    async getSettings() { return structuredClone(slot.value); },
     async setImage(image) { display.push(['image', image]); }, async setTitle(title) { display.push(['title', title]); },
   };
 }
 const appear = async (h, r) => h.action.onWillAppear({ action: r, payload: { settings: await r.getSettings() } });
 async function startAdapter(h, r) {
   await appear(h, r);
+  // First-snapshot adoption is read-only; the explicit start owns the intent save.
+  assert.deepEqual(r.writes, []);
+  assert.deepEqual(h.launches.filter(launch => launch.snapshot.ELGATO_ACTION_CONTEXT === r.id), []);
   r.display.length = 0; // Running scenarios observe from the explicit press; fresh Ready has separate coverage.
   await h.action.onKeyDown({ action: r, payload: { settings: await r.getSettings() } });
 }
@@ -310,7 +316,7 @@ for (const [themeColor, expected] of [[undefined, '#969696'], ['#ABCDEF', '#abcd
     await startAdapter(h, r);
     // Assert: inherited collision is replaced; invalid renderer inputs use the default.
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, expected);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [{ ...r.initialSettings, resumeRequested: true }]);
     assert.equal(h.logs.some(value => value.includes('ELGATO_ACTION_THEME_COLOR')), false);
   });
 }
@@ -330,7 +336,9 @@ test('actual Stream theme edits isolate keys, preserve running snapshots and exp
   assert.equal(runningCount, 2); assert.deepEqual(runningStops, [0, 0]); assert.deepEqual(h.launches[0].snapshot, original);
   assert.equal(h.launches[1].snapshot.ELGATO_ACTION_THEME_COLOR, '#654321'); assert.deepEqual(second.display, secondDisplay);
   assert.equal(h.launches[2].snapshot.ELGATO_ACTION_THEME_COLOR, '#abcdef'); assert.equal(h.launches.length, 3);
-  assert.deepEqual(second.writes, []); assert.deepEqual(first.writes.map(value => value.runRequested), [true]);
+  assert.deepEqual(second.writes, [{ ...second.initialSettings, resumeRequested: true }]);
+  assert.deepEqual(first.writes, [{ ...first.initialSettings, resumeRequested: true },
+    { ...first.initialSettings, resumeRequested: true, themeColor: '#abcdef' }]);
   assert.equal(h.replies.some(reply => JSON.stringify(reply).includes('ELGATO_')), false);
   assert.equal(h.logs.some(value => value.includes('#abcdef') || value.includes('STALE_SYNTHETIC')), false);
 });
@@ -345,7 +353,7 @@ for (const failed of [false, true]) {
     const originalImage = r.setImage, originalRead = r.getSettings;
     r.setImage = async image => { await originalImage(image); if (artworkSvg(image).includes('>loading...</text>')) { loadingEntered.resolve(); await loading.promise; } };
     const starting = h.action.onKeyDown({ action: r, payload: { settings: initial } }); await loadingEntered.promise;
-    // The explicit Start has local intent only; the theme edit is the first configuration write.
+    // Start intent is confirmed before Loading; the theme edit is a separate save.
     const started = await originalRead();
     r.getSettings = async () => { const snapshot = await originalRead(); readEntered.resolve(snapshot); return read.promise; };
     const editing = sendInspector(h, r, 'canvas:edit', 3, { changes: { themeColor: '#ABCDEF' } });
@@ -359,8 +367,10 @@ for (const failed of [false, true]) {
     await Promise.all([starting, editing]); await progress();
     // Assert: order-independent complete equality, not stale reports or legacy intent metadata.
     assert.equal(before, 0); assert.equal(afterRejectedHost, 0);
-    assert.equal(started.runRequested, false); assert.equal(snapshot.themeColor, '#abcdef'); assert.equal(snapshot.runRequested, false);
-    assert.deepEqual(r.writes.map(value => value.runRequested), [false]);
+    assert.deepEqual(started, { ...initial, resumeRequested: true });
+    assert.deepEqual(snapshot, { ...initial, resumeRequested: true, themeColor: '#abcdef' });
+    assert.deepEqual(r.writes, [{ ...initial, resumeRequested: true },
+      { ...initial, resumeRequested: true, themeColor: '#abcdef' }]);
     assert.equal(h.launches.length, failed ? 0 : 1);
     assert.equal(h.replies.at(-1).status, failed ? 'error' : 'saved');
     if (failed) assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED', '#abcdef'));
@@ -368,7 +378,7 @@ for (const failed of [false, true]) {
   });
 }
 
-// Slice 3: exercise the real Run adapter without SDK startup or real programs.
+// Slice 3: exercise the real Stream adapter without SDK startup or real programs.
 
 async function pendingThemeLaunch(t) {
   const initial = { executable: '/synthetic/report.py', argsText: '', runRequested: false, themeColor: '#123456' };
@@ -392,8 +402,8 @@ async function pendingThemeLaunch(t) {
 
 // Direct persistence injection at this boundary remains in action-session.test.mjs.
 for (const loss of ['hide', 'disconnect', 'stop', 'execution']) {
-  test(`actual Stream ${loss} at the final authority wait prevents stale spawn without extra launch writes`, { timeout: 3000 }, async t => {
-    // Arrange: local Started intent exists and Loading has finished; only theme readback remains pending.
+   test(`actual Stream ${loss} at the final authority wait prevents stale spawn with phase-specific intent saves`, { timeout: 3000 }, async t => {
+    // Arrange: saved start intent exists and Loading has finished; only theme readback remains pending.
     const { h, r, read, snapshot, starting, editing } = await pendingThemeLaunch(t);
     const before = h.launches.length;
     // Act
@@ -404,7 +414,12 @@ for (const loss of ['hide', 'disconnect', 'stop', 'execution']) {
     read.resolve(snapshot); await Promise.all([starting, editing, transition]); await progress();
     // Assert
     assert.equal(before, 0); assert.deepEqual(h.launches, []);
-    assert.deepEqual(r.writes.map(value => value.runRequested), loss === 'execution' ? [false, false] : [false]);
+    const expected = [{ ...r.initialSettings, resumeRequested: true },
+      { ...r.initialSettings, resumeRequested: true, themeColor: '#abcdef' }];
+    if (loss === 'stop' || loss === 'execution') expected.push({ ...r.initialSettings,
+      themeColor: '#abcdef', resumeRequested: false,
+      ...(loss === 'execution' ? { executable: '/synthetic/replacement.sh' } : {}) });
+    assert.deepEqual(r.writes, expected);
     assert.equal(h.replies.at(-1).status, 'saved');
   });
 }
@@ -421,8 +436,10 @@ for (const oldResult of ['match', 'mismatch', 'reject']) {
     await Promise.all([starting, editing, newer]); await progress();
     // Assert
     assert.equal(h.launches.length, 1); assert.equal(h.launches[0].snapshot.ELGATO_ACTION_THEME_COLOR, '#fedcba');
-    assert.equal(h.launches[0].stops, 0); assert.deepEqual(r.writes.map(value => value.runRequested), [false, false]);
-    assert.deepEqual(r.writes.map(value => value.themeColor), ['#abcdef', '#fedcba']);
+    assert.equal(h.launches[0].stops, 0);
+    assert.deepEqual(r.writes, [{ ...r.initialSettings, resumeRequested: true },
+      { ...r.initialSettings, resumeRequested: true, themeColor: '#abcdef' },
+      { ...r.initialSettings, resumeRequested: true, themeColor: '#fedcba' }]);
     assert.equal(h.replies.at(-1).status, 'saved');
   });
 }
@@ -458,7 +475,8 @@ for (const output of [false, true]) {
     assert.match(artworkSvg(frames.at(-1)), />\.py<\/text>.*>report<\/text>.*>exited<\/text>/);
     if (output) assert.equal(frames[1], 'data:image/png;base64,AAAA');
     assert.equal(frames.length, output ? 3 : 2); assert.equal(h.launches.length, 1);
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(r.writes, [{ ...r.initialSettings, resumeRequested: true },
+      { ...r.initialSettings, resumeRequested: false }]);
   });
 }
 
@@ -480,9 +498,9 @@ for (const loss of ['hide', 'disconnect']) {
   });
 }
 
-// Slice 2: real Run adapter forwards Setup artwork and clears the native title without launch authority.
+// Slice 2: real Stream adapter forwards Setup artwork and clears the native title without launch authority.
 for (const [index, input] of [{}, { executable: '', argsText: '' }, { args: ['literal'], cwd: '/synthetic/work' }].entries()) {
-  test(`actual Run adapter Setup ${index} clears title and ignores repeated presses without hydration writes`, { timeout: 3000 }, async t => {
+   test(`actual Stream adapter Setup ${index} clears title and ignores repeated presses without hydration writes`, { timeout: 3000 }, async t => {
     // Arrange
     const h = adapterHarness(), r = runtime('synthetic-setup', input);
     t.after(() => h.action.onWillDisappear({ action: r }));
@@ -498,7 +516,7 @@ for (const [index, input] of [{}, { executable: '', argsText: '' }, { args: ['li
   });
 }
 for (const input of [{ runRequested: 'malformed' }, { executable: 'relative', argsText: '' }]) {
-  test('actual Run adapter invalid/restored Started settings retain fixed Error rather than Setup', { timeout: 3000 }, async t => {
+  test('actual Stream adapter invalid settings retain fixed Error rather than Setup', { timeout: 3000 }, async t => {
     // Arrange
     const h = adapterHarness(), r = runtime('synthetic-invalid-setup', input);
     t.after(() => h.action.onWillDisappear({ action: r }));
@@ -512,7 +530,7 @@ for (const input of [{ runRequested: 'malformed' }, { executable: 'relative', ar
     assert.equal(r.writes.length, 0);
   });
 }
-test('actual Run adapter delayed Setup cannot overwrite newer confirmed Ready after PI configuration', { timeout: 3000 }, async t => {
+test('actual Stream adapter delayed Setup cannot overwrite newer confirmed Ready after PI configuration', { timeout: 3000 }, async t => {
   // Arrange
   const h = adapterHarness(), r = runtime('synthetic-stale-setup-ready', {}), entered = boundaryGate(), gate = boundaryGate();
   t.after(() => h.action.onWillDisappear({ action: r }));
@@ -526,7 +544,7 @@ test('actual Run adapter delayed Setup cannot overwrite newer confirmed Ready af
   assert.equal(r.display.some(([kind, image]) => kind === 'image' && artworkSvg(image).includes('setup required')), false);
   assert.match(artworkSvg(r.display.at(-1)[1]), />report<\/text>.*>ready<\/text>/);
   assert.equal(h.replies.at(-1)?.status, 'saved'); assert.deepEqual(h.launches, []);
-  assert.deepEqual(await r.getSettings(), { executable: '/synthetic/report.py', argsText: '' });
+  assert.deepEqual(await r.getSettings(), { executable: '/synthetic/report.py', argsText: '', resumeRequested: false });
 });
 
 for (const output of [false, true]) {
@@ -549,8 +567,9 @@ for (const output of [false, true]) {
     if (output) assert.equal(images[1], 'data:image/png;base64,AAAA');
     assert.deepEqual(r.display.filter(item => item[0] === 'title'), Array(output ? 3 : 2).fill(['title', '']));
     assert.ok(r.display.every((item, index) => item[0] !== 'image' || r.display[index - 1]?.[0] === 'title'));
-    assert.deepEqual(r.writes, []);
-    assert.deepEqual(saved, { executable: '/synthetic/program', args: [], runRequested: true });
+    assert.deepEqual(r.writes, [{ ...r.initialSettings, resumeRequested: true },
+      { ...r.initialSettings, resumeRequested: false }]);
+    assert.deepEqual(saved, { ...r.initialSettings, resumeRequested: false });
     assert.equal(h.launches.length, 1);
   });
 }
@@ -678,7 +697,8 @@ test('actual starts and eligible hide/resume capture fresh runtime and info whil
   await startAdapter(h, first); await startAdapter(h, other);
   const original = { ...h.launches[0].snapshot };
   // Act: replace current action metadata without changing execution settings.
-  const replacement = runtime(); replacement.device.name = 'replacement-name'; replacement.coordinates = undefined;
+  const replacement = runtime(first.id, await first.getSettings(), first.slot);
+  replacement.device.name = 'replacement-name'; replacement.coordinates = undefined;
   h.sdk.info.application.version = 'new-version';
   await appear(h, replacement);
   const runningCount = h.launches.length;
@@ -736,7 +756,7 @@ for (const started of [false, true]) test(`extracted Stream adopts legacy ${star
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_ARG')), false);
 });
 
-test('extracted Stream toggles local intent without writes and ignores late key payload settings', adapterOptions, async t => {
+test('extracted Stream saves start and stop intent and ignores late key payload settings', adapterOptions, async t => {
   // Arrange
   const initial = { executable: '/synthetic/program', args: ['literal'], cwd: '/synthetic/work', runRequested: false };
   const h = adapterHarness(), r = runtime('synthetic-key', initial);
@@ -748,7 +768,7 @@ test('extracted Stream toggles local intent without writes and ignores late key 
   await h.action.onKeyDown({ action: r, payload: { settings: late } });
   await appear(h, r);
   // Assert
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [{ ...initial, resumeRequested: true }, { ...initial, resumeRequested: false }]);
   assert.deepEqual(h.launches[0].settings, { executable: initial.executable, args: initial.args, cwd: initial.cwd });
   assert.equal(h.launches.length, 1);
   assert.equal(h.launches[0].stops, 1);
@@ -768,35 +788,37 @@ test('extracted Stream refuses launch when complete configuration readback does 
   await progress();
   await h.action.onKeyDown({ action: r, payload: { settings: initial } });
   // Assert
-  assert.deepEqual(r.writes, [{ ...initial, argsText: 'changed' }]);
+  assert.deepEqual(r.writes, [{ ...initial, argsText: 'changed', resumeRequested: false }]);
   assert.equal(h.launches.length, 0);
   assert.equal(r.display.at(-1)[1], createErrorArtwork('STATE_SAVE_FAILED'));
 });
 
-for (const execution of [false, true]) test(`shared PI claimed ${execution ? 'execution' : 'theme'} edit preserves Run policy and complete settings`, adapterOptions, async t => {
+for (const execution of [false, true]) test(`shared PI claimed ${execution ? 'execution' : 'theme'} edit preserves Stream policy and complete settings`, adapterOptions, async t => {
   // Arrange
   const initial = { executable: '/synthetic/program', args: ['legacy'], runRequested: true };
   const h = adapterHarness(), r = runtime('synthetic-key', initial);
   t.after(() => h.action.onWillDisappear({ action: r }));
-  await startAdapter(h, r); await claimInspector(h, r);
-  const hydrationWrites = r.writes.length;
+  await appear(h, r); await claimInspector(h, r);
+  const hydrationWrites = structuredClone(r.writes);
+  await h.action.onKeyDown({ action: r, payload: { settings: initial } });
   const changes = execution ? { argsText: '"SYNTHETIC_PRIVATE_ARG"', cwd: '/synthetic/new-cwd' } : { themeColor: '#123456' };
   // Act
   await sendInspector(h, r, 'canvas:edit', 3, { changes });
   await progress();
   // Assert: claim/hydration never writes or launches; only execution edits stop.
-  assert.equal(hydrationWrites, 0);
-  assert.deepEqual(r.writes, [{ ...initial, ...changes }]);
+  assert.deepEqual(hydrationWrites, []);
+  const edited = { ...initial, ...changes, resumeRequested: !execution };
+  assert.deepEqual(r.writes, [{ ...initial, resumeRequested: true }, edited]);
   assert.equal(h.launches.length, 1);
   assert.equal(h.launches[0].stops, execution ? 1 : 0);
-  assert.deepEqual(h.replies.at(-1), { status: 'saved', settings: r.writes[0], type: 'canvas:reply',
+  assert.deepEqual(h.replies.at(-1), { status: 'saved', settings: edited, type: 'canvas:reply',
     context: r.id, inspectorId: 'synthetic-inspector', requestId: 3 });
   if (execution) assert.match(artworkSvg(r.display.at(-1)[1]), />program<\/text>.*>ready<\/text>/);
   assert.equal(h.logs.some(value => value.includes('SYNTHETIC_PRIVATE_ARG')), false);
 });
 
 for (const rejection of ['foreign context', 'unclaimed edit', 'wrong claim token', 'stale claim', 'foreign inspector', 'stale edit', 'invalid execution']) {
-  test(`shared PI refuses ${rejection} without writes or Run replacement`, adapterOptions, async t => {
+  test(`shared PI refuses ${rejection} without extra writes or Stream replacement`, adapterOptions, async t => {
     // Arrange
     const h = adapterHarness(), r = runtime();
     t.after(() => h.action.onWillDisappear({ action: r }));
@@ -804,6 +826,7 @@ for (const rejection of ['foreign context', 'unclaimed edit', 'wrong claim token
     if (['foreign inspector', 'stale edit', 'invalid execution'].includes(rejection)) await claimInspector(h, r);
     if (['wrong claim token', 'stale claim'].includes(rejection)) await sendInspector(h, r, 'canvas:hello', 1);
     const before = h.replies.length;
+    const writesBefore = structuredClone(r.writes);
     // Act
     if (rejection === 'foreign context') await sendInspector(h, r, 'canvas:hello', 1, { context: 'synthetic-foreign' });
     else if (rejection === 'wrong claim token') await sendInspector(h, r, 'canvas:claim', 2, { token: 'synthetic-wrong' });
@@ -813,7 +836,8 @@ for (const rejection of ['foreign context', 'unclaimed edit', 'wrong claim token
       changes: { executable: rejection === 'invalid execution' ? 'relative' : '/synthetic/replacement' },
     });
     // Assert
-    assert.deepEqual(r.writes, []);
+    assert.deepEqual(writesBefore, [{ ...r.initialSettings, resumeRequested: true }]);
+    assert.deepEqual(r.writes, writesBefore);
     assert.equal(h.launches.length, 1);
     assert.equal(h.launches[0].stops, 0);
     if (rejection === 'invalid execution') {
@@ -831,13 +855,15 @@ test('shared PI retiring an inspector rejects its later claim and edit', adapter
   await startAdapter(h, r); await claimInspector(h, r);
   await claimInspector(h, r, 'synthetic-new-inspector');
   const before = h.replies.length;
+  const writesBefore = structuredClone(r.writes);
   // Act
   await sendInspector(h, r, 'canvas:hello', 4);
   await sendInspector(h, r, 'canvas:claim', 5, { token: '1' });
   await sendInspector(h, r, 'canvas:edit', 6, { changes: { cwd: '/synthetic/retired' } });
   // Assert
   assert.equal(h.replies.length, before);
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(writesBefore, [{ ...r.initialSettings, resumeRequested: true }]);
+  assert.deepEqual(r.writes, writesBefore);
   assert.equal(h.launches[0].stops, 0);
 });
 
@@ -877,10 +903,10 @@ test('shared runtime drops a producer frame held at title clearing when the key 
   // Assert: existing positive output tests cover handoff; hidden and late frames do not hand off.
   assert.equal(r.display.filter(([kind]) => kind === 'image').length, before);
   assert.equal(h.launches[0].stops, 1);
-  assert.deepEqual(r.writes, []);
+  assert.deepEqual(r.writes, [{ ...r.initialSettings, resumeRequested: true }]);
 });
 
-test('extracted Singleton Run registers hooks once and scopes disconnect/resume to the owning device', adapterOptions, async t => {
+test('extracted Singleton Stream registers hooks once and scopes disconnect/resume to the owning device', adapterOptions, async t => {
   // Arrange
   const h = adapterHarness(), first = runtime(), second = runtime('synthetic-second');
   second.device.id = 'synthetic-second-device';
@@ -903,6 +929,6 @@ test('extracted Singleton Run registers hooks once and scopes disconnect/resume 
   for (const name of ['ELGATO_DEVICE_COLUMNS', 'ELGATO_DEVICE_ROWS', 'ELGATO_KEY_COLUMN', 'ELGATO_KEY_ROW', 'ELGATO_APP_LANGUAGE']) {
     assert.equal(Object.hasOwn(h.launches[2].snapshot, name), false);
   }
-  assert.deepEqual(first.writes, []);
-  assert.deepEqual(second.writes, []);
+  assert.deepEqual(first.writes, [{ ...first.initialSettings, resumeRequested: true }]);
+  assert.deepEqual(second.writes, [{ ...second.initialSettings, resumeRequested: true }]);
 });

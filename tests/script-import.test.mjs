@@ -161,7 +161,9 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     assert.equal(new Set(h.files.map(file => file.filename)).size, 4);
     assert.deepEqual(h.files.map(file => file.writes[0].value), sources);
     assert.deepEqual(results.map(result => [result.status, result.importSequence]), [['saved', 1], ['saved', 2], ['saved', 3], ['saved', 4]]);
-    assert.deepEqual(r.slot.value, { ...original, executable: h.files[3].filename, argsText: '', cwd: '', title: 'local title', themeColor: '#abcdef' });
+    // Imports are execution edits: only remembering facades save cleared intent.
+    assert.deepEqual(r.slot.value, { ...original, executable: h.files[3].filename, argsText: '', cwd: '', title: 'local title', themeColor: '#abcdef',
+      ...(kind === 'Run' ? {} : { resumeRequested: false }) });
     assert.deepEqual(h.launches, []);
   });
 }
@@ -262,7 +264,8 @@ for (const kind of ['Stream', 'Loop', 'Run']) {
     // Assert: callback has no implicit Start and preserves the complete baseline.
     assert.equal(result.status, 'saved'); assert.equal(result.context, target.id);
     assert.equal(result.inspectorId, registration.inspectorId); assert.equal(result.requestId, registration.requestId);
-    assert.deepEqual(target.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '', title: 'Imported title' }]);
+    assert.deepEqual(target.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '', title: 'Imported title',
+      ...(kind === 'Run' ? {} : { resumeRequested: false }) }]);
     assert.deepEqual(result.settings, target.slot.value); assert.deepEqual(other.slot.value, untouched); assert.deepEqual(other.writes, []);
     assert.equal(h.files.length, 1); assert.equal(h.files[0].closed, true);
     assert.deepEqual(h.launches, []);
@@ -341,7 +344,7 @@ for (const stage of ['write', 'close']) {
     // Assert: file completion is necessary, and releasing it really permits the same callback to save.
     assert.deepEqual(before, { writes: [], settings: original, results: [], closed: false });
     assert.equal(h.files[0].closed, true);
-    assert.deepEqual(r.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '' }]);
+    assert.deepEqual(r.writes, [{ ...original, executable: h.files[0].filename, argsText: '', cwd: '', resumeRequested: false }]);
     assert.deepEqual(result, { type: 'canvas:script-result', context: r.id, inspectorId: registration.inspectorId,
       requestId: registration.requestId, importSequence: 1, status: 'saved', settings: r.slot.value });
     assert.deepEqual(h.launches, []);

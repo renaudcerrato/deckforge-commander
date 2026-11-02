@@ -143,7 +143,9 @@ for (const [name, validate, classify, same, edit] of facades) {
     const result = edit(input, { executable: String.raw`D:\new.EXE`, cwd: 'D:/work' }, 'win32');
     const cosmetic = edit(input, { themeColor: '#ABCDEF' }, 'posix');
     // Assert
-    assert.deepEqual(result, { ...original, executable: String.raw`D:\new.EXE`, cwd: 'D:/work' });
+    // Execution edits atomically clear remembered intent only for Stream and Loop.
+    assert.deepEqual(result, { ...original, executable: String.raw`D:\new.EXE`, cwd: 'D:/work',
+      ...(name === 'Run' ? {} : { resumeRequested: false }) });
     assert.deepEqual(cosmetic, { ...original, themeColor: '#abcdef' }); assert.deepEqual(input, original);
     assert.throws(() => edit(input, { platform: 'win32' }, 'win32'), { message: 'Invalid settings.' });
     assert.throws(() => edit(input, { executable: '/posix/program' }, 'win32'), { diagnosticCode: 'INVALID_EXECUTABLE' });
