@@ -5,7 +5,7 @@
 Turn program output into live text, progress rings, and images. An open-source Stream Deck plugin for macOS and Windows.
 
 <p align="center">
-<a href="#install-a-packaged-build">Get started</a> · <a href="#examples">Examples</a> · <a href="#protocol">Protocol</a> · <a href="#build-from-source">Build</a>
+<a href="#install-a-packaged-build">Get started</a> · <a href="#examples">Examples</a> · <a href="#protocol">Protocol</a> · <a href="#build-from-source">Build</a> · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center" width="100%">
