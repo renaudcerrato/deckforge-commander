@@ -34,6 +34,41 @@ function manifestVersion(text) {
     return version;
 }
 
+async function requireChangelog(git, sha, version) {
+    let text;
+    try {
+        text = await git(['show', `${sha}:CHANGELOG.md`]);
+    } catch {
+        throw new Error(`Cannot read CHANGELOG.md; add a populated section for ${version} in the candidate commit.`);
+    }
+    let matchingSection = false;
+    let fence = null;
+    for (const line of text.replace(/<!--[\s\S]*?(?:-->|$)/g, '').split(/\r?\n/)) {
+        const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+        if (fence) {
+            if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length
+                && /^[ \t]*$/.test(marker[2])) fence = null;
+            else if (matchingSection && !marker && line.trim()
+                && !/^[ \t]*#{1,6}(?:[ \t]|$)/.test(line)) return;
+            continue;
+        }
+        if (marker && (marker[1][0] === '~' || !marker[2].includes('`'))) {
+            fence = marker[1];
+            continue;
+        }
+        const heading = /^[ \t]{0,3}(#{1,2})[ \t]+(.*?)[ \t]*#*[ \t]*$/.exec(line);
+        if (heading) {
+            if (matchingSection) break;
+            const release = /^(?:(\d+\.\d+\.\d+\.\d+)|\[(\d+\.\d+\.\d+\.\d+)\]\([^\s)]+\))(?:[ \t]+[-–—][ \t]+\d{4}-\d{2}-\d{2})?$/.exec(heading[2]);
+            matchingSection = heading[1] === '##' && Boolean(release)
+                && (release[1] ?? release[2]) === version;
+        } else if (matchingSection && line.trim() && !/^[ \t]*#{1,6}(?:[ \t]|$)/.test(line)) {
+            return;
+        }
+    }
+    throw new Error(`Add a populated level-two section for ${version} to CHANGELOG.md before increasing Manifest Version.`);
+}
+
 // git(args) returns stdout; missing commits/manifests must reject, not guess a baseline.
 export async function planRelease({ eventName, ref, event, sha, git }) {
     requireSha(sha);
@@ -58,6 +93,7 @@ export async function planRelease({ eventName, ref, event, sha, git }) {
     const version = manifestVersion(await git(['show', `${head}:${MANIFEST}`]));
     const comparison = compareVersions(version, baseline);
     if (comparison < 0) throw new Error('Manifest Version must not decrease.');
+    if (comparison > 0) await requireChangelog(git, head, version);
     return { version, sha, release: eventName === 'push' && comparison > 0 };
 }
 

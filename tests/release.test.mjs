@@ -10,6 +10,23 @@ const OTHER = 'd'.repeat(40);
 const VERSION = '0.1.1.0';
 const TAG = `v${VERSION}`;
 const ASSET_PATH = `dist/${INSTALLER}`;
+const CHANGELOG = 'CHANGELOG.md';
+const RELEASE_NOTES = `# Changelog
+
+User-facing changes, maintained manually.
+
+## [${VERSION}](https://github.com/renaudcerrato/deckforge-commander/releases/tag/v${VERSION}) — 2026-11-02
+
+Initial release of DeckForge Commander.
+
+- **Stream** toggles a live program; **Loop** repeats after completion and a delay; **Run** executes once and retains successful output.
+`;
+
+function assertChangelogError(error) {
+  assert.match(error.message, /CHANGELOG\.md/);
+  assert.ok(error.message.includes(VERSION), 'Changelog error must identify the required version');
+  return true;
+}
 
 function planning({ baseline = '0.1.0.0', current = VERSION } = {}) {
   const calls = [];
@@ -17,6 +34,7 @@ function planning({ baseline = '0.1.0.0', current = VERSION } = {}) {
     [`${BASE}:${MANIFEST}`, JSON.stringify({ Version: baseline })],
     [`${SHA}:${MANIFEST}`, JSON.stringify({ Version: current })],
     [`${HEAD}:${MANIFEST}`, JSON.stringify({ Version: current })],
+    ...[BASE, SHA, HEAD].map(ref => [`${ref}:${CHANGELOG}`, RELEASE_NOTES]),
   ]);
   return {
     calls, snapshots,
@@ -26,7 +44,9 @@ function planning({ baseline = '0.1.0.0', current = VERSION } = {}) {
         calls.push(args);
         assert.equal(args[0], 'show');
         if (!snapshots.has(args[1])) throw new Error('Snapshot unavailable');
-        return snapshots.get(args[1]);
+        const snapshot = snapshots.get(args[1]);
+        if (snapshot instanceof Error) throw snapshot;
+        return snapshot;
       },
     },
   };
@@ -86,9 +106,8 @@ for (const current of [VERSION, '0.1.0.0']) {
     const result = await planRelease(input);
     // Assert
     assert.deepEqual(result, { version: current, sha: SHA, release: current === VERSION });
-    // Independent snapshot reads may occur in either order; exact tuples retain
-    // rejection of missing, duplicate, unexpected or misassociated arguments.
-    assert.deepEqual(calls.toSorted(), [['show', `${BASE}:${MANIFEST}`], ['show', `${SHA}:${MANIFEST}`]].toSorted());
+    assert.ok(calls.some(args => args[1] === `${BASE}:${MANIFEST}`));
+    assert.ok(calls.some(args => args[1] === `${SHA}:${MANIFEST}`));
   });
   test(`PR ${current} validates base/head without permitting release`, async () => {
     // Arrange
@@ -99,8 +118,145 @@ for (const current of [VERSION, '0.1.0.0']) {
     const result = await planRelease(input);
     // Assert
     assert.deepEqual(result, { version: current, sha: SHA, release: false });
-    assert.deepEqual(calls.toSorted(), [['show', `${BASE}:${MANIFEST}`], ['show', `${HEAD}:${MANIFEST}`]].toSorted());
+    assert.ok(calls.some(args => args[1] === `${BASE}:${MANIFEST}`));
+    assert.ok(calls.some(args => args[1] === `${HEAD}:${MANIFEST}`));
   });
+}
+
+// CHANGELOG-GATE: bumps need populated exact-version notes from the candidate commit,
+// not the baseline, working tree, or (for PRs) the tested merge commit.
+for (const eventName of ['push', 'pull_request']) {
+  const candidate = eventName === 'push' ? SHA : HEAD;
+  const configureEvent = input => {
+    input.eventName = eventName;
+    if (eventName === 'pull_request') input.event = { pull_request: { base: { sha: BASE }, head: { sha: HEAD } } };
+  };
+
+  for (const [name, notes] of [
+    ['plain heading', `## ${VERSION}\n\n- Added release validation.\n`],
+    ['dated plain heading', `## ${VERSION} - 2026-11-02\n\nRelease validation is available.\n`],
+    ['linked heading', `## [${VERSION}](https://example.test/releases/${VERSION})\n\n### Added\n\n- Release validation.\n`],
+    ['current changelog format', RELEASE_NOTES],
+    ['populated section before another release', `## ${VERSION}\n\n- Release validation.\n\n## 0.1.0.0\n\nOlder notes.\n`],
+  ]) {
+    test(`${eventName} accepts ${name} already present in the candidate snapshot`, async () => {
+      // Arrange: unchanged matching notes in base and candidate need no diff entry.
+      const { input, snapshots } = planning();
+      configureEvent(input);
+      snapshots.set(`${BASE}:${CHANGELOG}`, notes);
+      snapshots.set(`${candidate}:${CHANGELOG}`, notes);
+      // Act
+      const result = await planRelease(input);
+      // Assert
+      assert.deepEqual(result, { version: VERSION, sha: SHA, release: eventName === 'push' });
+    });
+  }
+
+  for (const [name, notes] of [
+    ['missing file', undefined],
+    ['unreadable file', new Error('Synthetic changelog read failure')],
+    ['empty file', ''],
+    ['wrong version', '## 0.1.0.0\n\n- Previous release.\n'],
+    ['mere version mention', `# Changelog\n\nRelease ${VERSION} adds validation.\n`],
+    ['version only in another section body', `## 0.1.0.0\n\n- Preparing ${VERSION}.\n`],
+    ['level-one version heading', `# ${VERSION}\n\n- Release validation.\n`],
+    ['level-three version heading', `### ${VERSION}\n\n- Release validation.\n`],
+    ['prefixed version', `## v${VERSION}\n\n- Release validation.\n`],
+    ['truncated version', '## 0.1.1\n\n- Release validation.\n'],
+    ['longer fourth component', `## ${VERSION}0\n\n- Release validation.\n`],
+    ['fifth component', `## ${VERSION}.1\n\n- Release validation.\n`],
+    ['linked version prefix', `## [${VERSION}-beta](https://example.test/release)\n\n- Release validation.\n`],
+    ['whitespace-only section', `## ${VERSION}\n \t\n`],
+    ['comment-only section', `## ${VERSION}\n\n<!-- TODO: write notes -->\n<!--\n- Not published content.\n-->\n`],
+    ['subheading-only section', `## ${VERSION}\n\n### Added\n\n#### Fixed\n`],
+    ['comments and subheadings only', `## ${VERSION}\n\n### Added\n<!-- Add notes here. -->\n`],
+    ['content after next level-two heading', `## ${VERSION}\n\n## 0.1.0.0\n\n- Older release content.\n`],
+    ['content after next level-one heading', `## ${VERSION}\n\n# Other notes\n\n- Not candidate content.\n`],
+  ]) {
+    test(`${eventName} rejects ${name} in the candidate changelog`, async () => {
+      // Arrange
+      const { input, snapshots } = planning();
+      configureEvent(input);
+      snapshots.delete(`${candidate}:${CHANGELOG}`);
+      if (notes !== undefined) snapshots.set(`${candidate}:${CHANGELOG}`, notes);
+      // Act / Assert
+      await assert.rejects(() => planRelease(input), assertChangelogError);
+    });
+  }
+
+  // CHANGELOG-GATE: example code is not an actual release heading; closing a
+  // fence must still allow the following real release section to be found.
+  for (const fence of ['```', '~~~']) {
+    test(`${eventName} rejects a release heading inside a ${fence} code fence`, async () => {
+      // Arrange
+      const { input, snapshots } = planning();
+      configureEvent(input);
+      snapshots.set(`${candidate}:${CHANGELOG}`, `# Changelog\n\n${fence}markdown\n## ${VERSION}\n\n- Example only.\n${fence}\n`);
+      // Act / Assert
+      await assert.rejects(() => planRelease(input), assertChangelogError);
+    });
+
+    test(`${eventName} accepts a real release section after a closed ${fence} code fence`, async () => {
+      // Arrange
+      const { input, snapshots } = planning();
+      configureEvent(input);
+      snapshots.set(`${candidate}:${CHANGELOG}`, `# Changelog\n\n${fence}markdown\n## 9.9.9.9\n\n- Example only.\n${fence}\n\n## ${VERSION}\n\n- Added release validation.\n`);
+      // Act
+      const result = await planRelease(input);
+      // Assert
+      assert.deepEqual(result, { version: VERSION, sha: SHA, release: eventName === 'push' });
+    });
+
+    test(`${eventName} accepts substantive ${fence} fenced notes under a real release heading`, async () => {
+      // Arrange: fences do not invalidate descriptive content in a genuine section.
+      const { input, snapshots } = planning();
+      configureEvent(input);
+      snapshots.set(`${candidate}:${CHANGELOG}`, `# Changelog\n\n## ${VERSION}\n\n${fence}text\nAdded release validation for candidate commits.\n${fence}\n`);
+      // Act
+      const result = await planRelease(input);
+      // Assert
+      assert.deepEqual(result, { version: VERSION, sha: SHA, release: eventName === 'push' });
+    });
+  }
+
+  test(`${eventName} accepts candidate notes despite invalid non-candidate snapshots`, async () => {
+    // Arrange
+    const { input, snapshots } = planning();
+    configureEvent(input);
+    for (const ref of [BASE, SHA, HEAD, OTHER]) snapshots.set(`${ref}:${CHANGELOG}`, new Error('Wrong commit read'));
+    snapshots.set(`${candidate}:${CHANGELOG}`, RELEASE_NOTES);
+    // Act
+    const result = await planRelease(input);
+    // Assert
+    assert.deepEqual(result, { version: VERSION, sha: SHA, release: eventName === 'push' });
+  });
+
+  test(`${eventName} cannot borrow valid notes from another commit`, async () => {
+    // Arrange: for PRs SHA represents the tested merge commit, not the PR head.
+    const { input, snapshots } = planning();
+    configureEvent(input);
+    snapshots.set(`${OTHER}:${CHANGELOG}`, RELEASE_NOTES);
+    snapshots.set(`${candidate}:${CHANGELOG}`, `## ${VERSION}\n\n<!-- Still empty. -->\n`);
+    // Act / Assert
+    await assert.rejects(() => planRelease(input));
+  });
+
+  for (const notes of [undefined, new Error('Changelog must not be read')]) {
+    test(`${eventName} unchanged version needs no ${notes === undefined ? 'missing' : 'unreadable'} changelog`, async () => {
+      // Arrange
+      const { input, snapshots, calls } = planning({ current: '0.1.0.0' });
+      configureEvent(input);
+      for (const ref of [BASE, SHA, HEAD]) {
+        snapshots.delete(`${ref}:${CHANGELOG}`);
+        if (notes !== undefined) snapshots.set(`${ref}:${CHANGELOG}`, notes);
+      }
+      // Act
+      const result = await planRelease(input);
+      // Assert
+      assert.deepEqual(result, { version: '0.1.0.0', sha: SHA, release: false });
+      assert.equal(calls.some(args => args[1]?.endsWith(`:${CHANGELOG}`)), false);
+    });
+  }
 }
 
 for (const eventName of ['push', 'pull_request']) {
@@ -418,7 +574,8 @@ for (const override of [{ version: '0.1.1' }, { sha: SHA.slice(0, 7) }]) {
 // DRAFT-RECOVERY: manual main runs use the tested snapshot, not an invented baseline.
 test('main dispatch is release eligible using only the tested manifest', async () => {
   // Arrange
-  const { input, calls } = planning();
+  const { input, calls, snapshots } = planning();
+  snapshots.set(`${SHA}:${CHANGELOG}`, new Error('Dispatch must not read changelog'));
   input.eventName = 'workflow_dispatch';
   input.event = {};
   // Act

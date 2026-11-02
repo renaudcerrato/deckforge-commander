@@ -1,8 +1,12 @@
 # Agent handoff
 
+## Git workflow
+
+- Direct pushes to `main` are disabled. Make changes on a separate branch and submit a pull request; do not bypass branch protection.
+
 ## Documentation discipline
 
-- The plugin is not published yet. Describe the current product; do not add migration notices, breaking-change warnings, historical UUID mappings, or instructions to recreate keys for pre-release changes.
+- Describe the current product; do not add migration notices, breaking-change warnings, historical UUID mappings, or instructions to recreate keys for pre-release changes.
 - User-facing Markdown is a practical guide, not a devlog or agent handoff. Prefer short descriptions, copyable examples, requirements, and actionable limitations.
 - Do not append implementation reports, internal algorithms, locking/ACL mechanics, validation receipts, source-review history, or unrun manual-test checklists to READMEs and setup guides. Report verification and remaining uncertainty in the session instead; never imply unverified behavior was tested.
 - Keep essential safety warnings and public protocol contracts, but state them concisely. Do not turn every internal safeguard or hypothetical failure into documentation.
