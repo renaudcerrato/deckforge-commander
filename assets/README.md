@@ -9,9 +9,9 @@ Run these asset-generation commands on macOS, from the repository root, with Nod
 ```sh
 npm run assets           # Changed asset groups, then checks
 npm run assets -- --force # Force regeneration
-npm run assets:images    # Protocol SVGs and key PNGs
+npm run assets:images    # Protocol SVGs, key PNGs, and marketplace icon
 npm run assets:gifs      # Demo stdout → GIFs
-npm run assets:check     # Protocol/key preview freshness
+npm run assets:check     # Protocol/key previews and marketplace icon freshness
 npm run assets:hero      # Separate animated Mini hero
 ```
 
@@ -112,11 +112,13 @@ Use a new output file: redirection truncates existing files before validation.
 
 ## Plugin icon
 
-Edit `assets/plugin-icon.svg`:
+Edit `assets/plugin-icon.svg`, then run `npm run assets:images` (or `npm run assets`) to generate [plugin-icon-288.png](plugin-icon-288.png), the 288×288 marketplace upload. `npm run assets:check` checks it against the SVG source without writing.
+
+Generate the bundled 256/512 PNGs separately:
 
 ```sh
 node assets/generate-plugin-icon.mjs --output-dir git.renaudcerrato.deckforge.sdPlugin/imgs/plugin # Generate 256/512 PNGs
 node assets/generate-plugin-icon.mjs --check --output-dir git.renaudcerrato.deckforge.sdPlugin/imgs/plugin # Compare decoded pixels; no writes
 ```
 
-Separate from `assets:images`/`assets:check`. Action-list and category icons are unchanged.
+Action-list and category icons are unchanged.

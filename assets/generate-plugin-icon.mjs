@@ -11,6 +11,7 @@ const OUTPUTS = [
   { filename: 'marketplace.png', size: 256 },
   { filename: 'marketplace@2x.png', size: 512 },
 ];
+const MARKETPLACE_OUTPUTS = [{ filename: 'plugin-icon-288.png', size: 288 }];
 const MAX_PNG_BYTES = 1024 * 1024;
 const INPUT_OPTIONS = { limitInputPixels: 512 * 512 };
 
@@ -27,12 +28,14 @@ function fail(identifier, exitCode = 1) {
 
 function parseArguments(args) {
   const check = args[0] === '--check';
-  const remaining = check ? args.slice(1) : args;
+  const afterCheck = check ? args.slice(1) : args;
+  const marketplace = afterCheck[0] === '--marketplace';
+  const remaining = marketplace ? afterCheck.slice(1) : afterCheck;
   if (remaining.length !== 2 || remaining[0] !== '--output-dir'
     || !remaining[1] || remaining[1].startsWith('-') || remaining[1].includes('\0')) {
     fail('ARGUMENTS_INVALID', 2);
   }
-  return { check, directory: resolve(remaining[1]) };
+  return { check, marketplace, directory: resolve(remaining[1]) };
 }
 
 async function inspectOutput(path) {
@@ -61,9 +64,9 @@ async function decodePng(sharp, bytes, size) {
   return data;
 }
 
-async function renderOutputs(sharp, source) {
+async function renderOutputs(sharp, source, specifications) {
   const outputs = [];
-  for (const output of OUTPUTS) {
+  for (const output of specifications) {
     const { data, info } = await sharp(source, INPUT_OPTIONS).resize(output.size, output.size)
       .png().timeout({ seconds: 30 }).toBuffer({ resolveWithObject: true });
     if (info.format !== 'png' || info.width !== output.size || info.height !== output.size) fail('RENDER_INVALID');
@@ -87,7 +90,8 @@ async function writeOutput(directory, output) {
   }
 }
 
-export async function generatePluginIcon({ check = false, directory = PLUGIN_DIRECTORY } = {}) {
+export async function generatePluginIcon({ check = false, marketplace = false, directory = PLUGIN_DIRECTORY } = {}) {
+  const specifications = marketplace ? MARKETPLACE_OUTPUTS : OUTPUTS;
   const directoryInfo = await lstat(directory);
   if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) fail('DIRECTORY_INVALID');
   const sourcePath = resolve(ASSETS_DIRECTORY, 'plugin-icon.svg');
@@ -95,9 +99,9 @@ export async function generatePluginIcon({ check = false, directory = PLUGIN_DIR
   if (!sourceInfo.isFile() || sourceInfo.size < 1 || sourceInfo.size > 262_144) fail('FILE_INVALID');
   const source = await readFile(sourcePath);
   if (source.length < 1 || source.length > 262_144) fail('FILE_INVALID');
-  const existing = await Promise.all(OUTPUTS.map(output => inspectOutput(resolve(directory, output.filename))));
+  const existing = await Promise.all(specifications.map(output => inspectOutput(resolve(directory, output.filename))));
   const sharp = (await import('sharp')).default;
-  const outputs = await renderOutputs(sharp, source);
+  const outputs = await renderOutputs(sharp, source, specifications);
   let written = 0;
   for (const [index, output] of outputs.entries()) {
     const current = existing[index];
@@ -118,8 +122,8 @@ export async function generatePluginIcon({ check = false, directory = PLUGIN_DIR
 
 async function main(args) {
   const options = parseArguments(args);
-  await generatePluginIcon(options);
-  console.log(options.check ? 'PLUGIN_ICON_CHECK_OK 2' : 'PLUGIN_ICON_WRITE_OK 2');
+  const result = await generatePluginIcon(options);
+  console.log(`${options.check ? 'PLUGIN_ICON_CHECK_OK' : 'PLUGIN_ICON_WRITE_OK'} ${result.written + result.skipped}`);
 }
 
 if (import.meta.main) {
