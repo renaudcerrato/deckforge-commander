@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { copyFile, mkdir, mkdtemp, readFile, readdir, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -18,6 +19,9 @@ const groups = [
   { name: 'plugin icons', generate: generatePluginIcon, outputs: [
     ['marketplace.png', 256], ['marketplace@2x.png', 512],
   ] },
+  { name: 'marketplace icon', marketplace: true,
+    generate: options => generatePluginIcon({ ...options, marketplace: true }),
+    outputs: [['plugin-icon-288.png', 288]] },
 ];
 async function fixture() { return mkdtemp(path.join(tmpdir(), 'deckforge-asset-generators-')); }
 async function decode(bytes) { return sharp(bytes).ensureAlpha().raw().toBuffer({ resolveWithObject: true }); }
@@ -28,15 +32,17 @@ async function snapshot(directory, outputs) {
   }));
 }
 
-test('plugin icons: SVG regions survive both output sizes and source edits make both icons stale', options, async () => {
+for (const group of groups.slice(1)) {
+test(`${group.name}: SVG regions survive resizing and source edits invalidate existing icons`, options, async () => {
   // Arrange: copy the generator unchanged so its normal relative SVG input is
   // fixture-owned. Only dependency resolution links back to read-only packages.
   const root = await fixture(), assets = path.join(root, 'assets'), directory = path.join(root, 'outputs');
   await mkdir(assets); await mkdir(directory);
   await copyFile(new URL('../assets/generate-plugin-icon.mjs', import.meta.url), path.join(assets, 'generate-plugin-icon.mjs'));
   await symlink(fileURLToPath(new URL('../node_modules', import.meta.url)), path.join(root, 'node_modules'), 'dir');
-  const { generatePluginIcon: generate } = await import(pathToFileURL(path.join(assets, 'generate-plugin-icon.mjs')).href);
-  const outputs = groups[1].outputs;
+  const { generatePluginIcon } = await import(pathToFileURL(path.join(assets, 'generate-plugin-icon.mjs')).href);
+  const generate = options => generatePluginIcon({ ...options, marketplace: group.marketplace ?? false });
+  const outputs = group.outputs;
   const source = path.join(assets, 'plugin-icon.svg');
   for (const [color, rgba] of [['#ff0000', [255, 0, 0, 255]], ['#ffff00', [255, 255, 0, 255]]]) {
     await writeFile(source, `<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
@@ -50,8 +56,8 @@ test('plugin icons: SVG regions survive both output sizes and source edits make 
       await assert.rejects(generate({ directory, check: true }));
       assert.deepEqual(await snapshot(directory, outputs), before);
     }
-    // Act: both initial generation and source-edit regeneration update both sizes.
-    assert.deepEqual(await generate({ directory }), { written: 2, skipped: 0 });
+    // Act: initial generation and source-edit regeneration update every selected size.
+    assert.deepEqual(await generate({ directory }), { written: outputs.length, skipped: 0 });
     // Assert interior regions, not a second rendering pipeline or real-art golden.
     for (const [name, size] of outputs) {
       const { data, info } = await decode(await readFile(path.join(directory, name)));
@@ -64,9 +70,55 @@ test('plugin icons: SVG regions survive both output sizes and source edits make 
         assert.deepEqual([...data.subarray(offset, offset + 4)], expected, `${name}: region ${x},${y}`);
       }
     }
-    assert.deepEqual(await generate({ directory, check: true }), { written: 0, skipped: 2 });
+    assert.deepEqual(await generate({ directory, check: true }), { written: 0, skipped: outputs.length });
   }
 });
+}
+
+test('marketplace CLI: explicit mode generates only the 288px icon and accepts a leading check', options, async () => {
+  // Arrange: CLI writes are confined to an existing fixture directory.
+  const directory = await fixture();
+  const script = fileURLToPath(new URL('../assets/generate-plugin-icon.mjs', import.meta.url));
+  // Act
+  const generated = spawnSync(process.execPath, [script, '--marketplace', '--output-dir', directory],
+    { encoding: 'utf8', timeout: 10000 });
+  // Assert
+  assert.equal(generated.error, undefined); assert.equal(generated.status, 0);
+  assert.deepEqual(await readdir(directory), ['plugin-icon-288.png']);
+  const metadata = await sharp(await readFile(path.join(directory, 'plugin-icon-288.png'))).metadata();
+  assert.equal(metadata.width, 288); assert.equal(metadata.height, 288);
+
+  // Arrange: make any check-mode rewrite observable without relying on a clock tick.
+  await utimes(path.join(directory, 'plugin-icon-288.png'), 1, 1);
+  const before = await snapshot(directory, groups[2].outputs);
+  // Act
+  const checked = spawnSync(process.execPath, [script, '--check', '--marketplace', '--output-dir', directory],
+    { encoding: 'utf8', timeout: 10000 });
+  // Assert
+  assert.equal(checked.error, undefined); assert.equal(checked.status, 0);
+  assert.deepEqual(await snapshot(directory, groups[2].outputs), before);
+});
+
+for (const argumentsFor of [
+  () => ['--marketplace'],
+  () => ['--check', '--marketplace'],
+  directory => ['--marketplace', '--marketplace', '--output-dir', directory],
+  directory => ['--marketplace', '--output-dir', directory, '--size', '288'],
+]) {
+  test(`marketplace CLI: rejects invalid argument shape ${argumentsFor('OUTPUT').join(' ')}`, options, async () => {
+    // Arrange: invalid invocations must not publish any assets.
+    const directory = await fixture();
+    await writeFile(path.join(directory, 'sentinel'), 'retained');
+    const script = fileURLToPath(new URL('../assets/generate-plugin-icon.mjs', import.meta.url));
+    // Act
+    const result = spawnSync(process.execPath, [script, ...argumentsFor(directory)],
+      { encoding: 'utf8', timeout: 10000 });
+    // Assert: the CLI usage exit code is stable; diagnostic wording is not pinned.
+    assert.equal(result.error, undefined); assert.equal(result.status, 2);
+    assert.deepEqual(await readdir(directory), ['sentinel']);
+    assert.equal(await readFile(path.join(directory, 'sentinel'), 'utf8'), 'retained');
+  });
+}
 
 for (const group of groups) {
   test(`${group.name}: fresh generation creates decodable PNGs with expected dimensions and alpha`, options, async () => {
@@ -121,7 +173,7 @@ for (const group of groups) {
     assert.deepEqual(await snapshot(directory, group.outputs), recompressedBefore);
   });
 
-  for (const scenario of ['missing', 'corrupt', 'empty', 'stale pixels']) {
+  for (const scenario of ['missing', 'corrupt', 'empty', 'wrong dimensions', 'transparent', 'stale pixels']) {
     test(`${group.name}: check rejects ${scenario} without writes; generation repairs it`, options, async () => {
       // Arrange: missing fixtures omit creation; no generated or source file is deleted.
       const directory = await fixture(), [name] = group.outputs[0], file = path.join(directory, name);
@@ -134,6 +186,12 @@ for (const group of groups) {
         const original = await decode(await readFile(file)); expectedPixels = original.data;
         if (scenario === 'corrupt') await writeFile(file, 'not a PNG');
         if (scenario === 'empty') await writeFile(file, '');
+        if (scenario === 'wrong dimensions') await writeFile(file, await sharp(original.data, { raw: original.info })
+          .resize(original.info.width - 1, original.info.height).png().toBuffer());
+        if (scenario === 'transparent') {
+          const pixels = Buffer.from(original.data); pixels[3] = original.data[3] === 255 ? 0 : 255;
+          await writeFile(file, await sharp(pixels, { raw: original.info }).png().toBuffer());
+        }
         if (scenario === 'stale pixels') {
           const pixels = Buffer.from(original.data), center = (Math.floor(original.info.height / 2) * original.info.width + Math.floor(original.info.width / 2)) * 4;
           pixels[center] ^= 1; // Preserve dimensions/alpha while changing visible content.

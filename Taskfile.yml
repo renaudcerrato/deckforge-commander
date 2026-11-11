@@ -128,6 +128,7 @@ tasks:
     cmds:
       - task: protocol
       - task: keys
+      - task: plugin-icon
 
   gifs:
     cmds:
@@ -139,6 +140,19 @@ tasks:
     cmds:
       - node assets/generate-protocol-examples.mjs --check
       - node assets/generate-key-previews.mjs --check
+      - node assets/generate-plugin-icon.mjs --check --marketplace --output-dir assets
+
+  plugin-icon:
+    sources:
+      - Taskfile.yml
+      - package.json
+      - package-lock.json
+      - assets/generate-plugin-icon.mjs
+      - assets/plugin-icon.svg
+    generates:
+      - assets/plugin-icon-288.png
+    cmds:
+      - node assets/generate-plugin-icon.mjs --marketplace --output-dir assets
 
   hero:
     desc: Capture four demos and compose the animated Mini hero
